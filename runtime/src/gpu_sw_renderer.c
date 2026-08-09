@@ -662,7 +662,11 @@ static void raster_flat_triangle(const RTarget *t,
     int dy_total = y2 - y0;
     if (dy_total == 0) return;
 
-    for (int y = y0; y <= y2; y++) {
+    /* PS1 triangle coverage is half-open on the bottom and right edges.
+     * This also makes the diagonal shared by the two triangles of a quad
+     * belong to exactly one primitive, avoiding a second semi-transparent
+     * blend on that edge. */
+    for (int y = y0; y < y2; y++) {
         if (y < t->cy1 || y > t->cy2) continue;
 
         int second_half = (y >= y1);
@@ -686,9 +690,9 @@ static void raster_flat_triangle(const RTarget *t,
         if (xa > xb) { int tt = xa; xa = xb; xb = tt; }
 
         int sx = max_i(xa, t->cx1);
-        int ex = min_i(xb, t->cx2);
+        int ex = min_i(xb, t->cx2 + 1);
 
-        for (int x = sx; x <= ex; x++) {
+        for (int x = sx; x < ex; x++) {
             put_opaque(t, x, y, color);
         }
     }
@@ -741,7 +745,7 @@ static void raster_gouraud_triangle(const RTarget *t,
     int dy_total = y2 - y0;
     if (dy_total == 0) return;
 
-    for (int y = y0; y <= y2; y++) {
+    for (int y = y0; y < y2; y++) {
         if (y < t->cy1 || y > t->cy2) continue;
 
         int second_half = (y >= y1);
@@ -788,10 +792,10 @@ static void raster_gouraud_triangle(const RTarget *t,
         }
 
         int sx = max_i(xa, t->cx1);
-        int ex = min_i(xb, t->cx2);
+        int ex = min_i(xb, t->cx2 + 1);
         int span = xb - xa;
 
-        for (int x = sx; x <= ex; x++) {
+        for (int x = sx; x < ex; x++) {
             /* Interpolate color across the scanline */
             uint16_t color;
             if (span > 0) {
@@ -859,7 +863,7 @@ static void raster_textured_triangle(const RTarget *t,
     int dy_total = y2 - y0;
     if (dy_total == 0) return;
 
-    for (int y = y0; y <= y2; y++) {
+    for (int y = y0; y < y2; y++) {
         if (y < t->cy1 || y > t->cy2) continue;
 
         int second_half = (y >= y1);
@@ -902,9 +906,9 @@ static void raster_textured_triangle(const RTarget *t,
         if (span == 0) span = 1;
 
         int sx = max_i(xa, t->cx1);
-        int ex = min_i(xb, t->cx2);
+        int ex = min_i(xb, t->cx2 + 1);
 
-        for (int x = sx; x <= ex; x++) {
+        for (int x = sx; x < ex; x++) {
             float t_val = (float)(x - xa) / (float)span;
             float fu = ua + (ub - ua) * t_val;
             float fv = va + (vb - va) * t_val;
@@ -990,7 +994,7 @@ static void raster_shaded_textured_triangle(const RTarget *t,
     int dy_total = y2 - y0;
     if (dy_total == 0) return;
 
-    for (int y = y0; y <= y2; y++) {
+    for (int y = y0; y < y2; y++) {
         if (y < t->cy1 || y > t->cy2) continue;
 
         int second_half = (y >= y1);
@@ -1046,9 +1050,9 @@ static void raster_shaded_textured_triangle(const RTarget *t,
         if (span == 0) span = 1;
 
         int sx = max_i(xa, t->cx1);
-        int ex = min_i(xb, t->cx2);
+        int ex = min_i(xb, t->cx2 + 1);
 
-        for (int x = sx; x <= ex; x++) {
+        for (int x = sx; x < ex; x++) {
             float t_val = (float)(x - xa) / (float)span;
             float fu = ua + (ub - ua) * t_val;
             float fv = va + (vb - va) * t_val;
