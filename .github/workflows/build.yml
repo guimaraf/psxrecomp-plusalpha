@@ -1,0 +1,62 @@
+name: Build PSXRecomp Framework
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build pkg-config libsdl2-dev clang
+
+    - name: Configure and Build Recompiler
+      run: |
+        cmake -S recompiler -B recompiler/build -DCMAKE_BUILD_TYPE=Release
+        cmake --build recompiler/build --config Release
+
+    - name: Configure and Build Runtime
+      run: |
+        cmake -S runtime -B runtime/build -DCMAKE_BUILD_TYPE=Release
+        cmake --build runtime/build --config Release --target psx-runtime
+
+    - name: Prepare Release Artifact (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        mkdir -p release
+        cp recompiler/build/psxrecomp-game release/ || true
+        cp recompiler/build/psxrecomp-bios release/ || true
+        cp runtime/build/psx-runtime release/ || true
+        cp README.md release/
+
+    - name: Prepare Release Artifact (Windows)
+      if: runner.os == 'Windows'
+      shell: cmd
+      run: |
+        mkdir release
+        copy recompiler\build\Release\psxrecomp-game.exe release\ || copy recompiler\build\psxrecomp-game.exe release\
+        copy recompiler\build\Release\psxrecomp-bios.exe release\ || copy recompiler\build\psxrecomp-bios.exe release\
+        copy runtime\build\Release\psx-runtime.exe release\ || copy runtime\build\psx-runtime.exe release\
+        copy README.md release\
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: PSXRecomp-${{ runner.os }}-x64
+        path: release/
