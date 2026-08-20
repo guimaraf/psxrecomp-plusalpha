@@ -30,7 +30,6 @@ ghidra/
 /test_msvc/
 
 # Recompiler output (derivative of copyrighted Sony BIOS, regenerate locally)
-/generated/
 
 # Release packaging artifacts
 release-stage/
