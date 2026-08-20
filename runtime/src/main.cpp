@@ -1,4 +1,4 @@
-﻿/* main.cpp — Phase 3 runtime entry point.
+/* main.cpp — Phase 3 runtime entry point.
  *
  * Loads BIOS ROM, initializes CPU state + SDL display, calls into
  * the recompiled reset vector. BIOS drives execution; SDL presents
@@ -2600,7 +2600,7 @@ int main(int argc, char** argv) {
 
     /* Install crash handlers early so they catch issues during init too.
      * Writes psx_last_run_report.json on signal/SEH/atexit/fail-fast. */
-    psx_crash_trace_install_handlers();
+    // psx_crash_trace_install_handlers();
 
     const char* bios_path = PSX_DEFAULT_BIOS_PATH;
     const char* game_config_path = nullptr;
@@ -3503,7 +3503,7 @@ int main(int argc, char** argv) {
     cosim_init();  /* first-divergence oracle server */
 #endif
     /* Heartbeat always on — see freeze_heartbeat.c rationale. */
-    freeze_heartbeat_start("psx-runtime");
+    // freeze_heartbeat_start("psx-runtime");
     /* Register game entry_pc for post-BIOS disc speed switch. Fires once when
      * the BIOS hands control to the game EXE — not on the BIOS shell. */
     if (game_entry_pc != 0)
