@@ -42,7 +42,7 @@ jobs:
         mkdir -p release
         cp recompiler/build/psxrecomp-game release/ || true
         cp recompiler/build/psxrecomp-bios release/ || true
-        cp runtime/build/psx-runtime release/ || true
+        cp runtime/build/psxrecomp* release/ || true
         cp README.md release/
 
     - name: Prepare Release Artifact (Windows)
@@ -52,7 +52,7 @@ jobs:
         mkdir release
         copy recompiler\build\Release\psxrecomp-game.exe release\ || copy recompiler\build\psxrecomp-game.exe release\
         copy recompiler\build\Release\psxrecomp-bios.exe release\ || copy recompiler\build\psxrecomp-bios.exe release\
-        copy runtime\build\Release\psx-runtime.exe release\ || copy runtime\build\psx-runtime.exe release\
+        copy runtime\build\Release\psxrecomp*.exe release\ || copy runtime\build\psxrecomp*.exe release\
         copy README.md release\
 
     - name: Upload Artifact
