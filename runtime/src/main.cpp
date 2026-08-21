@@ -689,6 +689,31 @@ static std::filesystem::path resolve_bios_path(const char* requested, const char
 
 static std::filesystem::path resolve_bios_for_runtime(const char* requested,
                                                       const char* argv0) {
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+    char* pref_path = SDL_GetPrefPath("psxrecomp", "alphaPlus");
+    if (!pref_path) return {};
+    std::filesystem::path local_state(pref_path);
+    SDL_free(pref_path);
+
+    std::filesystem::create_directories(local_state / "bios");
+    std::filesystem::create_directories(local_state / "disc");
+    std::filesystem::create_directories(local_state / "memoryCard");
+
+    auto copy_if_missing = [&](const char* filename) {
+        if (!std::filesystem::exists(local_state / filename)) {
+            std::error_code ec;
+            std::filesystem::copy_file(filename, local_state / filename, ec);
+        }
+    };
+    copy_if_missing("game.toml");
+    copy_if_missing("input.ini");
+
+    std::filesystem::path picked = local_state / "bios" / "SCPH1001.BIN";
+    if (!std::filesystem::exists(picked)) {
+        std::exit(0);
+    }
+    return picked;
+#else
     std::filesystem::path resolved = resolve_bios_path(requested, argv0);
     if (!resolved.empty() && std::filesystem::exists(resolved) &&
         validate_bios_for_launch(resolved)) {
@@ -727,12 +752,25 @@ static std::filesystem::path resolve_bios_for_runtime(const char* requested,
             return picked;
         }
     }
+#endif
 }
 
 static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::path& config_disc,
                                                       const char* disc_override,
                                                       const std::string& game_id,
                                                       const char* argv0) {
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+    char* pref_path = SDL_GetPrefPath("psxrecomp", "alphaPlus");
+    if (!pref_path) return {};
+    std::filesystem::path local_state(pref_path);
+    SDL_free(pref_path);
+
+    std::filesystem::path picked = local_state / "disc" / "game.cue";
+    if (!std::filesystem::exists(picked)) {
+        std::exit(0);
+    }
+    return picked;
+#else
     if (disc_override && disc_override[0]) {
         std::filesystem::path p = std::filesystem::absolute(disc_override);
         return validate_disc_for_launch(p, game_id) ? p : std::filesystem::path{};
@@ -782,6 +820,7 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
             return picked;
         }
     }
+#endif
 }
 
 static std::filesystem::path resolve_bios_path(const char* requested, const char* argv0) {
@@ -2611,6 +2650,9 @@ int main(int argc, char** argv) {
      * PSX_NO_LAUNCHER env) forces it off. --launcher wins if both are given. */
     bool        force_launcher    = false;
     bool        force_no_launcher = false;
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+    force_no_launcher = true;
+#endif
     /* CLI overrides for running several instances side by side (soak fleet).
      * These win over any game-config value and, crucially, work for the BIOS
      * (which has no [game]-block config schema, so debug_port/renderer can't be
@@ -3380,6 +3422,9 @@ int main(int argc, char** argv) {
     /* Select the renderer backend BEFORE gpu_init() (which runs gr_init ->
      * the backend's init on the VRAM buffer). Software is the default and the
      * fallback; an unavailable OpenGL backend reverts to software. */
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+    g_video_renderer = 0;
+#endif
     gr_set_backend(g_video_renderer == 2 ? GR_BACKEND_VULKAN :
                    g_video_renderer == 1 ? GR_BACKEND_OPENGL : GR_BACKEND_SOFTWARE);
     std::fprintf(stdout, "psxrecomp: renderer backend requested: %s\n",
