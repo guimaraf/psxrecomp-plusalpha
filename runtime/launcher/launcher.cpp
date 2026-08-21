@@ -37,7 +37,9 @@ extern "C" {
 
 #if defined(_WIN32)
 #  include <windows.h>
+#if !defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP
 #  include <commdlg.h>
+#endif
 #endif
 
 namespace fs = std::filesystem;
@@ -562,6 +564,7 @@ void refresh_disc_status(LauncherModel& m, const std::string& game_name,
 }
 
 #if defined(_WIN32)
+#if !defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP
 // Native open-file dialog. Returns "" if cancelled.
 std::string win_pick_file(SDL_Window* parent, const char* title, const char* filter) {
     char buf[MAX_PATH] = {0};
@@ -598,6 +601,10 @@ std::string win_pick_save_file(SDL_Window* parent, const char* title,
     if (GetSaveFileNameA(&ofn)) return std::string(buf);
     return std::string();
 }
+#else
+std::string win_pick_file(SDL_Window*, const char*, const char*) { return std::string(); }
+std::string win_pick_save_file(SDL_Window*, const char*, const char*, const char*, const std::string&) { return std::string(); }
+#endif
 #else
 // POSIX native dialogs via popen-based choosers (zenity / kdialog / qarma /
 // osascript), each gated on `command -v` so an absent tool falls through.
