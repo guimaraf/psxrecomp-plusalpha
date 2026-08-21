@@ -74,8 +74,13 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#if !defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP
 #include <commdlg.h>
+#endif
 #endif
 
 #ifndef PSX_DEFAULT_BIOS_PATH
@@ -554,7 +559,7 @@ static void write_cached_path(const char* argv0, const char* filename,
 
 static void launcher_warning(const char* title, const std::string& msg) {
     std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
     // Headless (--headless / PSX_HEADLESS): NEVER pop a blocking modal — it would
     // hang an unattended/CI/scripted run forever waiting for a click.
     if (!g_headless) MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONWARNING);
@@ -563,7 +568,7 @@ static void launcher_warning(const char* title, const std::string& msg) {
 
 static void launcher_info(const char* title, const std::string& msg) {
     std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
     if (!g_headless) MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONINFORMATION);
 #endif
 }
@@ -581,7 +586,7 @@ static bool pick_runtime_file(const char* title, const char* filter,
                              "supply it via game.toml / --disc / --bios.\n", title);
         return false;
     }
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
     char path_buf[4096];
     std::memset(path_buf, 0, sizeof(path_buf));
 
