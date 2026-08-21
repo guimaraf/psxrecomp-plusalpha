@@ -4097,15 +4097,12 @@ int main(int argc, char** argv) {
             SDL_free(pref_path);
             FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
             if (f) {
-                fprintf(f, "INFO: recomp_init passed. Entering recomp_run().\n");
+                fprintf(f, "INFO: recomp_init passed. Entering psx_scheduler_run().\n");
                 fclose(f);
             }
         }
     }
 #endif
-
-    std::fprintf(stdout, "psxrecomp: starting CPU execution loop\n");
-    recomp_run();
 
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
     { extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
