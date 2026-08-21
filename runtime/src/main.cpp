@@ -715,6 +715,11 @@ static std::filesystem::path resolve_bios_for_runtime(const char* requested,
 
     std::filesystem::path picked = local_state / "bios" / "SCPH1001.BIN";
     if (!std::filesystem::exists(picked)) {
+        FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
+        if (f) {
+            fprintf(f, "ERROR: BIOS file not found at: %s\n", picked.string().c_str());
+            fclose(f);
+        }
         std::exit(0);
     }
     return picked;
@@ -772,6 +777,11 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
 
     std::filesystem::path picked = local_state / "disc" / "game.cue";
     if (!std::filesystem::exists(picked)) {
+        FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
+        if (f) {
+            fprintf(f, "ERROR: Disc file not found at: %s\n", picked.string().c_str());
+            fclose(f);
+        }
         std::exit(0);
     }
     return picked;
@@ -3412,6 +3422,25 @@ int main(int argc, char** argv) {
     std::string disc_path_str    = resolved_disc.string();
 
     std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s\n", bios_path_str.c_str());
+    
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+    FILE* bios_f = fopen(bios_path_str.c_str(), "rb");
+    if (!bios_f) {
+        char* pref_path = SDL_GetPrefPath("psxrecomp", "alphaPlus");
+        if (pref_path) {
+            std::filesystem::path local_state(pref_path);
+            SDL_free(pref_path);
+            FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
+            if (f) {
+                fprintf(f, "ERROR: fopen failed for BIOS at: %s\n", bios_path_str.c_str());
+                fclose(f);
+            }
+        }
+    } else {
+        fclose(bios_f);
+    }
+#endif
+
     memory_init(bios_path_str.c_str());
 #ifndef PSX_HAVE_VULKAN
     /* Vulkan was not compiled in (PSX_ENABLE_VULKAN=OFF or no SDK found).
@@ -3496,6 +3525,22 @@ int main(int argc, char** argv) {
     if (g_audio_spu_hq)
         std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
     spu_init();
+    
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+    {
+        char* pref_path = SDL_GetPrefPath("psxrecomp", "alphaPlus");
+        if (pref_path) {
+            std::filesystem::path local_state(pref_path);
+            SDL_free(pref_path);
+            FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
+            if (f) {
+                fprintf(f, "INFO: BIOS loaded successfully. Attempting to load disc: %s\n", disc_path_str.c_str());
+                fclose(f);
+            }
+        }
+    }
+#endif
+
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
     if (!disc_path_str.empty()) {
         /* GetID must report the inserted disc's license region (the BIOS CD
@@ -4043,6 +4088,24 @@ int main(int argc, char** argv) {
           psx_fatal_halt("top-level dispatch returned PC=0 (abnormal boot exit — inspect live)");
       }
     }
+
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+    {
+        char* pref_path = SDL_GetPrefPath("psxrecomp", "alphaPlus");
+        if (pref_path) {
+            std::filesystem::path local_state(pref_path);
+            SDL_free(pref_path);
+            FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
+            if (f) {
+                fprintf(f, "INFO: recomp_init passed. Entering recomp_run().\n");
+                fclose(f);
+            }
+        }
+    }
+#endif
+
+    std::fprintf(stdout, "psxrecomp: starting CPU execution loop\n");
+    recomp_run();
 
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
     { extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
