@@ -143,6 +143,9 @@ function(psxrecomp_ensure_launcher_libs)
     set(RMLUI_THIRDPARTY_CONTAINERS OFF     CACHE BOOL   "" FORCE)
     add_subdirectory("${PSXRECOMP_ROOT}/lib/RmlUi"
                      "${CMAKE_BINARY_DIR}/_deps/RmlUi-build" EXCLUDE_FROM_ALL)
+    if(MSVC)
+        target_compile_options(rmlui_core PRIVATE /FIalgorithm)
+    endif()
 endfunction()
 
 set(PSXRECOMP_RUNTIME_SOURCES
