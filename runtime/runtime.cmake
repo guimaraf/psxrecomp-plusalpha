@@ -481,8 +481,12 @@ function(psxrecomp_add_runtime_target target)
         )
         # The vendored GL3 backend uses std::all_of without including
         # <algorithm>; force-include it rather than patching the pinned
-        # submodule. (GCC/Clang only; MSVC pulls it in transitively.)
-        if(NOT MSVC)
+        # submodule. (GCC/Clang only; MSVC pulls it in transitively, except UWP MSVC!)
+        if(MSVC)
+            set_source_files_properties(
+                ${PSXRECOMP_ROOT}/lib/RmlUi/Backends/RmlUi_Renderer_GL3.cpp
+                PROPERTIES COMPILE_OPTIONS "/FIalgorithm")
+        else()
             set_source_files_properties(
                 ${PSXRECOMP_ROOT}/lib/RmlUi/Backends/RmlUi_Renderer_GL3.cpp
                 PROPERTIES COMPILE_OPTIONS "-include;algorithm")
