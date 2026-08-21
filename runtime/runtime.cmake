@@ -1,4 +1,4 @@
-﻿# Shared psxrecomp runtime CMake helpers.
+# Shared psxrecomp runtime CMake helpers.
 #
 # Include this from either the framework runtime build or a sibling game
 # project. Call psxrecomp_add_runtime_target() after SDL2 detection has
@@ -594,6 +594,10 @@ function(psxrecomp_add_runtime_target target)
             target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++)
         endif()
     elseif(MSVC)
+        target_compile_options(${target} PRIVATE -DPSXRECOMP_RUNTIME)
+        if(MSVC)
+            target_compile_options(${target} PRIVATE /std:c11 /experimental:c11atomics)
+        endif()
         target_compile_options(${target} PRIVATE /GS- /guard:cf-)
         target_link_options(${target} PRIVATE /STACK:67108864,67108864 /GUARD:NO)
         # No console window in Release MSVC builds. /ENTRY keeps main() as

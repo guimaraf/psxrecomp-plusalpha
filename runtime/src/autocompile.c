@@ -37,7 +37,7 @@ static uint32_t     s_rescans   = 0;
 static char s_out[AC_OUT_CAP];
 static int  s_out_len = 0;
 
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
 static CRITICAL_SECTION s_out_lock;
 static int              s_out_lock_init = 0;
 static HANDLE           s_proc = NULL;
@@ -82,7 +82,7 @@ static DWORD WINAPI watch_thread(LPVOID arg) {
 void autocompile_configure(const char *cmd, const char *cwd) {
     snprintf(s_cmd, sizeof(s_cmd), "%s", cmd ? cmd : "");
     snprintf(s_cwd, sizeof(s_cwd), "%s", cwd ? cwd : "");
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
     if (!s_out_lock_init) {
         InitializeCriticalSection(&s_out_lock);
         s_out_lock_init = 1;
@@ -138,7 +138,7 @@ int autocompile_toolchain_available(void) {
 
 int autocompile_request(void) {
     if (!autocompile_configured() || s_state == AC_RUNNING) return 0;
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE rd = NULL, wr = NULL;
     if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
@@ -236,7 +236,7 @@ int autocompile_status_json(char *out, int cap) {
     char tail[2048];
     int  tn = 0;
     tail[0] = '\0';
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
     if (s_out_lock_init) {
         EnterCriticalSection(&s_out_lock);
         int take = s_out_len < 900 ? s_out_len : 900;   /* newest tail */

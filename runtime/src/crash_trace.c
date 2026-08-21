@@ -625,7 +625,7 @@ static void psx_signal_handler(int sig) {
     raise(sig);
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
 static LONG WINAPI psx_seh_handler(EXCEPTION_POINTERS *info) {
     psx_crash_trace_dump("seh", info);
     /* Same as the signal path: keep the rings on involuntary death. */
@@ -644,7 +644,7 @@ static void psx_atexit_handler(void) {
 void psx_crash_trace_install_handlers(void) {
     signal(SIGSEGV, psx_signal_handler);
     signal(SIGABRT, psx_signal_handler);
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
     SetUnhandledExceptionFilter(psx_seh_handler);
     /* Suppress Windows error dialog so SEH unwinds straight to our
      * filter and we can write the report without the user having to
