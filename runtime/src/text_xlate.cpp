@@ -210,7 +210,7 @@ void sj_transcode(const std::string& utf8, std::vector<uint8_t>& out) {
         // EXE menu labels are big-endian SJIS; the message-table text is stored
         // little-endian. Selectable per run (PSX_XLATE_LE=1) until confirmed;
         // once known this becomes an EncodingProfile flag.
-        static const bool le = [] { const char* e = std::getenv("PSX_XLATE_LE");
+        static const bool le = [] { const char* e = ::getenv("PSX_XLATE_LE");
                                     return e && e[0] == '1'; }();
         if (le) { out.push_back((uint8_t)(g & 0xFF)); out.push_back((uint8_t)(g >> 8)); }
         else    { out.push_back((uint8_t)(g >> 8));   out.push_back((uint8_t)(g & 0xFF)); }
@@ -890,7 +890,7 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
             // framed (0xFFFF, always standalone) OR pure clean text (no wild
             // binary params). PSX_XLATE_ALLOW_NUL=1 forces through for debugging.
             static const bool allow_nul = [] {
-                const char* e = std::getenv("PSX_XLATE_ALLOW_NUL"); return e && e[0] == '1'; }();
+                const char* e = ::getenv("PSX_XLATE_ALLOW_NUL"); return e && e[0] == '1'; }();
             if (term != Term::FFFF && !allow_nul && !sj_clean_text(buf, len)) continue;
             if (apply_to_reg(ram, cpu, sp, argregs[a], te, term))
                 g_hits.fetch_add(1, std::memory_order_relaxed);
@@ -907,12 +907,12 @@ extern "C" void text_xlate_vram_upload(int x, int y, int w, int h) {
 }
 
 extern "C" void text_xlate_init(const char* project_root, const char* language) {
-    const char* env = std::getenv("PSX_LANG");
+    const char* env = ::getenv("PSX_LANG");
     if (env && *env) g_lang = env;
     else if (language && *language) g_lang = language;
     if (project_root && *project_root)
         g_dir = (fs::path(project_root) / "translations").string();
-    const char* capenv = std::getenv("PSX_XLATE_CAPTURE");
+    const char* capenv = ::getenv("PSX_XLATE_CAPTURE");
     if (capenv && capenv[0] == '0') g_capture_on.store(false);
     std::lock_guard<std::mutex> lk(g_mtx);
     load_tables_locked();
@@ -921,7 +921,7 @@ extern "C" void text_xlate_init(const char* project_root, const char* language) 
 extern "C" void text_xlate_set_language(const char* language) {
     // PSX_LANG env is an authoring/testing override — if set it pins the language
     // and the launcher's choice is ignored (matches text_xlate_init precedence).
-    const char* env = std::getenv("PSX_LANG");
+    const char* env = ::getenv("PSX_LANG");
     std::string want = (env && *env) ? env : (language ? language : "");
     std::lock_guard<std::mutex> lk(g_mtx);
     if (want == g_lang) return;      // no change => skip the reload

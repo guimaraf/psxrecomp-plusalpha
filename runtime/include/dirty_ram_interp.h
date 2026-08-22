@@ -220,10 +220,14 @@ extern uint64_t g_static_text_miss_dropped;
  * `ra` is cpu->gpr[31] at dispatch time. For normal JAL-style calls,
  * (ra - 8) gives the caller's PC. For J/JR/tail-calls it's only a
  * heuristic — treat ra as "ra_callsite_guess", not authoritative. */
+#if defined(PSX_UWP)
+#define DIRTY_RAM_BLOCK_LOG_CAP (1u << 18) /* ~0.45 s at the measured boot peak. */
+#else
 #define DIRTY_RAM_BLOCK_LOG_CAP (1u << 22) /* 4M entries (~128 MB).
  * At ~580K dispatches/s during boot, this retains ~7s of history; at
  * ~10K/s during modal idle, ~400s. Sized for retroactive press-window
  * analysis without the prior 16K ring's 28-ms eviction problem. */
+#endif
 typedef struct {
     uint64_t seq;       /* monotonic, unique per entry */
     uint32_t target;    /* entry PC (RAM address) */
@@ -241,7 +245,11 @@ typedef struct {
 extern DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP];
 extern uint64_t              g_dirty_ram_block_log_seq;
 
+#if defined(PSX_UWP)
+#define DIRTY_RAM_FLOW_LOG_CAP (1u << 13)
+#else
 #define DIRTY_RAM_FLOW_LOG_CAP (1u << 16)
+#endif
 typedef struct {
     uint64_t seq;
     uint32_t pc;
@@ -257,7 +265,11 @@ typedef struct {
 extern DirtyRamFlowLogEntry g_dirty_ram_flow_log[DIRTY_RAM_FLOW_LOG_CAP];
 extern uint64_t             g_dirty_ram_flow_log_seq;
 
+#if defined(PSX_UWP)
+#define DIRTY_RAM_INSN_LOG_CAP (1u << 13)
+#else
 #define DIRTY_RAM_INSN_LOG_CAP (1u << 16)
+#endif
 typedef struct {
     uint64_t seq;
     uint32_t pc;

@@ -38,78 +38,35 @@ void psx_fiber_destroy(psx_fiber_t fiber) { if (fiber) DeleteFiber((LPVOID)fiber
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <stdlib.h>
 
-typedef struct {
-    HANDLE thread;
-    HANDLE event_run;
-    HANDLE event_yield;
-    psx_fiber_entry entry;
-    void* arg;
-    int is_main;
-} uwp_fiber_t;
-
-static DWORD tls_index = TLS_OUT_OF_INDEXES;
-
-static DWORD WINAPI fiber_thread_proc(LPVOID param) {
-    uwp_fiber_t* fib = (uwp_fiber_t*)param;
-    TlsSetValue(tls_index, fib);
-    WaitForSingleObjectEx(fib->event_run, INFINITE, FALSE);
-    fib->entry(fib->arg);
-    return 0;
+psx_fiber_t psx_fiber_convert_thread(void)
+{
+    void* fiber = ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
+    if (!fiber && GetLastError() == ERROR_ALREADY_FIBER)
+        fiber = GetCurrentFiber();
+    return (psx_fiber_t)fiber;
 }
 
-psx_fiber_t psx_fiber_convert_thread(void) {
-    if (tls_index == TLS_OUT_OF_INDEXES) tls_index = TlsAlloc();
-    uwp_fiber_t* fib = (uwp_fiber_t*)calloc(1, sizeof(uwp_fiber_t));
-    fib->is_main = 1;
-    TlsSetValue(tls_index, fib);
-    return (psx_fiber_t)fib;
+psx_fiber_t psx_fiber_current(void)
+{
+    return (psx_fiber_t)GetCurrentFiber();
 }
 
-psx_fiber_t psx_fiber_current(void) {
-    if (tls_index == TLS_OUT_OF_INDEXES) return NULL;
-    return (psx_fiber_t)TlsGetValue(tls_index);
+psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg)
+{
+    return (psx_fiber_t)CreateFiberEx((SIZE_T)stack_size, 0,
+                                     FIBER_FLAG_FLOAT_SWITCH,
+                                     (LPFIBER_START_ROUTINE)entry, arg);
 }
 
-psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg) {
-    uwp_fiber_t* fib = (uwp_fiber_t*)calloc(1, sizeof(uwp_fiber_t));
-    fib->event_run = CreateEventEx(NULL, NULL, 0, EVENT_ALL_ACCESS);
-    fib->event_yield = CreateEventEx(NULL, NULL, 0, EVENT_ALL_ACCESS);
-    fib->entry = entry;
-    fib->arg = arg;
-    fib->thread = CreateThread(NULL, stack_size, fiber_thread_proc, fib, 0, NULL);
-    return (psx_fiber_t)fib;
+void psx_fiber_switch(psx_fiber_t target)
+{
+    if (target) SwitchToFiber((LPVOID)target);
 }
 
-void psx_fiber_switch(psx_fiber_t target) {
-    uwp_fiber_t* next = (uwp_fiber_t*)target;
-    uwp_fiber_t* curr = (uwp_fiber_t*)psx_fiber_current();
-    
-    if (!next->is_main) {
-        SetEvent(next->event_run);
-    } else {
-        SetEvent(curr->event_yield);
-    }
-    
-    if (!curr->is_main) {
-        WaitForSingleObjectEx(curr->event_run, INFINITE, FALSE);
-    } else {
-        WaitForSingleObjectEx(next->event_yield, INFINITE, FALSE);
-    }
-    TlsSetValue(tls_index, curr);
-}
-
-void psx_fiber_destroy(psx_fiber_t fiber) {
-    uwp_fiber_t* fib = (uwp_fiber_t*)fiber;
-    if (fib) {
-        if (!fib->is_main) {
-            CloseHandle(fib->thread);
-            CloseHandle(fib->event_run);
-            CloseHandle(fib->event_yield);
-        }
-        free(fib);
-    }
+void psx_fiber_destroy(psx_fiber_t fiber)
+{
+    if (fiber) DeleteFiber((LPVOID)fiber);
 }
 
 #else /* POSIX: ucontext */

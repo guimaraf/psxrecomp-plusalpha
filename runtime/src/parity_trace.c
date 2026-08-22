@@ -4,9 +4,13 @@
 #include "parity_trace.h"
 #include <string.h>
 
+#if defined(PSX_UWP)
+#define PARITY_RING_CAP (1u << 14)
+#else
 #define PARITY_RING_CAP 131072u  /* power of two; ~128K thread1 events of history
                                   * so the parked-thread1 divergence is in-window,
                                   * not just the wedge tail (~7.5 MB ring). */
+#endif
 
 static ParityEntry s_ring[PARITY_RING_CAP];
 static uint64_t    s_seq      = 0;

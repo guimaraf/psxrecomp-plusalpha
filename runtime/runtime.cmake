@@ -8,6 +8,12 @@ if(NOT DEFINED PSXRECOMP_ROOT)
     get_filename_component(PSXRECOMP_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
+set(PSX_UWP OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    set(PSX_UWP ON)
+    message(STATUS "psxrecomp: UWP/Xbox profile enabled")
+endif()
+
 # Default to an optimized build. The recompiled game is a huge (~270 MB) block of
 # generated C; with no CMAKE_BUILD_TYPE the compiler emits it at -O0 and the game
 # runs at a small fraction of full speed (terrible framerate). A naive
@@ -50,23 +56,30 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel"
 else()
     option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
 endif()
+if(PSX_UWP)
+    set(PSX_DEBUG_TOOLS OFF CACHE BOOL
+        "Debug server is unavailable in the Xbox UWP profile" FORCE)
+endif()
 
-if(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
+if(PSX_UWP)
+    find_package(SDL2 CONFIG REQUIRED)
+    if(TARGET SDL2::SDL2-static)
+        set(PSX_SDL_TARGET SDL2::SDL2-static)
+    elseif(TARGET SDL2::SDL2)
+        set(PSX_SDL_TARGET SDL2::SDL2)
+    else()
+        message(FATAL_ERROR "SDL2 UWP package does not export SDL2::SDL2-static or SDL2::SDL2")
+    endif()
+elseif(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
     if(MSVC)
-        file(GLOB SDL2_MSVC_DIR "${PSXRECOMP_ROOT}/../sdl2-msvc/SDL2-*")
-        if(SDL2_MSVC_DIR)
-            set(SDL2_INCLUDE_DIRS "${SDL2_MSVC_DIR}/include")
-            set(SDL2_LIBRARIES "${SDL2_MSVC_DIR}/lib/x64/SDL2.lib")
-            message(STATUS "SDL2 MSVC: ${SDL2_MSVC_DIR}")
-        else()
-            message(FATAL_ERROR "SDL2 MSVC dev package not found")
-        endif()
+        message(FATAL_ERROR
+            "Desktop MSVC game builds are not supported. Use MSYS2 UCRT64/MinGW; "
+            "MSVC is reserved for WindowsStore or framework tools that provide SDL2 explicitly.")
     else()
         get_filename_component(_psxrecomp_compiler_dir "${CMAKE_C_COMPILER}" DIRECTORY)
         find_program(_psxrecomp_pkg_config pkg-config
             HINTS "${_psxrecomp_compiler_dir}"
-            NO_DEFAULT_PATH
-        )
+            NO_DEFAULT_PATH)
         if(_psxrecomp_pkg_config)
             set(PKG_CONFIG_EXECUTABLE "${_psxrecomp_pkg_config}" CACHE FILEPATH "pkg-config executable" FORCE)
         endif()
@@ -100,6 +113,10 @@ endif()
 # lib/RmlUi + lib/freetype submodules. ON by default; the oracle/beetle builds
 # never include it. Turn OFF for a launcher-less runtime (boots straight in).
 option(PSX_LAUNCHER "Build the integrated RmlUi launcher UI" ON)
+if(PSX_UWP)
+    set(PSX_LAUNCHER OFF CACHE BOOL
+        "The Xbox UWP profile boots directly without the desktop launcher" FORCE)
+endif()
 
 # Build the vendored RmlUi + FreeType once per CMake project (idempotent — the
 # rmlui_core target guards re-entry). Both are linked statically into the exe so
@@ -148,13 +165,22 @@ function(psxrecomp_ensure_launcher_libs)
     endif()
 endfunction()
 
+if(PSX_UWP)
+    set(PSXRECOMP_GL_RENDERER_SOURCE
+        ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer_stub.c)
+else()
+    set(PSXRECOMP_GL_RENDERER_SOURCE
+        ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c)
+endif()
+
 set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/main.cpp
     ${PSXRECOMP_ROOT}/runtime/src/memory.c
+    ${PSXRECOMP_ROOT}/runtime/src/platform_paths.cpp
     ${PSXRECOMP_ROOT}/runtime/src/gpu.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
-    ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
+    ${PSXRECOMP_GL_RENDERER_SOURCE}
     ${PSXRECOMP_ROOT}/runtime/src/gpu_vk_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/dma.c
     ${PSXRECOMP_ROOT}/runtime/src/mdec.c
@@ -416,7 +442,9 @@ function(psxrecomp_add_runtime_target target)
     # --static link line (libSDL2.a + the full Windows system-lib chain SDL2
     # needs: winmm, imm32, ole32, oleaut32, version, setupapi, dinput8, ...).
     # Otherwise link the SDL2 import lib (needs SDL2.dll at runtime).
-    if(PSX_STATIC_RUNTIME AND SDL2_STATIC_LDFLAGS)
+    if(PSX_SDL_TARGET)
+        target_link_libraries(${target} PRIVATE ${PSX_SDL_TARGET})
+    elseif(PSX_STATIC_RUNTIME AND SDL2_STATIC_LDFLAGS)
         target_link_libraries(${target} PRIVATE ${SDL2_STATIC_LDFLAGS})
     else()
         target_link_libraries(${target} PRIVATE ${SDL2_LIBRARIES})
@@ -440,8 +468,13 @@ function(psxrecomp_add_runtime_target target)
         PSX_WINDOW_TITLE="${PSXRT_WINDOW_TITLE}"
         PSX_BUILD_REV="${PSX_GIT_REV}"
         FMT_HEADER_ONLY=1
-        $<$<CXX_COMPILER_ID:MSVC>:SDL_MAIN_HANDLED>
     )
+    if(MSVC AND NOT PSX_UWP)
+        target_compile_definitions(${target} PRIVATE SDL_MAIN_HANDLED)
+    endif()
+    if(PSX_UWP)
+        target_compile_definitions(${target} PRIVATE PSX_UWP=1 _CRT_SECURE_NO_WARNINGS)
+    endif()
 
     if(PSXRT_ORACLE)
         target_compile_definitions(${target} PRIVATE PSX_ORACLE_BUILD=1)
@@ -509,7 +542,9 @@ function(psxrecomp_add_runtime_target target)
             COMMENT "Copying launcher assets next to ${target}")
     endif()
 
-    if(WIN32 OR MINGW)
+    if(PSX_UWP)
+        # SDL2's WindowsStore target supplies the UWP platform libraries.
+    elseif(WIN32 OR MINGW)
         # opengl32: GL backend (gpu_gl_renderer.c). GL 1.x is exported directly
         # by opengl32; Phase 2b will load modern GL via SDL_GL_GetProcAddress.
         target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32 opengl32)
@@ -601,17 +636,19 @@ function(psxrecomp_add_runtime_target target)
             target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++)
         endif()
     elseif(MSVC)
-        target_compile_options(${target} PRIVATE -DPSXRECOMP_RUNTIME)
-        if(MSVC)
-            target_compile_options(${target} PRIVATE /std:c11 /experimental:c11atomics)
+        target_compile_definitions(${target} PRIVATE PSXRECOMP_RUNTIME)
+        target_compile_options(${target} PRIVATE
+            $<$<COMPILE_LANGUAGE:C>:/std:c11>
+            $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+        if(NOT PSX_UWP)
+            target_compile_options(${target} PRIVATE /GS- /guard:cf-)
+            target_link_options(${target} PRIVATE /STACK:67108864,67108864 /GUARD:NO)
+            # No console window in Release desktop MSVC builds. /ENTRY keeps
+            # main() as the entry point while using the Windows subsystem.
+            target_link_options(${target} PRIVATE
+                $<$<CONFIG:Release>:/SUBSYSTEM:WINDOWS>
+                $<$<CONFIG:Release>:/ENTRY:mainCRTStartup>)
         endif()
-        target_compile_options(${target} PRIVATE /GS- /guard:cf-)
-        target_link_options(${target} PRIVATE /STACK:67108864,67108864 /GUARD:NO)
-        # No console window in Release MSVC builds. /ENTRY keeps main() as
-        # the entry point (not WinMain) while switching to the Windows subsystem.
-        target_link_options(${target} PRIVATE
-            $<$<CONFIG:Release>:/SUBSYSTEM:WINDOWS>
-            $<$<CONFIG:Release>:/ENTRY:mainCRTStartup>)
     endif()
 endfunction()
 

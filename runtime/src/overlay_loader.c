@@ -179,7 +179,11 @@ static int s_active_depth = 0;
  * interest — never "arm a trace then hope". s_native_inprogress holds the entry
  * currently executing (nonzero at dump => a native fn was entered and never
  * returned: a freeze INSIDE native code, the strongest single suspect). */
+#if defined(PSX_UWP)
+#define NRING_CAP 1024
+#else
 #define NRING_CAP 16384
+#endif
 typedef struct { uint32_t addr; uint32_t crc; uint32_t frame; uint64_t seq; int returned; } NRingEnt;
 static NRingEnt s_nring[NRING_CAP];
 static uint32_t s_nring_pos = 0;
@@ -3020,7 +3024,11 @@ typedef struct {
     uint32_t in_regs[34];    /* r0..r31, hi, lo at entry                       */
     uint32_t out_regs[34];   /* r0..r31, hi, lo at exit                        */
 } FpEnt;
+#if defined(PSX_UWP)
+#define FP_CAP (1u << 12)
+#else
 #define FP_CAP (1u << 16)   /* ~19 MB with full reg files; ~65K executions     */
+#endif
 static FpEnt    s_fp[FP_CAP];
 static uint64_t s_fp_seq = 0;
 

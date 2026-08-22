@@ -12,7 +12,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#if !defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP
 #include <dbghelp.h>
+#endif
 #endif
 
 /* State accessors. All defined in other compilation units; declared here
@@ -169,7 +171,7 @@ static uint32_t    s_ring_count = 0;
 static int      s_dump_armed = 1;
 static uint32_t s_last_wedge_kind = 0;  /* informational, last detected kind */
 
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
 /* Capture the main thread's call stack at the moment of a hard freeze.
  *
  * Called from the heartbeat thread when wedge_kind==1 (frame_count not
@@ -524,7 +526,7 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     debug_server_freeze_dump_dirty_block_json(f, DUMP_CAP_DIRTY_BLOCK);
     fputs(",\n", f);
 
-#ifdef _WIN32
+#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
     /* Main-thread call stack. Hard freeze (wedge_kind==1): one snapshot of the
      * wedged thread in `main_stack`. Still-running wedges (kind 2 reentry
      * storm, kind 3 slow frames): a single frame is noise — take multiple

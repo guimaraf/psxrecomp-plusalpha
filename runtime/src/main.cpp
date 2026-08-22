@@ -52,6 +52,7 @@
 #include "disc_identity.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
+#include "platform_paths.h"
 #if defined(PSX_LAUNCHER)
 #include "launcher.h"
 #endif
@@ -502,7 +503,7 @@ static std::filesystem::path exe_dir_from_argv(const char* argv0) {
     // be a bare name or symlink (launched via PATH / a .desktop file). $APPIMAGE
     // is the .AppImage's own path, so settings.toml anchors next to it.
     if (exe_dir.empty()) {
-        if (const char* appimg = std::getenv("APPIMAGE"); appimg && appimg[0]) {
+        if (const char* appimg = ::getenv("APPIMAGE"); appimg && appimg[0]) {
             exe_dir = fs::absolute(appimg, ec).parent_path();
             if (ec) exe_dir.clear();
         }
@@ -695,32 +696,29 @@ static std::filesystem::path resolve_bios_path(const char* requested, const char
 static std::filesystem::path resolve_bios_for_runtime(const char* requested,
                                                       const char* argv0) {
 #if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
-    char* pref_path = SDL_GetPrefPath("psxrecomp", "alphaPlus");
-    if (!pref_path) return {};
-    std::filesystem::path local_state(pref_path);
-    SDL_free(pref_path);
-
-    std::filesystem::create_directories(local_state / "bios");
-    std::filesystem::create_directories(local_state / "disc");
-    std::filesystem::create_directories(local_state / "memoryCard");
-
-    auto copy_if_missing = [&](const char* filename) {
-        if (!std::filesystem::exists(local_state / filename)) {
-            std::error_code ec;
-            std::filesystem::copy_file(filename, local_state / filename, ec);
-        }
-    };
-    copy_if_missing("game.toml");
-    copy_if_missing("input.ini");
-
-    std::filesystem::path picked = local_state / "bios" / "SCPH1001.BIN";
+    const std::filesystem::path picked =
+        PSXRuntime::platform_paths().bios_dir / "SCPH1001.BIN";
     if (!std::filesystem::exists(picked)) {
-        FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
-        if (f) {
-            fprintf(f, "ERROR: BIOS file not found at: %s\n", picked.string().c_str());
-            fclose(f);
-        }
-        std::exit(0);
+        std::fprintf(stderr, "psxrecomp UWP: BIOS não encontrada em %s\n",
+                     picked.string().c_str());
+        return {};
+    }
+
+    std::ifstream bios(picked, std::ios::binary | std::ios::ate);
+    std::streamoff size = -1;
+    if (bios) size = static_cast<std::streamoff>(bios.tellg());
+    if (size != 512 * 1024) {
+        std::fprintf(stderr,
+                     "psxrecomp UWP: BIOS inválida; SCPH1001.BIN deve ter 524288 bytes.\n");
+        return {};
+    }
+    bios.seekg(0, std::ios::beg);
+    std::vector<uint8_t> bytes((size_t)size);
+    bios.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+    if (!bios || crc32_compute(bytes.data(), bytes.size()) != 0x37157331u) {
+        std::fprintf(stderr,
+                     "psxrecomp UWP: BIOS inválida; CRC32 esperado para SCPH1001.BIN: 37157331.\n");
+        return {};
     }
     return picked;
 #else
@@ -770,19 +768,18 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
                                                       const std::string& game_id,
                                                       const char* argv0) {
 #if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
-    char* pref_path = SDL_GetPrefPath("psxrecomp", "alphaPlus");
-    if (!pref_path) return {};
-    std::filesystem::path local_state(pref_path);
-    SDL_free(pref_path);
-
-    std::filesystem::path picked = local_state / "disc" / "game.cue";
+    const std::filesystem::path picked =
+        PSXRuntime::platform_paths().disc_dir / "game.cue";
     if (!std::filesystem::exists(picked)) {
-        FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
-        if (f) {
-            fprintf(f, "ERROR: Disc file not found at: %s\n", picked.string().c_str());
-            fclose(f);
-        }
-        std::exit(0);
+        std::fprintf(stderr, "psxrecomp UWP: disco não encontrado em %s\n",
+                     picked.string().c_str());
+        return {};
+    }
+    const DiscValidation validation = validate_disc_image(picked, game_id);
+    if (!validation.opened || !validation.has_header || !validation.id_matches) {
+        std::fprintf(stderr, "psxrecomp UWP: disco inválido: %s\n",
+                     validation.detail.c_str());
+        return {};
     }
     return picked;
 #else
@@ -868,7 +865,12 @@ static std::filesystem::path resolve_bios_path(const char* requested, const char
 // block) specifies one: the executable's directory (authoritative, never cwd —
 // see exe_dir_from_argv), so saves always live next to the binary.
 static std::filesystem::path default_memcard_dir(const char* argv0) {
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+    (void)argv0;
+    return PSXRuntime::platform_paths().saves_dir;
+#else
     return exe_dir_from_argv(argv0);
+#endif
 }
 
 static void close_controller(void);
@@ -1057,7 +1059,7 @@ static void runtime_perf_diag_tick() {
     static uint32_t last_overlay_loads = 0;
     static uint64_t last_overlay_load_us = 0;
     if (enabled < 0) {
-        const char *e = std::getenv("PSX_RUNTIME_PERF_DIAG");
+        const char *e = ::getenv("PSX_RUNTIME_PERF_DIAG");
         enabled = e && e[0] && e[0] != '0';
     }
     if (!enabled) return;
@@ -1410,7 +1412,12 @@ static void load_input_config(const char* argv0) {
     set_default_controller_mapping();
 
     namespace fs = std::filesystem;
-    fs::path config_path = exe_dir_from_argv(argv0) / "input.ini";
+    fs::path config_path =
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+        PSXRuntime::mutable_config_path("input.ini");
+#else
+        exe_dir_from_argv(argv0) / "input.ini";
+#endif
     std::error_code ec;
     if (!fs::exists(config_path, ec)) {
         std::ofstream out(config_path, std::ios::binary);
@@ -1464,7 +1471,12 @@ static void load_input_config(const char* argv0) {
      * from input.ini's gamepad map. Loads the user's map (or writes defaults on
      * first run). The launcher may have just edited+saved this file; we re-read
      * it here so the runtime always reflects the current bindings. */
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+    const std::string keybinds_root = PSXRuntime::platform_paths().config_dir.string();
+    psx_keybinds_init(keybinds_root.c_str());
+#else
     psx_keybinds_init(argv0);
+#endif
 }
 
 static void close_player(PlayerInput& p) {
@@ -1754,8 +1766,17 @@ static bool hybrid_dpad_active(const PlayerInput& p, int player, bool kb_always)
 static bool dev_any_input_enabled() {
     static int cached = -1;
     if (cached < 0) {
-        const char* e = std::getenv("PSX_DEV_INPUT");
-        cached = (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F')) ? 0 : 1;
+        const char* e = ::getenv("PSX_DEV_INPUT");
+        if (e) {
+            cached = (e[0] == '0' || e[0] == 'n' || e[0] == 'N' ||
+                      e[0] == 'f' || e[0] == 'F') ? 0 : 1;
+        } else {
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+            cached = 0;
+#else
+            cached = 1;
+#endif
+        }
     }
     return cached != 0;
 }
@@ -2646,9 +2667,32 @@ static void sdl_vblank_present(void) {
 }
 
 int main(int argc, char** argv) {
-    /* Force line-buffered output so messages appear even if killed. */
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    std::string platform_error;
+    if (!PSXRuntime::initialize_platform_paths(exe_dir_from_argv(argv[0]),
+                                               &platform_error)) {
+        if (!PSXRuntime::platform_paths().logs_dir.empty()) {
+            (void)PSXRuntime::redirect_platform_logs(nullptr);
+        }
+        std::fprintf(stderr, "psxrecomp: falha ao preparar os caminhos: %s\n",
+                     platform_error.c_str());
+        return 1;
+    }
+    if (!PSXRuntime::redirect_platform_logs(&platform_error)) {
+        std::fprintf(stderr, "psxrecomp: falha ao abrir o log: %s\n",
+                     platform_error.c_str());
+        return 1;
+    }
+    if (PSXRuntime::platform_paths().uwp && PSXRuntime::platform_paths().first_run) {
+        std::fprintf(stdout, "CREATE_FOLDERS_SUCCESS: %s\n",
+                     PSXRuntime::platform_paths().user_root.string().c_str());
+        return 0;
+    }
+    /* UWP streams were made unbuffered by redirect_platform_logs(). Desktop
+     * keeps line buffering, with the non-zero size required by the UCRT. */
+#if !defined(WINAPI_FAMILY) || (WINAPI_FAMILY != WINAPI_FAMILY_APP)
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+    std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
+#endif
     std::fprintf(stderr, "psxrecomp: main() entered\n");
     std::fflush(stderr);
 
@@ -2726,7 +2770,7 @@ int main(int argc, char** argv) {
             }
         }
     }
-    if (const char *e = std::getenv("PSX_HEADLESS")) {
+    if (const char *e = ::getenv("PSX_HEADLESS")) {
         if (e[0] && e[0] != '0') {
             g_headless = 1;
             force_no_launcher = true;
@@ -2735,13 +2779,19 @@ int main(int argc, char** argv) {
 
     std::string default_game_config_storage;
     if (!game_config_path) {
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+        const std::filesystem::path default_game_config =
+            PSXRuntime::mutable_config_path("game.toml");
+#else
         std::filesystem::path default_game_config =
             resolve_existing_runtime_path(PSX_DEFAULT_GAME_CONFIG_PATH, argv[0]);
+#endif
         if (!default_game_config.empty()) {
             default_game_config_storage = default_game_config.string();
             game_config_path = default_game_config_storage.c_str();
         }
-    } else if (!std::filesystem::path(game_config_path).is_absolute()) {
+    } else if (!PSXRuntime::platform_paths().uwp &&
+               !std::filesystem::path(game_config_path).is_absolute()) {
         // An explicit --game with a relative path must ALSO anchor on the exe
         // dir, never cwd — otherwise the disc / memcard_dir / game_options.toml
         // that resolve against this file's parent silently point at cwd. Resolve
@@ -2936,7 +2986,7 @@ int main(int argc, char** argv) {
              * touch this flag, so applying it here (config-load time) is stable.
              * Full history + removal plan: psxrecomp sio.c g_pad_legacy_cfg. */
             sio_set_legacy_cfg(gc.runtime.legacy_pad_config ? 1 : 0);
-            { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
+            { const char *e = ::getenv("PSX_GL_FORCE_CPU_PRESENT");
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
@@ -3094,8 +3144,12 @@ int main(int argc, char** argv) {
     bool skip_launcher_setting = false;  /* [launcher] skip_launcher from settings.toml */
     std::string settings_bios_storage;  /* must outlive resolve_bios_for_runtime */
     {
-        std::filesystem::path settings_path =
+        const std::filesystem::path settings_path =
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+            PSXRuntime::mutable_config_path("settings.toml");
+#else
             exe_dir_from_argv(argv[0]) / "settings.toml";
+#endif
         const PSXRecompV4::UserSettings us =
             PSXRecompV4::load_user_settings(settings_path);
         if (us.parse_error) {
@@ -3196,11 +3250,11 @@ int main(int argc, char** argv) {
     /* Latency knobs: env overrides win over config (for A/B measurement).
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive);
      * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|90+. */
-    if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
-    if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
-    if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
+    if (const char *e = ::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
+    if (const char *e = ::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
+    if (const char *e = ::getenv("PSX_FRAME_INTERPOLATION"))
         g_frame_interpolation = atoi(e) ? 1 : 0;
-    if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION_FPS")) {
+    if (const char *e = ::getenv("PSX_FRAME_INTERPOLATION_FPS")) {
         int fps = atoi(e);
         if (fps == 0 || fps >= 90) g_frame_interpolation_fps = fps;
     }
@@ -3208,7 +3262,15 @@ int main(int argc, char** argv) {
     /* Resolve the effective memory-card directory now (before the launcher) so
      * the launcher can introspect the real card files. The same default is used
      * by the runtime below. */
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+    memcard_dir = PSXRuntime::platform_paths().saves_dir;
+    memcard1_path.clear();
+    memcard2_path.clear();
+    memcard1_enabled = true;
+    memcard2_enabled = true;
+#else
     if (memcard_dir.empty()) memcard_dir = default_memcard_dir(argv[0]);
+#endif
 
     /* The game's OWN native OPTION settings (game_options.toml, next to
      * game.toml) — persisted across launches, kept separate from game.toml
@@ -3262,7 +3324,7 @@ int main(int argc, char** argv) {
      * This removes the dismiss-the-launcher round-trip for scripted/debug runs. */
     const bool want_launcher =
         force_launcher ||
-        (!std::getenv("PSX_NO_LAUNCHER") && !force_no_launcher && !skip_launcher_setting);
+        (!::getenv("PSX_NO_LAUNCHER") && !force_no_launcher && !skip_launcher_setting);
     if (want_launcher) {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) == 0) {
             PSXRecompV4::UserSettings seed;
@@ -3405,13 +3467,21 @@ int main(int argc, char** argv) {
     std::filesystem::path resolved_bios = resolve_bios_for_runtime(bios_path, argv[0]);
     if (resolved_bios.empty()) {
         std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+        return 0;
+#else
         return 1;
+#endif
     }
     if (game_config_path || disc_override_path || !resolved_disc.empty()) {
         resolved_disc = resolve_disc_for_runtime(resolved_disc, disc_override_path, game_id, argv[0]);
         if (game_config_path && resolved_disc.empty()) {
             std::fprintf(stderr, "psxrecomp: no disc image selected; exiting.\n");
+#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+            return 0;
+#else
             return 1;
+#endif
         }
     }
 
@@ -3422,24 +3492,6 @@ int main(int argc, char** argv) {
     std::string disc_path_str    = resolved_disc.string();
 
     std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s\n", bios_path_str.c_str());
-    
-#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
-    FILE* bios_f = fopen(bios_path_str.c_str(), "rb");
-    if (!bios_f) {
-        char* pref_path = SDL_GetPrefPath("psxrecomp", "alphaPlus");
-        if (pref_path) {
-            std::filesystem::path local_state(pref_path);
-            SDL_free(pref_path);
-            FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
-            if (f) {
-                fprintf(f, "ERROR: fopen failed for BIOS at: %s\n", bios_path_str.c_str());
-                fclose(f);
-            }
-        }
-    } else {
-        fclose(bios_f);
-    }
-#endif
 
     memory_init(bios_path_str.c_str());
 #ifndef PSX_HAVE_VULKAN
@@ -3525,21 +3577,8 @@ int main(int argc, char** argv) {
     if (g_audio_spu_hq)
         std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
     spu_init();
-    
-#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
-    {
-        char* pref_path = SDL_GetPrefPath("psxrecomp", "alphaPlus");
-        if (pref_path) {
-            std::filesystem::path local_state(pref_path);
-            SDL_free(pref_path);
-            FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
-            if (f) {
-                fprintf(f, "INFO: BIOS loaded successfully. Attempting to load disc: %s\n", disc_path_str.c_str());
-                fclose(f);
-            }
-        }
-    }
-#endif
+    std::fprintf(stdout, "psxrecomp: BIOS carregada; abrindo disco %s\n",
+                 disc_path_str.c_str());
 
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
     if (!disc_path_str.empty()) {
@@ -3860,9 +3899,9 @@ int main(int argc, char** argv) {
      * aliases the boot-skip alone. Env overrides: PSX_BIOS_HLE /
      * PSX_BIOS_HLE_KEEP_INTRO ('0' = off, anything else = on). */
     {
-        if (const char* e = std::getenv("PSX_BIOS_HLE"))
+        if (const char* e = ::getenv("PSX_BIOS_HLE"))
             bios_hle = (e[0] && e[0] != '0');
-        if (const char* e = std::getenv("PSX_BIOS_HLE_KEEP_INTRO"))
+        if (const char* e = ::getenv("PSX_BIOS_HLE_KEEP_INTRO"))
             bios_hle_keep_intro = (e[0] && e[0] != '0');
         const bool boot_skip =
             (bios_hle && !bios_hle_keep_intro) || fast_boot;
@@ -3991,9 +4030,9 @@ int main(int argc, char** argv) {
      * arm-then-time). Watched TCB / freeze trigger / watch words are env-tunable;
      * defaults target the MMX6 cutscene→gameplay wedge (thread1 0xA000E35C,
      * trigger dispatch 0x800CD3F8, watch the handshake flag + state struct). */
-    if (const char* pt = std::getenv("PSX_PARITY_TRACE"); pt && pt[0] && pt[0] != '0') {
+    if (const char* pt = ::getenv("PSX_PARITY_TRACE"); pt && pt[0] && pt[0] != '0') {
         auto envhex = [](const char* k, uint32_t dflt) -> uint32_t {
-            const char* v = std::getenv(k);
+            const char* v = ::getenv(k);
             return (v && v[0]) ? (uint32_t)std::strtoul(v, nullptr, 0) : dflt;
         };
         uint32_t tcb     = envhex("PSX_PARITY_TCB",     0xA000E35Cu);
@@ -4007,7 +4046,7 @@ int main(int argc, char** argv) {
             0x800200F4u, /* func_8002000C resume point */
         };
         int wc = PARITY_WATCH_MAX;
-        if (const char* wl = std::getenv("PSX_PARITY_WATCH"); wl && wl[0]) {
+        if (const char* wl = ::getenv("PSX_PARITY_WATCH"); wl && wl[0]) {
             wc = 0; std::string s(wl); size_t p = 0;
             while (p < s.size() && wc < PARITY_WATCH_MAX) {
                 size_t c = s.find(',', p);
@@ -4028,8 +4067,8 @@ int main(int argc, char** argv) {
      * CD/DMA/timer/VBlank/SIO/SPU IRQ raise with its guest cycle for the
      * cross-process device-timing diff (tools/devtrace_diff.py). */
     {
-        const char* pt = std::getenv("PSX_PARITY_TRACE");
-        const char* dt = std::getenv("PSX_DEVTRACE");
+        const char* pt = ::getenv("PSX_PARITY_TRACE");
+        const char* dt = ::getenv("PSX_DEVTRACE");
         if ((pt && pt[0] && pt[0] != '0') || (dt && dt[0] && dt[0] != '0')) {
             device_trace_arm(1);
             std::fprintf(stdout, "psxrecomp: device-event trace ARMED\n");
@@ -4082,27 +4121,14 @@ int main(int argc, char** argv) {
     /* Diagnostic: the guest published a null PC at the top level (abnormal). With
      * PSX_EXIT_HALT set, halt-and-serve here instead of shutting down so the
      * still-loaded overlays + full guest state are live-inspectable over TCP. */
-    { const char *e = std::getenv("PSX_EXIT_HALT");
+    { const char *e = ::getenv("PSX_EXIT_HALT");
       if (e && e[0] && e[0] != '0') {
           extern void psx_fatal_halt(const char *reason);
           psx_fatal_halt("top-level dispatch returned PC=0 (abnormal boot exit — inspect live)");
       }
     }
 
-#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
-    {
-        char* pref_path = SDL_GetPrefPath("psxrecomp", "alphaPlus");
-        if (pref_path) {
-            std::filesystem::path local_state(pref_path);
-            SDL_free(pref_path);
-            FILE* f = fopen((local_state / "debug_log.txt").string().c_str(), "w");
-            if (f) {
-                fprintf(f, "INFO: recomp_init passed. Entering psx_scheduler_run().\n");
-                fclose(f);
-            }
-        }
-    }
-#endif
+    std::fprintf(stdout, "psxrecomp: recomp_init concluído; scheduler finalizado.\n");
 
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
     { extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;

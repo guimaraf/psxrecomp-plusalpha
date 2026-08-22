@@ -4,9 +4,13 @@
 #include "device_trace.h"
 #include <string.h>
 
+#if defined(PSX_UWP)
+#define DEVTRACE_RING_CAP (1u << 14)
+#else
 #define DEVTRACE_RING_CAP (1u << 20)  /* 1M events (~24 MB); covers the whole
                                        * boot->wedge window so the divergent
                                        * event is in-window, never evicted. */
+#endif
 
 static DevEvent  s_ring[DEVTRACE_RING_CAP];
 static uint64_t  s_seq   = 0;
