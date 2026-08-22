@@ -38,11 +38,18 @@ import audit_config
 # ── Patterns shared with codegen_audit.py (BIOS emit) ──────────────────
 RE_TAIL_CALL = re.compile(r'cpu->pc = 0x([0-9A-Fa-f]+)u?;\s*return;')
 
-# Game emit uses a switch/case dispatch table:
+# Legacy game emit used a switch/case dispatch table:
 #   case 0xADDRu: func_ADDR(cpu); return 1;
-# This is NOT the BIOS strict-translator's `{ 0xADDR, func_ADDR }` array.
-RE_DISPATCH_TABLE_ENTRY = re.compile(
+RE_DISPATCH_SWITCH_ENTRY = re.compile(
     r'case\s+0x([0-9A-Fa-f]+)u?\s*:\s*func_[0-9A-Fa-f]+\s*\(cpu\)'
+)
+
+# Current game emit uses records with resumable interior block aliases:
+#   {0xADDRu, 0xRESUMEu, RANGE_INDEXu, RANGE_COUNTu, func_OWNER},
+RE_DISPATCH_ARRAY_ENTRY = re.compile(
+    r'^\s*\{0x([0-9A-Fa-f]+)u?,\s*0x[0-9A-Fa-f]+u?,\s*'
+    r'[0-9]+u?,\s*[0-9]+u?,\s*func_[0-9A-Fa-f]+\s*\},?$',
+    re.M,
 )
 
 # ── Patterns specific to game full-function-emitter ────────────────────
@@ -110,7 +117,10 @@ def main():
 
     cba_lits = RE_CALL_BY_ADDR_LIT.findall(full_c)
     cba_lit_set = set(cfg.normalize_addr(int(t, 16)) for t in cba_lits)
-    table_entries = RE_DISPATCH_TABLE_ENTRY.findall(dispatch_c)
+    table_entries = (
+        RE_DISPATCH_SWITCH_ENTRY.findall(dispatch_c)
+        + RE_DISPATCH_ARRAY_ENTRY.findall(dispatch_c)
+    )
     table_set = set(cfg.normalize_addr(int(e, 16)) for e in table_entries)
 
     cba_in_code = {t for t in cba_lit_set if is_in_code(t)}
