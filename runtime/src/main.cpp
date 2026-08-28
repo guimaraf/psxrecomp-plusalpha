@@ -411,19 +411,144 @@ int      g_present_vsync_disabled = 0; /* 1 once self-heal tripped */
 }
 
 /* Turbo-through-loads (step 4). C linkage: debug_server.c reads/toggles the
- * enable and reports the frame counter. Enabled by game.toml [runtime]
+ * enable and reports the policy state. Enabled by game.toml [runtime]
  * turbo_loads (opt-in per game) or the turbo_loads TCP command. */
+enum {
+    TURBO_LOADS_STATE_NORMAL = 0,
+    TURBO_LOADS_STATE_QUALIFYING,
+    TURBO_LOADS_STATE_ACTIVE,
+    TURBO_LOADS_STATE_COOLDOWN
+};
 extern "C" {
 int      g_turbo_loads_enabled = 0;
 uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
+int      g_turbo_loads_active  = 0;
+int      g_turbo_loads_state   = TURBO_LOADS_STATE_NORMAL;
+uint32_t g_turbo_loads_qualify_ms = 0;
+uint32_t g_turbo_loads_cooldown_remaining_ms = 0;
+int64_t  g_turbo_loads_sector_idle_ms = -1;
+uint32_t g_turbo_loads_engage_ms = 1000u;
+uint32_t g_turbo_loads_idle_exit_ms = 250u;
+uint32_t g_turbo_loads_cooldown_ms = 500u;
 }
-/* Engage turbo only after a load has been continuously in progress for this many
- * frames. Filters brief incidental reads (e.g. a boss/stage-select screen that
- * streams XA music and reads a few preview sectors as you hover): each 1-2 frame
- * blip would otherwise flip turbo on, muting the music for the audio hangover and
- * stuttering the frame rate. Real loads hold for hundreds of frames, so they
- * lose only this brief authentic-paced prefix. */
-#define TURBO_LOADS_ENGAGE_FRAMES 20
+
+extern "C" const char* turbo_loads_policy_state_name(void) {
+    switch (g_turbo_loads_state) {
+    case TURBO_LOADS_STATE_QUALIFYING: return "qualifying";
+    case TURBO_LOADS_STATE_ACTIVE:     return "active";
+    case TURBO_LOADS_STATE_COOLDOWN:   return "cooldown";
+    default:                           return "normal";
+    }
+}
+
+static uint32_t turbo_loads_elapsed_ms(Uint64 now, Uint64 since,
+                                       Uint64 frequency) {
+    if (since == 0u || now <= since || frequency == 0u) return 0u;
+    Uint64 ticks = now - since;
+    Uint64 whole_seconds = ticks / frequency;
+    Uint64 remainder = ticks % frequency;
+    Uint64 elapsed = whole_seconds * 1000u + remainder * 1000u / frequency;
+    return elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed;
+}
+
+/* A load must deliver data sectors continuously for one host second before it
+ * can run unpaced. Host time is intentional: guest frames accelerate once
+ * turbo begins and therefore cannot define either qualification or exit.
+ * A sector-idle tail ends turbo even if the CD read command remains asserted.
+ * Cooldown prevents the following short transition from inheriting the
+ * previous load's qualification. */
+static int turbo_loads_policy_update(int game_started) {
+    static Uint64 state_since = 0;
+    const Uint64 now = SDL_GetPerformanceCounter();
+    const Uint64 frequency = SDL_GetPerformanceFrequency();
+    const int load_active = game_started && cdrom_load_in_progress();
+    const uint64_t sector_idle = cdrom_data_sector_idle_ms();
+    const int sectors_recent = sector_idle != UINT64_MAX &&
+        sector_idle <= (uint64_t)g_turbo_loads_idle_exit_ms;
+
+    g_turbo_loads_sector_idle_ms = sector_idle == UINT64_MAX
+        ? -1 : (int64_t)sector_idle;
+    g_turbo_loads_active = 0;
+
+    if (!g_turbo_loads_enabled || !game_started) {
+        g_turbo_loads_state = TURBO_LOADS_STATE_NORMAL;
+        g_turbo_loads_qualify_ms = 0;
+        g_turbo_loads_cooldown_remaining_ms = 0;
+        state_since = 0;
+        return 0;
+    }
+
+    switch (g_turbo_loads_state) {
+    case TURBO_LOADS_STATE_NORMAL:
+        g_turbo_loads_qualify_ms = 0;
+        g_turbo_loads_cooldown_remaining_ms = 0;
+        if (load_active && sectors_recent) {
+            g_turbo_loads_state = TURBO_LOADS_STATE_QUALIFYING;
+            state_since = now;
+        }
+        break;
+
+    case TURBO_LOADS_STATE_QUALIFYING: {
+        if (!load_active || !sectors_recent) {
+            g_turbo_loads_state = TURBO_LOADS_STATE_NORMAL;
+            g_turbo_loads_qualify_ms = 0;
+            state_since = 0;
+            break;
+        }
+        uint32_t elapsed = turbo_loads_elapsed_ms(now, state_since, frequency);
+        g_turbo_loads_qualify_ms = elapsed > g_turbo_loads_engage_ms
+            ? g_turbo_loads_engage_ms : elapsed;
+        if (elapsed >= g_turbo_loads_engage_ms) {
+            g_turbo_loads_state = TURBO_LOADS_STATE_ACTIVE;
+            g_turbo_loads_active = 1;
+            state_since = now;
+        }
+        break;
+    }
+
+    case TURBO_LOADS_STATE_ACTIVE:
+        g_turbo_loads_qualify_ms = g_turbo_loads_engage_ms;
+        if (!load_active || !sectors_recent) {
+            g_turbo_loads_state = TURBO_LOADS_STATE_COOLDOWN;
+            g_turbo_loads_qualify_ms = 0;
+            g_turbo_loads_cooldown_remaining_ms =
+                g_turbo_loads_cooldown_ms;
+            state_since = now;
+        } else {
+            g_turbo_loads_active = 1;
+        }
+        break;
+
+    case TURBO_LOADS_STATE_COOLDOWN: {
+        g_turbo_loads_qualify_ms = 0;
+        uint32_t elapsed = turbo_loads_elapsed_ms(now, state_since, frequency);
+        if (elapsed >= g_turbo_loads_cooldown_ms) {
+            g_turbo_loads_cooldown_remaining_ms = 0;
+            if (load_active && sectors_recent) {
+                g_turbo_loads_state = TURBO_LOADS_STATE_QUALIFYING;
+                state_since = now;
+            } else {
+                g_turbo_loads_state = TURBO_LOADS_STATE_NORMAL;
+                state_since = 0;
+            }
+        } else {
+            g_turbo_loads_cooldown_remaining_ms =
+                g_turbo_loads_cooldown_ms - elapsed;
+        }
+        break;
+    }
+
+    default:
+        g_turbo_loads_state = TURBO_LOADS_STATE_NORMAL;
+        g_turbo_loads_qualify_ms = 0;
+        g_turbo_loads_cooldown_remaining_ms = 0;
+        state_since = 0;
+        break;
+    }
+
+    return g_turbo_loads_active;
+}
+
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
 
@@ -2224,24 +2349,9 @@ static void sdl_vblank_present(void) {
     /* Turbo-active test, shared by the audio gate here and the pacing/
      * present gate below. sdl_audio_update owns the mute + fade-in/out +
      * debounce across turbo transitions (see its comment). */
-    int turbo_loads_active = 0;
-    if (g_turbo_loads_enabled) {
-        extern int fntrace_is_game_started(void);
-        /* Hysteresis: count consecutive frames the load has held, and only
-         * engage turbo once it is SUSTAINED (TURBO_LOADS_ENGAGE_FRAMES). This
-         * stops brief incidental reads on music screens (boss/stage select) from
-         * flickering turbo on and chopping the audio. cdrom_load_in_progress()
-         * already bridges short intra-load gaps (CD_BURST_GAP_FRAMES), so a real
-         * load's counter does not reset mid-load. */
-        static int load_run = 0;
-        if (fntrace_is_game_started() && cdrom_load_in_progress()) {
-            if (load_run < (1 << 20)) load_run++;
-        } else {
-            load_run = 0;
-        }
-        if (load_run >= TURBO_LOADS_ENGAGE_FRAMES)
-            turbo_loads_active = 1;
-    }
+    extern int fntrace_is_game_started(void);
+    int turbo_loads_active =
+        turbo_loads_policy_update(fntrace_is_game_started());
     /* HLE boot-skip window: from reset until the game entry PC first
      * dispatches, run unpaced so the (shell-skipped) BIOS kernel init +
      * SYSTEM.CNF + game EXE load compress to host speed. This replaces the
@@ -2336,13 +2446,41 @@ static void sdl_vblank_present(void) {
      * showed loads are paced by the game's own per-sector processing at
      * real time (2.2-4.8 sectors/frame against a 32-256 IRQ budget), so
      * host-speed execution is the lever that compresses load wall-time.
-     * Presents 1-in-30 so visual progress stays visible. */
+     *
+     * Presentation is limited by HOST time, not guest-vblank count. The old
+     * 1-in-30 policy produced only ~3.6 visible updates/s when this game ran a
+     * load near 108 vblanks/s, which looked like a freeze even though the guest
+     * was accelerating normally. A 30 Hz target aims for about 33 ms between
+     * visible updates without pacing the intervening guest frames. An absolute
+     * deadline carries guest-frame overshoot into the following slot instead of
+     * accumulating it as a permanent drop below the target cadence. */
+    static FramePacer pacer = { 0 };
+    static Uint64 tl_next_present = 0;
     if (turbo_loads_active) {
         g_turbo_loads_frames++;
-        static int tl_skip = 0;
-        const int TL_PRESENT_EVERY = 30;
-        tl_skip = (tl_skip + 1) % TL_PRESENT_EVERY;
-        if (tl_skip != 0) return;
+        pacer.next_deadline = 0;  /* normal pacing restarts cleanly after load */
+        constexpr Uint64 TL_PRESENT_HZ = 30u;
+        const Uint64 now = SDL_GetPerformanceCounter();
+        const Uint64 frequency = SDL_GetPerformanceFrequency();
+        const Uint64 min_present_ticks = frequency / TL_PRESENT_HZ;
+        if (min_present_ticks != 0) {
+            if (tl_next_present == 0) {
+                tl_next_present = now + min_present_ticks;
+            } else {
+                if (now < tl_next_present) return;
+
+                /* Skip overdue slots arithmetically, but issue only this one
+                 * present. This preserves phase without a catch-up burst. */
+                const Uint64 overdue_ticks = now - tl_next_present;
+                const Uint64 periods = overdue_ticks / min_present_ticks + 1u;
+                if (periods > (UINT64_MAX - tl_next_present) / min_present_ticks)
+                    tl_next_present = now + min_present_ticks;
+                else
+                    tl_next_present += periods * min_present_ticks;
+            }
+        }
+    } else {
+        tl_next_present = 0;
     }
 
     /* FMV auto-skip: run uncapped (no wall-clock pacing) and suppress nearly all
@@ -2356,16 +2494,15 @@ static void sdl_vblank_present(void) {
     }
 
     /* Wall-clock pacing: always runs once fast_boot has ended, even when the
-     * display is still disabled (e.g. game crt0 setup). Skipped only by the
-     * turbo and fast_boot early-returns above. frame_pacer_wait is the
-     * race-free replacement for the old open-coded loop whose double
-     * counter read could underflow into a ~24.7-day SDL_Delay (Bug B
-     * hard freeze). */
-    {
-        static FramePacer pacer = { 0 };
+     * display is still disabled (e.g. game crt0 setup). Load-turbo presents
+     * remain deliberately unpaced; the other turbo modes return above.
+     * frame_pacer_wait is the race-free replacement for the old open-coded
+     * loop whose double counter read could underflow into a ~24.7-day
+     * SDL_Delay (Bug B hard freeze). */
+    if (!turbo_loads_active) {
         frame_pacer_wait(&pacer, g_frame_period_ms);
+        latency_ring_mark(LAT_PACED);
     }
-    latency_ring_mark(LAT_PACED);
 
     /* Low-latency input: the early sample above is now ~one pacer-wait old.
      * Refresh the device state and re-sample right before present so the next

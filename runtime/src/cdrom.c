@@ -346,6 +346,13 @@ int cdrom_get_bursts(void *out, int max) {
 }
 uint32_t cdrom_get_burst_total(void) { return s_burst_count; }
 
+uint64_t cdrom_data_sector_idle_ms(void) {
+    if (s_burst_count == 0u) return UINT64_MAX;
+    const CdBurst *b = &s_bursts[(s_burst_count - 1u) % CD_BURST_CAP];
+    uint64_t now = host_ms();
+    return now >= b->end_ms ? now - b->end_ms : 0u;
+}
+
 static int sector_delay_cycles(void) {
     /* PS1 CPU is 33.8688 MHz. CD-ROM sectors arrive at 75 Hz in 1x
      * mode, or twice that rate when SetMode bit 7 enables double speed. */

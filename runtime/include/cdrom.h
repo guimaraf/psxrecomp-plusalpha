@@ -48,6 +48,13 @@ typedef struct CdBurstRecord {
 int      cdrom_get_bursts(void *out, int max);
 uint32_t cdrom_get_burst_total(void);
 
+/* Host-wall time since the most recent delivered data sector. Returns
+ * UINT64_MAX until the first data sector has been delivered. This is kept
+ * separate from cdrom_load_in_progress(): the latter deliberately bridges
+ * guest-frame gaps, while turbo qualification must not inherit acceleration
+ * across a host-visible idle interval. */
+uint64_t cdrom_data_sector_idle_ms(void);
+
 /* True while a data-sector load is in progress (read stream active or a
  * data sector delivered within the burst-gap window). XA streaming is never
  * a load. Drives turbo-through-loads (step 4). */

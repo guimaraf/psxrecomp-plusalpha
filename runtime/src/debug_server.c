@@ -68,8 +68,10 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  if defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64)
+#    include <intrin.h>
+#  endif
 #  if defined(__x86_64__) || defined(_M_X64)
-#    include <intrin.h>     /* __readgsqword — native stack-overflow guard */
 #    define PSX_STACK_GUARD 1
 #  endif
    typedef SOCKET sock_t;
@@ -133,6 +135,7 @@ static size_t s_resp_len = 0, s_resp_cap = 0;
 static int    s_resp_overflow = 0;
 static int    s_in_command = 0;            /* 1 while emu runs process_command  */
 static int    io_thread_main(void *arg);   /* defined near debug_server_poll    */
+static uint64_t monotonic_ms(void);         /* shared by timer instrumentation   */
 
 /* ---- Frame counter (set by record_frame caller) ---- */
 /* Non-static so other instrumentation (e.g. dirty_ram_interp.c) can stamp
@@ -2009,6 +2012,8 @@ void debug_server_synth_recurse_arm(void) { s_synth_recurse_armed = 1; }
 #endif
 
 static inline void cyc_watch_observe(uint32_t block_leader_phys);  /* defined below; used at fn-entry */
+static inline void pc_watch_observe(uint32_t block_leader_phys,
+                                    int interpreted);              /* defined below; used at fn-entry */
 void debug_server_log_call_entry(uint32_t func_addr) {
 #ifdef PSX_STACK_GUARD
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
@@ -2022,6 +2027,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
      * here). Sampled at function entry, before the body runs — matches the
      * Beetle side (PC==anchor, before execute). Covers the game-dispatch path
      * that debug_server_trace_dispatch misses. */
+    pc_watch_observe(func_addr & 0x1FFFFFFFu, 0);
     cyc_watch_observe(func_addr & 0x1FFFFFFFu);
 #endif
 #ifdef PSX_NO_DEBUG_TOOLS
@@ -2101,6 +2107,266 @@ void psx_bioscall_record(uint32_t table_base, uint32_t index, uint32_t func_ptr,
             s_bioscall_unique[slot].table_base = table_base; s_bioscall_unique[slot].index = index;
             s_bioscall_unique[slot].count = 1; s_bioscall_unique_count++; return;
         }
+    }
+}
+
+/* ---- pc_watch: multi-PC reachability observer --------------------------
+ *
+ * Keeps a fixed, hash-indexed watchlist of formal function entries and counts
+ * every observed hit in compiled and interpreted execution.  Unlike fntrace,
+ * this observer is not limited to psx_dispatch boundaries: it shares the
+ * universal block/PC hooks used by cyc_watch, so an internal JAL executed
+ * entirely inside dirty_ram_interp is visible as soon as its target PC runs.
+ *
+ * The table is debug-only and default-off.  The hot path performs one armed
+ * check and, when active, an O(1) open-addressed lookup.  Counts are aggregated
+ * instead of stored in a per-hit ring, allowing long interactive campaigns
+ * without saturation. */
+#define PC_WATCH_MAX_TARGETS 128u
+#define PC_WATCH_HASH_CAP    256u
+typedef struct {
+    uint32_t raw;
+    uint32_t phys;
+    uint64_t hits;
+    uint64_t native_hits;
+    uint64_t interpreted_hits;
+    uint32_t first_frame;
+    uint32_t last_frame;
+    uint64_t first_cycle;
+    uint64_t last_cycle;
+} PcWatchEntry;
+
+static PcWatchEntry s_pc_watch_entries[PC_WATCH_MAX_TARGETS];
+/* Hash slots store entry_index + 1; zero means empty. */
+static uint16_t s_pc_watch_hash[PC_WATCH_HASH_CAP];
+static volatile uint32_t s_pc_watch_count = 0;
+static volatile int s_pc_watch_armed = 0;
+static uint32_t s_pc_watch_last_phys = 0xFFFFFFFFu;
+static uint64_t s_pc_watch_last_cycle = 0xFFFFFFFFFFFFFFFFull;
+
+/* ---- pc_watch_timer: low-impact wall-time timeline ---------------------
+ *
+ * The regular interactive observer polls pc_watch_dump over TCP.  Commands
+ * are deliberately executed on the emulation thread, so repeated dumps can
+ * perturb the very frametime being investigated.  This companion sampler
+ * keeps the PC lookup/count on the emulation thread but mirrors only the
+ * matched counters plus the once-per-frame clock into atomics.  A low-priority
+ * SDL thread copies those mirrors into a preallocated buffer.  No socket,
+ * JSON, Python or disk I/O occurs while the timed window is active. */
+#define PC_WATCH_TIMER_DEFAULT_INTERVAL_MS 100u
+#define PC_WATCH_TIMER_DEFAULT_MAX_SECONDS 900u
+#define PC_WATCH_TIMER_MIN_INTERVAL_MS     50u
+#define PC_WATCH_TIMER_MAX_INTERVAL_MS     1000u
+#define PC_WATCH_TIMER_MAX_SECONDS         900u
+#define PC_WATCH_TIMER_MAX_SAMPLES         10002u
+
+#if defined(_MSC_VER)
+typedef volatile __int64 PcWatchAtomic64;
+static inline uint64_t pc_watch_atomic_load64(PcWatchAtomic64 *value)
+{
+    return (uint64_t)_InterlockedCompareExchange64(value, 0, 0);
+}
+static inline void pc_watch_atomic_store64(PcWatchAtomic64 *value,
+                                            uint64_t next)
+{
+    _InterlockedExchange64(value, (__int64)next);
+}
+#elif defined(__GNUC__) || defined(__clang__)
+typedef uint64_t PcWatchAtomic64;
+static inline uint64_t pc_watch_atomic_load64(PcWatchAtomic64 *value)
+{
+    return __atomic_load_n(value, __ATOMIC_RELAXED);
+}
+static inline void pc_watch_atomic_store64(PcWatchAtomic64 *value,
+                                            uint64_t next)
+{
+    __atomic_store_n(value, next, __ATOMIC_RELAXED);
+}
+#else
+/* Debug-only fallback for toolchains without a 64-bit atomic intrinsic. */
+typedef volatile uint64_t PcWatchAtomic64;
+static inline uint64_t pc_watch_atomic_load64(PcWatchAtomic64 *value)
+{
+    return *value;
+}
+static inline void pc_watch_atomic_store64(PcWatchAtomic64 *value,
+                                            uint64_t next)
+{
+    *value = next;
+}
+#endif
+
+static PcWatchAtomic64 s_pc_watch_timer_hit_mirror[PC_WATCH_MAX_TARGETS];
+static PcWatchAtomic64 s_pc_watch_timer_frame_mirror;
+static PcWatchAtomic64 s_pc_watch_timer_cycle_mirror;
+static SDL_atomic_t s_pc_watch_timer_active;
+static SDL_atomic_t s_pc_watch_timer_run;
+static SDL_Thread *s_pc_watch_timer_thread = NULL;
+static uint64_t *s_pc_watch_timer_host_ms = NULL;
+static uint64_t *s_pc_watch_timer_frames = NULL;
+static uint64_t *s_pc_watch_timer_cycles = NULL;
+static uint64_t *s_pc_watch_timer_hits = NULL;
+static uint32_t s_pc_watch_timer_interval_ms = 0;
+static uint32_t s_pc_watch_timer_capacity = 0;
+static uint32_t s_pc_watch_timer_sample_count = 0;
+static uint32_t s_pc_watch_timer_target_count = 0;
+static int s_pc_watch_timer_saturated = 0;
+
+static void pc_watch_timer_free_storage(void)
+{
+    free(s_pc_watch_timer_host_ms);
+    free(s_pc_watch_timer_frames);
+    free(s_pc_watch_timer_cycles);
+    free(s_pc_watch_timer_hits);
+    s_pc_watch_timer_host_ms = NULL;
+    s_pc_watch_timer_frames = NULL;
+    s_pc_watch_timer_cycles = NULL;
+    s_pc_watch_timer_hits = NULL;
+    s_pc_watch_timer_interval_ms = 0;
+    s_pc_watch_timer_capacity = 0;
+    s_pc_watch_timer_sample_count = 0;
+    s_pc_watch_timer_target_count = 0;
+    s_pc_watch_timer_saturated = 0;
+}
+
+static int pc_watch_timer_record_sample(void)
+{
+    uint32_t sample = s_pc_watch_timer_sample_count;
+    if (sample >= s_pc_watch_timer_capacity) {
+        s_pc_watch_timer_saturated = 1;
+        return 0;
+    }
+
+    s_pc_watch_timer_host_ms[sample] = monotonic_ms();
+    s_pc_watch_timer_frames[sample] =
+        pc_watch_atomic_load64(&s_pc_watch_timer_frame_mirror);
+    s_pc_watch_timer_cycles[sample] =
+        pc_watch_atomic_load64(&s_pc_watch_timer_cycle_mirror);
+    size_t base = (size_t)sample * (size_t)s_pc_watch_timer_target_count;
+    for (uint32_t i = 0; i < s_pc_watch_timer_target_count; i++) {
+        s_pc_watch_timer_hits[base + i] =
+            pc_watch_atomic_load64(&s_pc_watch_timer_hit_mirror[i]);
+    }
+    s_pc_watch_timer_sample_count = sample + 1u;
+    return 1;
+}
+
+static int pc_watch_timer_thread_main(void *arg)
+{
+    (void)arg;
+    (void)SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
+    while (SDL_AtomicGet(&s_pc_watch_timer_run)) {
+        SDL_Delay(s_pc_watch_timer_interval_ms);
+        if (!SDL_AtomicGet(&s_pc_watch_timer_run)) break;
+        pc_watch_timer_record_sample();
+    }
+    return 0;
+}
+
+static void pc_watch_timer_stop_internal(void)
+{
+    SDL_AtomicSet(&s_pc_watch_timer_active, 0);
+    SDL_AtomicSet(&s_pc_watch_timer_run, 0);
+    if (s_pc_watch_timer_thread) {
+        SDL_WaitThread(s_pc_watch_timer_thread, NULL);
+        s_pc_watch_timer_thread = NULL;
+    }
+}
+
+static void pc_watch_timer_clear_internal(void)
+{
+    pc_watch_timer_stop_internal();
+    pc_watch_timer_free_storage();
+}
+
+static inline void pc_watch_timer_publish_clock(void)
+{
+    if (!SDL_AtomicGet(&s_pc_watch_timer_active)) return;
+    pc_watch_atomic_store64(&s_pc_watch_timer_frame_mirror, s_frame_count);
+    pc_watch_atomic_store64(&s_pc_watch_timer_cycle_mirror,
+                            psx_get_cycle_count());
+}
+
+static int pc_watch_find(uint32_t phys)
+{
+    uint32_t slot = (phys * 2654435761u) & (PC_WATCH_HASH_CAP - 1u);
+    for (uint32_t probe = 0; probe < PC_WATCH_HASH_CAP; probe++) {
+        uint16_t stored = s_pc_watch_hash[slot];
+        if (stored == 0u) return -1;
+        uint32_t index = (uint32_t)stored - 1u;
+        if (index < s_pc_watch_count &&
+            s_pc_watch_entries[index].phys == phys) {
+            return (int)index;
+        }
+        slot = (slot + 1u) & (PC_WATCH_HASH_CAP - 1u);
+    }
+    return -1;
+}
+
+static int pc_watch_insert_hash(uint32_t phys, uint32_t index)
+{
+    uint32_t slot = (phys * 2654435761u) & (PC_WATCH_HASH_CAP - 1u);
+    for (uint32_t probe = 0; probe < PC_WATCH_HASH_CAP; probe++) {
+        if (s_pc_watch_hash[slot] == 0u) {
+            s_pc_watch_hash[slot] = (uint16_t)(index + 1u);
+            return 1;
+        }
+        slot = (slot + 1u) & (PC_WATCH_HASH_CAP - 1u);
+    }
+    return 0;
+}
+
+static void pc_watch_reset_counts(void)
+{
+    uint32_t count = s_pc_watch_count;
+    for (uint32_t i = 0; i < count; i++) {
+        PcWatchEntry *entry = &s_pc_watch_entries[i];
+        entry->hits = 0;
+        entry->native_hits = 0;
+        entry->interpreted_hits = 0;
+        entry->first_frame = 0;
+        entry->last_frame = 0;
+        entry->first_cycle = 0;
+        entry->last_cycle = 0;
+        pc_watch_atomic_store64(&s_pc_watch_timer_hit_mirror[i], 0u);
+    }
+    s_pc_watch_last_phys = 0xFFFFFFFFu;
+    s_pc_watch_last_cycle = 0xFFFFFFFFFFFFFFFFull;
+}
+
+static inline void pc_watch_observe(uint32_t block_leader_phys,
+                                    int interpreted)
+{
+    if (!s_pc_watch_armed) return;
+
+    uint32_t phys = block_leader_phys & 0x1FFFFFFFu;
+    int index = pc_watch_find(phys);
+    if (index < 0) return;
+
+    /* Dispatcher + native prologue, or dirty-dispatch + first interpreted
+     * instruction, can expose the same PC at the same guest cycle.  Count that
+     * pair once; a real re-entry necessarily advances the guest cycle. */
+    uint64_t cycle = psx_get_cycle_count();
+    if (phys == s_pc_watch_last_phys && cycle == s_pc_watch_last_cycle) return;
+    s_pc_watch_last_phys = phys;
+    s_pc_watch_last_cycle = cycle;
+
+    PcWatchEntry *entry = &s_pc_watch_entries[(uint32_t)index];
+    uint32_t frame = (uint32_t)s_frame_count;
+    if (entry->hits == 0u) {
+        entry->first_frame = frame;
+        entry->first_cycle = cycle;
+    }
+    entry->hits++;
+    if (interpreted) entry->interpreted_hits++;
+    else entry->native_hits++;
+    entry->last_frame = frame;
+    entry->last_cycle = cycle;
+    if (SDL_AtomicGet(&s_pc_watch_timer_active)) {
+        pc_watch_atomic_store64(
+            &s_pc_watch_timer_hit_mirror[(uint32_t)index], entry->hits);
+        pc_watch_atomic_store64(&s_pc_watch_timer_frame_mirror, frame);
+        pc_watch_atomic_store64(&s_pc_watch_timer_cycle_mirror, cycle);
     }
 }
 
@@ -2228,7 +2494,10 @@ void debug_server_cyc_observe(uint32_t block_leader_phys) {
     (void)block_leader_phys;
     return;
 #else
-    cyc_watch_observe(block_leader_phys & 0x1FFFFFFFu);
+    uint32_t phys = block_leader_phys & 0x1FFFFFFFu;
+    { extern int g_ls_dirty_observe;
+      pc_watch_observe(phys, g_ls_dirty_observe ? 1 : 0); }
+    cyc_watch_observe(phys);
     /* #2 lockstep comparator: per-basic-block compiled-vs-interp check. Self-gates
      * on the armed frame window; ~free (one branch) when disarmed. */
     { extern void ls_at_leader(uint32_t, CPUState*); extern CPUState *debug_cpu_ptr;
@@ -2244,6 +2513,7 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
     ls_suppress_begin();
     /* cyc_watch: compiled-dispatch path. func_addr is already the physical
      * (normalized) block leader. Sampled before the block runs. */
+    pc_watch_observe(func_addr & 0x1FFFFFFFu, 0);
     cyc_watch_observe(func_addr & 0x1FFFFFFFu);
 
     card_mgr_trace_record(func_addr, 1);
@@ -4717,6 +4987,7 @@ int debug_server_dirty_break_maybe_pause(uint32_t target, CPUState *cpu)
      * the block runs (same instant as the compiled path). This hook is
      * invoked unconditionally at every interp block entry, so the anchor
      * is observed even when no dirty-break range is set. */
+    pc_watch_observe(target & 0x1FFFFFFFu, 1);
     cyc_watch_observe(target & 0x1FFFFFFFu);
 
     if (!s_dirty_break_active) return 0;
@@ -8957,6 +9228,343 @@ static void handle_wtrace_ranges(int id, const char *json)
     free(buf);
 }
 
+/* ---- pc_watch command handlers (see pc_watch_observe above) ---- */
+
+/* Add one target to the persistent watchlist.  Arming begins immediately;
+ * callers normally add the whole list at the menu and issue pc_watch_reset at
+ * the precise gameplay boundary to discard setup/selection hits. */
+static void handle_pc_watch_arm(int id, const char *json)
+{
+    if (s_pc_watch_timer_thread ||
+        SDL_AtomicGet(&s_pc_watch_timer_active)) {
+        send_err(id, "pc_watch_timer is active; stop it before changing targets");
+        return;
+    }
+    char target_buf[64];
+    if (!json_get_str(json, "target", target_buf, sizeof(target_buf))) {
+        send_err(id, "pc_watch_arm requires target");
+        return;
+    }
+    uint32_t raw = hex_to_u32(target_buf);
+    uint32_t phys = raw & 0x1FFFFFFFu;
+    if (raw == 0u || (raw & 3u) != 0u) {
+        send_err(id, "pc_watch_arm target must be a non-zero aligned PC");
+        return;
+    }
+
+    s_pc_watch_armed = 0;
+    int existing = pc_watch_find(phys);
+    if (existing >= 0) {
+        s_pc_watch_armed = 1;
+        send_fmt("{\"id\":%d,\"ok\":true,\"slot\":%d,"
+                 "\"target\":\"0x%08X\",\"phys\":\"0x%08X\","
+                 "\"duplicate\":true,\"count\":%u,\"capacity\":%u}",
+                 id, existing, raw, phys, s_pc_watch_count,
+                 PC_WATCH_MAX_TARGETS);
+        return;
+    }
+    if (s_pc_watch_count >= PC_WATCH_MAX_TARGETS) {
+        s_pc_watch_armed = s_pc_watch_count > 0u ? 1 : 0;
+        send_err(id, "pc_watch target capacity reached");
+        return;
+    }
+
+    uint32_t index = s_pc_watch_count;
+    PcWatchEntry *entry = &s_pc_watch_entries[index];
+    memset(entry, 0, sizeof(*entry));
+    entry->raw = raw;
+    entry->phys = phys;
+    if (!pc_watch_insert_hash(phys, index)) {
+        memset(entry, 0, sizeof(*entry));
+        s_pc_watch_armed = s_pc_watch_count > 0u ? 1 : 0;
+        send_err(id, "pc_watch hash table full");
+        return;
+    }
+    s_pc_watch_count = index + 1u;
+    s_pc_watch_armed = 1;
+    send_fmt("{\"id\":%d,\"ok\":true,\"slot\":%u,"
+             "\"target\":\"0x%08X\",\"phys\":\"0x%08X\","
+             "\"duplicate\":false,\"count\":%u,\"capacity\":%u}",
+             id, index, raw, phys, s_pc_watch_count,
+             PC_WATCH_MAX_TARGETS);
+}
+
+/* Clear counters, retain all targets, and begin a fresh scenario window. */
+static void handle_pc_watch_reset(int id, const char *json)
+{
+    (void)json;
+    if (s_pc_watch_timer_thread ||
+        SDL_AtomicGet(&s_pc_watch_timer_active)) {
+        send_err(id, "pc_watch_timer is active; use pc_watch_timer_stop");
+        return;
+    }
+    s_pc_watch_armed = 0;
+    pc_watch_reset_counts();
+    s_pc_watch_armed = s_pc_watch_count > 0u ? 1 : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":%d,"
+             "\"count\":%u,\"frame\":%llu}",
+             id, s_pc_watch_armed ? 1 : 0, s_pc_watch_count,
+             (unsigned long long)s_frame_count);
+}
+
+/* Freeze counters at the end of a scenario without discarding the watchlist. */
+static void handle_pc_watch_stop(int id, const char *json)
+{
+    (void)json;
+    if (s_pc_watch_timer_thread ||
+        SDL_AtomicGet(&s_pc_watch_timer_active)) {
+        send_err(id, "pc_watch_timer is active; use pc_watch_timer_stop");
+        return;
+    }
+    s_pc_watch_armed = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":false,"
+             "\"count\":%u,\"frame\":%llu}",
+             id, s_pc_watch_count, (unsigned long long)s_frame_count);
+}
+
+/* Return aggregate counters in arm order.  There is no finite hit ring, so
+ * long gameplay windows cannot saturate; each target owns 64-bit counters. */
+static void handle_pc_watch_dump(int id, const char *json)
+{
+    (void)json;
+    uint32_t count = s_pc_watch_count;
+    uint64_t total_hits = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        total_hits += s_pc_watch_entries[i].hits;
+    }
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"id\":%d,\"ok\":true,\"armed\":%s,"
+             "\"count\":%u,\"capacity\":%u,\"frame\":%llu,"
+             "\"total_hits\":%llu,\"entries\":[",
+             id, s_pc_watch_armed ? "true" : "false", count,
+             PC_WATCH_MAX_TARGETS, (unsigned long long)s_frame_count,
+             (unsigned long long)total_hits);
+    send_line(buf);
+    for (uint32_t i = 0; i < count; i++) {
+        PcWatchEntry *entry = &s_pc_watch_entries[i];
+        snprintf(buf, sizeof(buf),
+                 "%s{\"slot\":%u,\"target\":\"0x%08X\","
+                 "\"phys\":\"0x%08X\",\"hits\":%llu,"
+                 "\"native_hits\":%llu,\"interpreted_hits\":%llu,"
+                 "\"first_frame\":%u,\"last_frame\":%u,"
+                 "\"first_cycle\":%llu,\"last_cycle\":%llu}",
+                 i == 0u ? "" : ",", i, entry->raw, entry->phys,
+                 (unsigned long long)entry->hits,
+                 (unsigned long long)entry->native_hits,
+                 (unsigned long long)entry->interpreted_hits,
+                 entry->first_frame, entry->last_frame,
+                 (unsigned long long)entry->first_cycle,
+                 (unsigned long long)entry->last_cycle);
+        send_line(buf);
+    }
+    send_line("]}");
+}
+
+static void handle_pc_watch_timer_state(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"running\":%s,"
+             "\"interval_ms\":%u,\"capacity\":%u,"
+             "\"sample_count\":%u,\"target_count\":%u,"
+             "\"saturated\":%s}",
+             id,
+             SDL_AtomicGet(&s_pc_watch_timer_active) ? "true" : "false",
+             s_pc_watch_timer_interval_ms, s_pc_watch_timer_capacity,
+             s_pc_watch_timer_sample_count, s_pc_watch_timer_target_count,
+             s_pc_watch_timer_saturated ? "true" : "false");
+}
+
+/* Reset aggregate counts, preallocate the complete timeline and start the
+ * low-priority sampler.  The first sample is captured synchronously at this
+ * command boundary; later samples never pass through the TCP command path. */
+static void handle_pc_watch_timer_start(int id, const char *json)
+{
+    if (s_pc_watch_timer_thread ||
+        SDL_AtomicGet(&s_pc_watch_timer_active)) {
+        send_err(id, "pc_watch_timer is already running");
+        return;
+    }
+    uint32_t target_count = s_pc_watch_count;
+    if (target_count == 0u) {
+        send_err(id, "pc_watch_timer requires at least one pc_watch target");
+        return;
+    }
+
+    int interval_raw = json_get_int(
+        json, "interval_ms", (int)PC_WATCH_TIMER_DEFAULT_INTERVAL_MS);
+    int max_seconds_raw = json_get_int(
+        json, "max_seconds", (int)PC_WATCH_TIMER_DEFAULT_MAX_SECONDS);
+    if (interval_raw < (int)PC_WATCH_TIMER_MIN_INTERVAL_MS ||
+        interval_raw > (int)PC_WATCH_TIMER_MAX_INTERVAL_MS) {
+        send_err(id, "pc_watch_timer interval_ms must be between 50 and 1000");
+        return;
+    }
+    if (max_seconds_raw < 1 ||
+        max_seconds_raw > (int)PC_WATCH_TIMER_MAX_SECONDS) {
+        send_err(id, "pc_watch_timer max_seconds must be between 1 and 900");
+        return;
+    }
+
+    uint32_t interval_ms = (uint32_t)interval_raw;
+    uint32_t max_seconds = (uint32_t)max_seconds_raw;
+    uint64_t capacity64 =
+        (((uint64_t)max_seconds * 1000u) + interval_ms - 1u) /
+        interval_ms + 2u;
+    if (capacity64 > PC_WATCH_TIMER_MAX_SAMPLES) {
+        send_err(id, "pc_watch_timer request exceeds the 10002-sample limit");
+        return;
+    }
+    uint32_t capacity = (uint32_t)capacity64;
+    size_t hit_values = (size_t)capacity * (size_t)target_count;
+
+    pc_watch_timer_clear_internal();
+    s_pc_watch_timer_interval_ms = interval_ms;
+    s_pc_watch_timer_capacity = capacity;
+    s_pc_watch_timer_target_count = target_count;
+    s_pc_watch_timer_host_ms =
+        (uint64_t *)calloc((size_t)capacity, sizeof(uint64_t));
+    s_pc_watch_timer_frames =
+        (uint64_t *)calloc((size_t)capacity, sizeof(uint64_t));
+    s_pc_watch_timer_cycles =
+        (uint64_t *)calloc((size_t)capacity, sizeof(uint64_t));
+    s_pc_watch_timer_hits =
+        (uint64_t *)calloc(hit_values, sizeof(uint64_t));
+    if (!s_pc_watch_timer_host_ms || !s_pc_watch_timer_frames ||
+        !s_pc_watch_timer_cycles || !s_pc_watch_timer_hits) {
+        pc_watch_timer_free_storage();
+        send_err(id, "pc_watch_timer could not allocate the sample buffer");
+        return;
+    }
+
+    s_pc_watch_armed = 0;
+    pc_watch_reset_counts();
+    pc_watch_atomic_store64(&s_pc_watch_timer_frame_mirror, s_frame_count);
+    pc_watch_atomic_store64(&s_pc_watch_timer_cycle_mirror,
+                            psx_get_cycle_count());
+    SDL_AtomicSet(&s_pc_watch_timer_active, 1);
+    SDL_AtomicSet(&s_pc_watch_timer_run, 1);
+    pc_watch_timer_record_sample();
+    s_pc_watch_timer_thread = SDL_CreateThread(
+        pc_watch_timer_thread_main, "psx-pc-watch-timer", NULL);
+    if (!s_pc_watch_timer_thread) {
+        SDL_AtomicSet(&s_pc_watch_timer_active, 0);
+        SDL_AtomicSet(&s_pc_watch_timer_run, 0);
+        pc_watch_timer_free_storage();
+        send_err(id, "pc_watch_timer could not create the sampler thread");
+        return;
+    }
+    s_pc_watch_armed = 1;
+    send_fmt("{\"id\":%d,\"ok\":true,\"running\":true,"
+             "\"interval_ms\":%u,\"max_seconds\":%u,"
+             "\"capacity\":%u,\"target_count\":%u,"
+             "\"sample_count\":%u}",
+             id, interval_ms, max_seconds, capacity, target_count,
+             s_pc_watch_timer_sample_count);
+}
+
+/* Stop first, then append a final synchronous sample.  The join is bounded by
+ * interval_ms because the sampler only sleeps between in-memory copies. */
+static void handle_pc_watch_timer_stop(int id, const char *json)
+{
+    (void)json;
+    int was_running = s_pc_watch_timer_thread != NULL ||
+        SDL_AtomicGet(&s_pc_watch_timer_active);
+    s_pc_watch_armed = 0;
+    pc_watch_timer_stop_internal();
+    if (was_running && s_pc_watch_timer_capacity > 0u) {
+        pc_watch_atomic_store64(&s_pc_watch_timer_frame_mirror, s_frame_count);
+        pc_watch_atomic_store64(&s_pc_watch_timer_cycle_mirror,
+                                psx_get_cycle_count());
+        pc_watch_timer_record_sample();
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"running\":false,"
+             "\"was_running\":%s,\"sample_count\":%u,"
+             "\"target_count\":%u,\"saturated\":%s,"
+             "\"frame\":%llu}",
+             id, was_running ? "true" : "false",
+             s_pc_watch_timer_sample_count, s_pc_watch_timer_target_count,
+             s_pc_watch_timer_saturated ? "true" : "false",
+             (unsigned long long)s_frame_count);
+}
+
+/* The potentially large JSON is built only after the timed window stopped. */
+static void handle_pc_watch_timer_dump(int id, const char *json)
+{
+    (void)json;
+    if (s_pc_watch_timer_thread ||
+        SDL_AtomicGet(&s_pc_watch_timer_active)) {
+        send_err(id, "pc_watch_timer is running; stop it before dump");
+        return;
+    }
+    if (!s_pc_watch_timer_host_ms || s_pc_watch_timer_sample_count == 0u) {
+        send_err(id, "pc_watch_timer has no completed timeline");
+        return;
+    }
+
+    char buf[4096];
+    snprintf(buf, sizeof(buf),
+             "{\"id\":%d,\"ok\":true,\"running\":false,"
+             "\"interval_ms\":%u,\"capacity\":%u,"
+             "\"sample_count\":%u,\"target_count\":%u,"
+             "\"saturated\":%s,\"targets\":[",
+             id, s_pc_watch_timer_interval_ms, s_pc_watch_timer_capacity,
+             s_pc_watch_timer_sample_count, s_pc_watch_timer_target_count,
+             s_pc_watch_timer_saturated ? "true" : "false");
+    send_line(buf);
+    for (uint32_t i = 0; i < s_pc_watch_timer_target_count; i++) {
+        snprintf(buf, sizeof(buf), "%s\"0x%08X\"",
+                 i == 0u ? "" : ",", s_pc_watch_entries[i].raw);
+        send_line(buf);
+    }
+    send_line("],\"samples\":[");
+    for (uint32_t sample = 0;
+         sample < s_pc_watch_timer_sample_count; sample++) {
+        size_t pos = (size_t)snprintf(
+            buf, sizeof(buf),
+            "%s{\"sample\":%u,\"host_ms\":%llu,"
+            "\"frame\":%llu,\"cycle\":%llu,\"hits\":[",
+            sample == 0u ? "" : ",", sample,
+            (unsigned long long)s_pc_watch_timer_host_ms[sample],
+            (unsigned long long)s_pc_watch_timer_frames[sample],
+            (unsigned long long)s_pc_watch_timer_cycles[sample]);
+        size_t base = (size_t)sample *
+                      (size_t)s_pc_watch_timer_target_count;
+        for (uint32_t i = 0; i < s_pc_watch_timer_target_count; i++) {
+            pos += (size_t)snprintf(
+                buf + pos, sizeof(buf) - pos, "%s%llu",
+                i == 0u ? "" : ",",
+                (unsigned long long)s_pc_watch_timer_hits[base + i]);
+        }
+        snprintf(buf + pos, sizeof(buf) - pos, "]}");
+        send_line(buf);
+    }
+    send_line("]}");
+}
+
+static void handle_pc_watch_timer_clear(int id, const char *json)
+{
+    (void)json;
+    s_pc_watch_armed = 0;
+    pc_watch_timer_clear_internal();
+    send_ok(id);
+}
+
+/* Disarm and remove every target. */
+static void handle_pc_watch_clear(int id, const char *json)
+{
+    (void)json;
+    s_pc_watch_armed = 0;
+    pc_watch_timer_clear_internal();
+    s_pc_watch_count = 0;
+    memset(s_pc_watch_entries, 0, sizeof(s_pc_watch_entries));
+    memset(s_pc_watch_hash, 0, sizeof(s_pc_watch_hash));
+    s_pc_watch_last_phys = 0xFFFFFFFFu;
+    s_pc_watch_last_cycle = 0xFFFFFFFFFFFFFFFFull;
+    send_ok(id);
+}
+
 /* ---- cyc_watch command handlers (see cyc_watch_observe above) ---- */
 
 /* cyc_watch — arm an anchor PC. {"pc":"0x...","n":16}. Clears the ring,
@@ -10897,19 +11505,37 @@ static void handle_cd_overwrite(int id, const char *json)
 }
 
 /* turbo_loads: get/set the turbo-through-loads enable (step 4). Param "n"
- * (optional: 0/1). Reports the enable, whether the load predicate holds RIGHT
- * NOW, and how many vblanks have run unpaced. */
+ * (optional: 0/1). Reports both the raw CD predicate and the host-time policy
+ * state so a short transition can be distinguished from sustained turbo. */
 static void handle_turbo_loads(int id, const char *json)
 {
     extern int      g_turbo_loads_enabled;
     extern uint64_t g_turbo_loads_frames;
+    extern int      g_turbo_loads_active;
+    extern uint32_t g_turbo_loads_qualify_ms;
+    extern uint32_t g_turbo_loads_cooldown_remaining_ms;
+    extern int64_t  g_turbo_loads_sector_idle_ms;
+    extern uint32_t g_turbo_loads_engage_ms;
+    extern uint32_t g_turbo_loads_idle_exit_ms;
+    extern uint32_t g_turbo_loads_cooldown_ms;
+    extern const char *turbo_loads_policy_state_name(void);
     extern int      fntrace_is_game_started(void);
     int n = json_get_int(json, "n", -1);
     if (n == 0 || n == 1) g_turbo_loads_enabled = n;
     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"load_active\":%d,"
-             "\"game_started\":%d,\"turbo_frames\":%llu}\n",
+             "\"game_started\":%d,\"turbo_active\":%d,\"state\":\"%s\","
+             "\"qualify_ms\":%u,\"sector_idle_ms\":%lld,"
+             "\"cooldown_remaining_ms\":%u,"
+             "\"engage_ms\":%u,\"idle_exit_ms\":%u,\"cooldown_ms\":%u,"
+             "\"turbo_frames\":%llu}\n",
              id, g_turbo_loads_enabled, cdrom_load_in_progress(),
              fntrace_is_game_started(),
+             g_turbo_loads_active, turbo_loads_policy_state_name(),
+             g_turbo_loads_qualify_ms,
+             (long long)g_turbo_loads_sector_idle_ms,
+             g_turbo_loads_cooldown_remaining_ms,
+             g_turbo_loads_engage_ms, g_turbo_loads_idle_exit_ms,
+             g_turbo_loads_cooldown_ms,
              (unsigned long long)g_turbo_loads_frames);
 }
 
@@ -12501,6 +13127,16 @@ static const CmdEntry s_commands[] = {
     { "freeze_check",      handle_freeze_check },
     { "d44_ring",          handle_d44_ring },
     { "irqctx_ring",       handle_irqctx_ring },
+    { "pc_watch_arm",      handle_pc_watch_arm },
+    { "pc_watch_reset",    handle_pc_watch_reset },
+    { "pc_watch_stop",     handle_pc_watch_stop },
+    { "pc_watch_dump",     handle_pc_watch_dump },
+    { "pc_watch_clear",    handle_pc_watch_clear },
+    { "pc_watch_timer_state", handle_pc_watch_timer_state },
+    { "pc_watch_timer_start", handle_pc_watch_timer_start },
+    { "pc_watch_timer_stop",  handle_pc_watch_timer_stop },
+    { "pc_watch_timer_dump",  handle_pc_watch_timer_dump },
+    { "pc_watch_timer_clear", handle_pc_watch_timer_clear },
     { "cyc_watch",         handle_cyc_watch },
     { "cyc_watch_dump",    handle_cyc_watch_dump },
     { "cyc_watch_clear",   handle_cyc_watch_clear },
@@ -13240,6 +13876,7 @@ void debug_server_record_frame(void)
 
     s_history_count = s_frame_count + 1;
     s_frame_count++;
+    pc_watch_timer_publish_clock();
     /* Layer-1 first-divergence: snapshot the cumulative write fingerprint for
      * the frame that just completed. Tagged with the new frame number so two
      * runs line up by frame index. */
@@ -13282,6 +13919,7 @@ void debug_server_check_watchpoints(void)
 
 void debug_server_shutdown(void)
 {
+    pc_watch_timer_clear_internal();
     /* Stop the I/O thread: clear the flag, close the listen socket to break the
      * blocking accept(), then join. */
     s_io_running = 0;
