@@ -33,7 +33,7 @@ s = socket.socket()
 s.settimeout(5.0)
 s.connect(("127.0.0.1", port))
 s.sendall((json.dumps(req) + "\n").encode())
-data = b""
+data = bytearray()
 depth_c = 0
 depth_s = 0
 in_str = False
@@ -46,7 +46,10 @@ try:
         if not chunk:
             break
         for b in chunk:
-            data += bytes([b])
+            # bytearray.append() e O(1). A concatenacao de bytes imutaveis
+            # copiava toda a resposta a cada byte e tornava dumps grandes
+            # (como overlay_native_ring, perto de 2 MiB) quadraticos.
+            data.append(b)
             ch = chr(b)
             if in_str:
                 if esc: esc = False
