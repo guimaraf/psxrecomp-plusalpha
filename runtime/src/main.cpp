@@ -2972,7 +2972,7 @@ int main(int argc, char** argv) {
     int  p1_mode = PSXRecompV4::PAD_MODE_DIGITAL;
     int  p2_mode = PSXRecompV4::PAD_MODE_DIGITAL;
     bool ctrl_allow_hybrid = true;  /* game.toml [controller] allow_hybrid; false hides Hybrid in the launcher */
-    bool ctrl_lock_mode    = false; /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
+    bool ctrl_lock_mode    = true;  /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
     bool ctrl_lock_device  = false; /* game.toml [controller] lock_device; true hides the Player controller cards entirely */
     /* The game-DECLARED port modes, captured at game.toml load and immune to the
      * settings.toml overrides below. Under lock_mode these are the only valid

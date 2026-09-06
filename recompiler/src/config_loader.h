@@ -281,7 +281,7 @@ struct RuntimeConfig {
     // works as a plain digital pad because the DualShock config-mode handshake
     // is unhandled — so the player can't pick a broken mode. Supersedes
     // allow_hybrid (which only hides the Hybrid segment). Default false.
-    bool                  controller_lock_mode = false;
+    bool                  controller_lock_mode = true;
 
     // lock_device: when true the launcher HIDES the Player 1/2 controller cards
     // entirely (no device picker, no config) — the game's controller type is
