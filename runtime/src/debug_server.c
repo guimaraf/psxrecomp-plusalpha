@@ -13700,6 +13700,24 @@ void debug_server_init(int port)
     memset(s_snapshot_active, 0, sizeof(s_snapshot_active));
 }
 
+/* Bound how long a single recv() may wait inside recv_line: the I/O thread
+ * serves one connection at a time, so a client that connects but never
+ * finishes its '\n'-terminated request line would block every later
+ * connection too (the send side already bounds itself via SO_SNDTIMEO and
+ * SEND_TOTAL_BUDGET_MS). Per-call: a client that keeps sending still
+ * completes; only a silent one is dropped. */
+#define RECV_LINE_TIMEOUT_MS 10000
+
+static void set_recv_timeout(sock_t sock, unsigned ms)
+{
+#ifdef _WIN32
+    DWORD tmo = ms;
+#else
+    struct timeval tmo = { (long)(ms / 1000), (long)((ms % 1000) * 1000) };
+#endif
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof(tmo));
+}
+
 /* Read one '\n'-terminated line from a blocking socket into buf. Returns the
  * line length (NUL-terminated, newline stripped), or -1 on close/error. */
 static int recv_line(sock_t c, char *buf, int cap)
@@ -13729,6 +13747,7 @@ static int io_thread_main(void *arg)
         int clen = sizeof(caddr);
         sock_t c = accept(s_listen, (struct sockaddr *)&caddr, &clen);
         if (c == SOCK_INVALID) { if (!s_io_running) break; SDL_Delay(5); continue; }
+        set_recv_timeout(c, RECV_LINE_TIMEOUT_MS);
 
         char req[RECV_BUF_SIZE];
         int rl = recv_line(c, req, sizeof(req));

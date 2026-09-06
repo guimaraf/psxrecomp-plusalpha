@@ -5,6 +5,7 @@ Protocol: **JSON over newline**, one object per line, responses on same connecti
 - Request shape: `{"id": N, "cmd": "<command>", ...params}`
 - Success: `{"id": N, "ok": true, ...data}`
 - Failure: `{"id": N, "ok": false, "error": "<msg>"}`
+- A request line must complete within 10 s of connecting (or of the previous chunk); a client that stalls mid-line is disconnected so it cannot wedge the I/O thread for later connections.
 
 There are **two** servers, both implementing this protocol with overlapping command sets:
 
