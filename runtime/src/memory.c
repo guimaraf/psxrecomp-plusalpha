@@ -388,6 +388,34 @@ int dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
             g_text_native_blocked++;
             return 0;
         }
+
+        uint32_t first_page = phys >> DIRTY_RAM_PAGE_SHIFT;
+        uint32_t last_page = (phys + len - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+
+        /* Fast rejection: if any page in the range already diverged, block immediately. */
+        int diverged = 0;
+        int modified = 0;
+        for (uint32_t page = first_page; page <= last_page; page++) {
+            uint32_t bit = 1u << (page & 31u);
+            if (text_diverged_bitmap[page >> 5] & bit) {
+                diverged = 1;
+                break;
+            }
+            if ((text_modified_bitmap[page >> 5] & bit) ||
+                dirty_ram_is_dirty(page << DIRTY_RAM_PAGE_SHIFT)) {
+                modified = 1;
+            }
+        }
+        if (diverged) {
+            g_text_native_blocked++;
+            return 0;
+        }
+        /* Fast path: pages never touched by a guarded write and not runtime-dirty
+         * still hold the pristine compiled image — native is safe with no memcmp. */
+        if (!modified) {
+            continue;
+        }
+
         if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), len) != 0) {
             uint32_t off = 0;
             const uint8_t *live = ram + phys;
@@ -399,8 +427,6 @@ int dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
             g_text_exact_last_mismatch = phys + off;
             g_text_exact_last_live = off < len ? live[off] : 0;
             g_text_exact_last_ref = off < len ? ref[off] : 0;
-            uint32_t first_page = phys >> DIRTY_RAM_PAGE_SHIFT;
-            uint32_t last_page = (phys + len - 1u) >> DIRTY_RAM_PAGE_SHIFT;
             for (uint32_t page = first_page; page <= last_page; page++) {
                 uint32_t bit = 1u << (page & 31u);
                 uint32_t *word = &text_diverged_bitmap[page >> 5];
