@@ -256,12 +256,17 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             rt.video_low_latency_input = toml::find<bool>(video, "low_latency_input");
         }
         if (video.contains("vsync")) {
-            const auto mode = toml::find<std::string>(video, "vsync");
-            if      (mode == "on"  || mode == "vsync")     rt.video_vsync = 1;
-            else if (mode == "off" || mode == "immediate") rt.video_vsync = 0;
-            else if (mode == "adaptive")                   rt.video_vsync = -1;
-            else throw std::runtime_error(fmt::format(
-                "[video] vsync must be \"on\"|\"off\"|\"immediate\"|\"adaptive\": {}", mode));
+            const auto& val = toml::find(video, "vsync");
+            if (val.is_boolean()) {
+                rt.video_vsync = toml::find<bool>(video, "vsync") ? 1 : 0;
+            } else if (val.is_string()) {
+                const auto mode = toml::find<std::string>(video, "vsync");
+                if      (mode == "on"  || mode == "vsync")     rt.video_vsync = 1;
+                else if (mode == "off" || mode == "immediate") rt.video_vsync = 0;
+                else if (mode == "adaptive")                   rt.video_vsync = -1;
+                else throw std::runtime_error(fmt::format(
+                    "[video] vsync must be \"on\"|\"off\"|\"immediate\"|\"adaptive\": {}", mode));
+            }
         }
         if (video.contains("frame_interpolation")) {
             rt.video_frame_interpolation =
@@ -1156,10 +1161,16 @@ UserSettings load_user_settings(const fs::path& path) {
             s.has_low_latency_input = true;
         });
         if (v.contains("vsync")) try_get([&]{
-            const auto m = toml::find<std::string>(v, "vsync");
-            if      (m == "on"  || m == "vsync")    { s.vsync = 1;  s.has_vsync = true; }
-            else if (m == "off" || m == "immediate"){ s.vsync = 0;  s.has_vsync = true; }
-            else if (m == "adaptive")               { s.vsync = -1; s.has_vsync = true; }
+            const auto& val = toml::find(v, "vsync");
+            if (val.is_boolean()) {
+                s.vsync = toml::find<bool>(v, "vsync") ? 1 : 0;
+                s.has_vsync = true;
+            } else if (val.is_string()) {
+                const auto m = toml::find<std::string>(v, "vsync");
+                if      (m == "on"  || m == "vsync")    { s.vsync = 1;  s.has_vsync = true; }
+                else if (m == "off" || m == "immediate"){ s.vsync = 0;  s.has_vsync = true; }
+                else if (m == "adaptive")               { s.vsync = -1; s.has_vsync = true; }
+            }
         });
         if (v.contains("frame_interpolation")) try_get([&]{
             s.frame_interpolation = toml::find<bool>(v, "frame_interpolation");

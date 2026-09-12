@@ -379,6 +379,10 @@ button:hover { background-color: #232d3c; }
 					</span></div>
 				<div class="set-row"><span class="set-lbl">Fullscreen on launch</span><span class="set-ctl">
 					<button class="toggle" data-event-click="toggle_fullscreen"><span class="value" data-if="fullscreen">On</span><span class="value" data-if="fullscreen == false">Off</span></button></span></div>
+				<div class="set-row"><span class="set-lbl">Vertical sync (VSync)</span><span class="set-ctl">
+					<button class="toggle wide" data-event-click="cycle_vsync"><span class="value">{{vsync_label}}</span></button></span></div>
+				<div class="set-row"><span class="set-lbl">Low-latency input</span><span class="set-ctl">
+					<button class="toggle" data-event-click="toggle_low_latency_input"><span class="value" data-if="low_latency_input">On</span><span class="value" data-if="low_latency_input == false">Off</span></button></span></div>
 			<div class="set-row" data-if="ws_eligible"><span class="set-lbl">Widescreen <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
 				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>

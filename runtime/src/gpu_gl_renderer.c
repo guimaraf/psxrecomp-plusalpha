@@ -108,6 +108,7 @@
 #define PSXGL_UNPACK_ROW_LENGTH     0x0CF2
 #define PSXGL_SRC1_ALPHA            0x8589
 #define PSXGL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#define PSXGL_SYNC_FLUSH_COMMANDS_BIT 0x00000001
 #define PSXGL_TIMEOUT_IGNORED       0xFFFFFFFFFFFFFFFFull
 
 #ifndef APIENTRY
@@ -150,6 +151,7 @@ typedef void   (APIENTRY *PFN_glVertexAttribPointer)(GLuint, GLint, GLenum, GLbo
 typedef void   (APIENTRY *PFN_glEnableVertexAttribArray)(GLuint);
 typedef void   (APIENTRY *PFN_glBindFragDataLocationIndexed)(GLuint, GLuint, GLuint, const char *);
 typedef GLsync (APIENTRY *PFN_glFenceSync)(GLenum, GLbitfield);
+typedef GLenum (APIENTRY *PFN_glClientWaitSync)(GLsync, GLbitfield, GLuint64);
 typedef void   (APIENTRY *PFN_glWaitSync)(GLsync, GLbitfield, GLuint64);
 typedef void   (APIENTRY *PFN_glDeleteSync)(GLsync);
 typedef void   (APIENTRY *PFN_glGenFramebuffers)(GLsizei, GLuint *);
@@ -215,8 +217,10 @@ static PFN_glVertexAttribPointer p_glVertexAttribPointer;
 static PFN_glEnableVertexAttribArray p_glEnableVertexAttribArray;
 static PFN_glBindFragDataLocationIndexed p_glBindFragDataLocationIndexed;
 static PFN_glFenceSync p_glFenceSync;
+static PFN_glClientWaitSync p_glClientWaitSync;
 static PFN_glWaitSync p_glWaitSync;
 static PFN_glDeleteSync p_glDeleteSync;
+static GLsync s_frame_fence = NULL;
 static PFN_glGenFramebuffers   p_glGenFramebuffers;
 static PFN_glDeleteFramebuffers p_glDeleteFramebuffers;
 static PFN_glBindFramebuffer   p_glBindFramebuffer;
@@ -268,6 +272,7 @@ static int load_modern_gl(void) {
     LOAD(p_glEnableVertexAttribArray, "glEnableVertexAttribArray");
     LOAD(p_glBindFragDataLocationIndexed, "glBindFragDataLocationIndexed");
     LOAD(p_glFenceSync, "glFenceSync");
+    LOAD(p_glClientWaitSync, "glClientWaitSync");
     LOAD(p_glWaitSync, "glWaitSync");
     LOAD(p_glDeleteSync, "glDeleteSync");
     LOAD(p_glGenFramebuffers, "glGenFramebuffers"); LOAD(p_glBindFramebuffer, "glBindFramebuffer");
@@ -2319,6 +2324,10 @@ void gl_renderer_shutdown(void) {
             p_glDeleteSync(s_interp_draw_fence);
             s_interp_draw_fence = NULL;
         }
+        if (s_frame_fence) {
+            p_glDeleteSync(s_frame_fence);
+            s_frame_fence = NULL;
+        }
         for (int i = 0; i < 3; i++) {
             if (s_interp_fence[i]) {
                 p_glDeleteSync(s_interp_fence[i]);
@@ -2334,6 +2343,21 @@ void gl_renderer_shutdown(void) {
     }
     free(s_conv); s_conv = NULL;
     s_raster_ok = 0;
+}
+
+/* Low-latency 1-frame GPU synchronization fence + glFlush. Limits the driver's
+ * pre-rendered command queue to at most 1 frame, eliminating queue bloat without
+ * causing GPU pipeline starvation. */
+static void gl_sync_frame_fence(void) {
+    if (p_glClientWaitSync && p_glFenceSync && p_glDeleteSync) {
+        if (s_frame_fence) {
+            p_glClientWaitSync(s_frame_fence, PSXGL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+            p_glDeleteSync(s_frame_fence);
+            s_frame_fence = NULL;
+        }
+        s_frame_fence = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    }
+    glFlush();
 }
 
 /* CPU-readout present (24-bit FMV frames and the PSX_GL_FORCE_CPU_PRESENT
@@ -2362,6 +2386,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0); p_glUseProgram(0);
     pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
+    gl_sync_frame_fence();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -3295,6 +3320,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
+    gl_sync_frame_fence();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -3387,6 +3413,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     present_target_quad(tex, g_wide_w, VRAM_H,
                         0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
+    gl_sync_frame_fence();
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);

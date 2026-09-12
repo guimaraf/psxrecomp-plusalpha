@@ -123,6 +123,8 @@ struct LauncherModel {
     bool ultrawide       = false; // separate EXPERIMENTAL 21:9 choice
     bool uw_eligible     = false; // per-game offer_ultrawide gate
     bool fullscreen      = false; // launch the game window in desktop fullscreen
+    int  vsync           = 1;     // 0=immediate, 1=vsync, -1=adaptive
+    bool low_latency_input = true;
     bool frame_interpolation = false;
     int  frame_interpolation_fps = 0; // 0 = current display refresh
     bool opengl_renderer = false;
@@ -143,6 +145,7 @@ struct LauncherModel {
     Rml::String aspect_label;
     Rml::String winsize_label;
     Rml::String interpolation_fps_label;
+    Rml::String vsync_label;
 
     // Disc verification (recomputed whenever disc_path changes).
     Rml::String disc_file;      // file name only, e.g. "tomba.cue"
@@ -504,6 +507,14 @@ std::string winsize_label_for(int width, int aspect_index) {
     return std::to_string(width) + " \xC3\x97 " + std::to_string(width * den / num);  // "1280 × 960"
 }
 
+const char* vsync_name(int v) {
+    switch (v) {
+        case 0:  return "Immediate";
+        case -1: return "Adaptive";
+        default: return "VSync";
+    }
+}
+
 void refresh_labels(LauncherModel& m) {
     m.renderer_label  = renderer_name(m.renderer);
     m.crt_label       = crt_name(m.crt);
@@ -511,6 +522,7 @@ void refresh_labels(LauncherModel& m) {
     m.aspect_label    = aspect_name(m.aspect_index);
     m.winsize_label   = winsize_label_for(m.window_width, m.aspect_index);
     m.interpolation_fps_label = interp_fps_label(m.frame_interpolation_fps);
+    m.vsync_label     = vsync_name(m.vsync);
     m.opengl_renderer = (m.renderer == 1);
     m.interpolation_target_visible = m.opengl_renderer && m.frame_interpolation;
     m.widescreen      = (m.aspect_index == 1);   // 16:9 == experimental native-wide
@@ -788,6 +800,8 @@ Result run(SDL_Window* window, void* gl_context,
     m.turbo_loads    = io.turbo_loads;
     m.bios_hle       = io.has_bios_hle ? io.bios_hle : true;
     m.fullscreen     = io.fullscreen;
+    m.vsync          = io.has_vsync ? io.vsync : 1;
+    m.low_latency_input = io.has_low_latency_input ? io.low_latency_input : true;
     m.frame_interpolation = false;
     m.frame_interpolation_fps = 0;
     m.skip_launcher  = io.skip_launcher;
@@ -872,6 +886,9 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("turbo_loads",    &m.turbo_loads);
     c.Bind("bios_hle",       &m.bios_hle);
     c.Bind("fullscreen",     &m.fullscreen);
+    c.Bind("vsync",          &m.vsync);
+    c.Bind("vsync_label",    &m.vsync_label);
+    c.Bind("low_latency_input", &m.low_latency_input);
     c.Bind("frame_interpolation", &m.frame_interpolation);
     c.Bind("interpolation_fps_label", &m.interpolation_fps_label);
     c.Bind("opengl_renderer", &m.opengl_renderer);
@@ -1104,6 +1121,20 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.fullscreen = !m.fullscreen;
             handle.DirtyVariable("fullscreen");
+        });
+    c.BindEventCallback("cycle_vsync",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            if (m.vsync == 1)      m.vsync = 0;
+            else if (m.vsync == 0) m.vsync = -1;
+            else                   m.vsync = 1;
+            refresh_labels(m);
+            handle.DirtyVariable("vsync");
+            handle.DirtyVariable("vsync_label");
+        });
+    c.BindEventCallback("toggle_low_latency_input",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.low_latency_input = !m.low_latency_input;
+            handle.DirtyVariable("low_latency_input");
         });
     c.BindEventCallback("toggle_frame_interpolation",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -1395,6 +1426,8 @@ Result run(SDL_Window* window, void* gl_context,
         io.turbo_loads = m.turbo_loads;       io.has_turbo_loads = true;
         io.bios_hle    = m.bios_hle;          io.has_bios_hle = true;
         io.fullscreen = m.fullscreen;         io.has_fullscreen = true;
+        io.vsync = m.vsync;                   io.has_vsync = true;
+        io.low_latency_input = m.low_latency_input; io.has_low_latency_input = true;
         io.frame_interpolation = false;
         io.has_frame_interpolation = true;
         io.frame_interpolation_fps = 0;
