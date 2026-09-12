@@ -268,6 +268,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                     "[video] vsync must be \"on\"|\"off\"|\"immediate\"|\"adaptive\": {}", mode));
             }
         }
+        if (video.contains("exclusive_fullscreen")) {
+            rt.video_exclusive_fullscreen = toml::find<bool>(video, "exclusive_fullscreen");
+        }
         if (video.contains("frame_interpolation")) {
             rt.video_frame_interpolation =
                 toml::find<bool>(video, "frame_interpolation");
@@ -1156,6 +1159,10 @@ UserSettings load_user_settings(const fs::path& path) {
         if (v.contains("fullscreen")) try_get([&]{
             s.fullscreen = toml::find<bool>(v, "fullscreen"); s.has_fullscreen = true;
         });
+        if (v.contains("exclusive_fullscreen")) try_get([&]{
+            s.exclusive_fullscreen = toml::find<bool>(v, "exclusive_fullscreen");
+            s.has_exclusive_fullscreen = true;
+        });
         if (v.contains("low_latency_input")) try_get([&]{
             s.low_latency_input = toml::find<bool>(v, "low_latency_input");
             s.has_low_latency_input = true;
@@ -1329,6 +1336,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "bios_hle          = " << (s.bios_hle ? "true" : "false") << "\n";
     if (s.has_fullscreen)
         f << "fullscreen        = " << (s.fullscreen ? "true" : "false") << "\n";
+    if (s.has_exclusive_fullscreen)
+        f << "exclusive_fullscreen = " << (s.exclusive_fullscreen ? "true" : "false") << "\n";
     if (s.has_low_latency_input)
         f << "low_latency_input = " << (s.low_latency_input ? "true" : "false") << "\n";
     if (s.has_vsync)

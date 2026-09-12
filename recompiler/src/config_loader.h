@@ -190,6 +190,7 @@ struct RuntimeConfig {
     // tear), -1=adaptive. The wall-clock pacer holds 59.94Hz regardless.
     bool                  video_low_latency_input = true;
     int                   video_vsync             = 1;
+    bool                  video_exclusive_fullscreen = false;
     bool                  video_frame_interpolation = false;
     int                   video_frame_interpolation_fps = 0; // 0 = display refresh
 
@@ -657,6 +658,7 @@ struct UserSettings {
     // launcher's "Fullscreen on launch" toggle; the in-game F11 / Alt+Enter
     // hotkey still toggles it live). false => windowed (default).
     bool has_fullscreen     = false; bool fullscreen     = false;
+    bool has_exclusive_fullscreen = false; bool exclusive_fullscreen = false;
     // Low-latency present knobs. low_latency_input re-samples the pad after the
     // wall-clock pacer (just before present) so the next CPU frame reads fresh
     // input instead of input ~one frame stale (the dominant input->photon cost

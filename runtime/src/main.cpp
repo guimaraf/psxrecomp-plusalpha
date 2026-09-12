@@ -287,6 +287,7 @@ static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 static int           g_video_renderer = 0;  /* 0=software, 1=opengl (requested) */
 static int           g_fullscreen     = 0;  /* launch the game window in desktop fullscreen */
+static int           g_exclusive_fullscreen = 0; /* 1=SDL_WINDOW_FULLSCREEN (exclusive mode/compositor bypass), 0=SDL_WINDOW_FULLSCREEN_DESKTOP */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
 static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
@@ -2327,15 +2328,15 @@ static void sdl_vblank_present(void) {
                     if (mod & KMOD_SHIFT) savestate_request_save(slot);
                     else                  savestate_request_load(slot);
                 }
-                /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. FULLSCREEN_DESKTOP
-                 * keeps the desktop resolution; the renderer's logical size
-                 * letterboxes the 640x480 image. */
+                /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F.
+                 * When exclusive_fullscreen is on, toggle SDL_WINDOW_FULLSCREEN;
+                 * otherwise toggle SDL_WINDOW_FULLSCREEN_DESKTOP (keeps desktop resolution). */
                 else if ((ev.key.keysym.sym == SDLK_RETURN && (mod & KMOD_ALT)) ||
                          (ev.key.keysym.sym == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
                     Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
-                                   SDL_WINDOW_FULLSCREEN_DESKTOP;
-                    SDL_SetWindowFullscreen(sdl_window,
-                        is_fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                                   (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP);
+                    Uint32 fs_mode = g_exclusive_fullscreen ? SDL_WINDOW_FULLSCREEN : SDL_WINDOW_FULLSCREEN_DESKTOP;
+                    SDL_SetWindowFullscreen(sdl_window, is_fs ? 0 : fs_mode);
                 }
             }
         }
@@ -3042,6 +3043,7 @@ int main(int argc, char** argv) {
             g_video_aspect_den = gc.runtime.video_aspect_den;
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
             g_video_vsync       = gc.runtime.video_vsync;
+            g_exclusive_fullscreen = gc.runtime.video_exclusive_fullscreen ? 1 : 0;
             g_frame_interpolation = gc.runtime.video_frame_interpolation ? 1 : 0;
             g_frame_interpolation_fps = gc.runtime.video_frame_interpolation_fps;
             g_fmv_skip_total_table = gc.runtime.video_fmv_skip_total_table;
@@ -3329,6 +3331,7 @@ int main(int argc, char** argv) {
         if (us.has_fast_boot)      fast_boot = us.fast_boot;
         if (us.has_bios_hle)       bios_hle  = us.bios_hle;
         if (us.has_fullscreen)     g_fullscreen      = us.fullscreen ? 1 : 0;
+        if (us.has_exclusive_fullscreen) g_exclusive_fullscreen = us.exclusive_fullscreen ? 1 : 0;
         if (us.has_aspect_ratio) {
             g_video_aspect_num = us.aspect_num;
             g_video_aspect_den = us.aspect_den;
@@ -3402,6 +3405,8 @@ int main(int argc, char** argv) {
         int fps = atoi(e);
         if (fps == 0 || fps >= 90) g_frame_interpolation_fps = fps;
     }
+    if (const char *e = ::getenv("PSX_EXCLUSIVE_FULLSCREEN"))
+        g_exclusive_fullscreen = atoi(e) ? 1 : 0;
 
     /* Resolve the effective memory-card directory now (before the launcher) so
      * the launcher can introspect the real card files. The same default is used
@@ -3482,6 +3487,7 @@ int main(int argc, char** argv) {
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
             seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
             seed.fullscreen = (g_fullscreen != 0);        seed.has_fullscreen = true;
+            seed.exclusive_fullscreen = (g_exclusive_fullscreen != 0); seed.has_exclusive_fullscreen = true;
             seed.frame_interpolation = (g_frame_interpolation != 0);
             seed.has_frame_interpolation = true;
             seed.frame_interpolation_fps = g_frame_interpolation_fps;
@@ -3568,6 +3574,7 @@ int main(int argc, char** argv) {
                 fast_boot = seed.fast_boot;
                 bios_hle  = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen ? 1 : 0;
+                g_exclusive_fullscreen = seed.exclusive_fullscreen ? 1 : 0;
                 g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
                 g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;
@@ -3807,6 +3814,8 @@ int main(int argc, char** argv) {
      * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
      * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
+    /* Compositor bypass hint for lowest display latency */
+    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -3851,10 +3860,13 @@ int main(int argc, char** argv) {
     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
     if (g_video_renderer == 1) win_flags |= SDL_WINDOW_OPENGL;
     if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
-    /* Fullscreen on launch (launcher "Fullscreen on launch" toggle). DESKTOP
-     * fullscreen keeps the desktop resolution and letterboxes the image, matching
-     * the in-game F11 / Alt+Enter hotkey behaviour. */
-    if (g_fullscreen) win_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    /* Fullscreen on launch (launcher "Fullscreen on launch" toggle).
+     * When exclusive_fullscreen is on, use SDL_WINDOW_FULLSCREEN (hardware display
+     * acquisition / compositor bypass). Otherwise use SDL_WINDOW_FULLSCREEN_DESKTOP
+     * (borderless fullscreen keeping desktop resolution). */
+    if (g_fullscreen) {
+        win_flags |= (g_exclusive_fullscreen ? SDL_WINDOW_FULLSCREEN : SDL_WINDOW_FULLSCREEN_DESKTOP);
+    }
     /* Open at the user-chosen window size (default 1280 wide) instead of the
      * old hardcoded 640x480, so the game doesn't boot into a tiny window. The
      * height follows the configured display aspect (4:3 native, wider for the

@@ -379,6 +379,8 @@ button:hover { background-color: #232d3c; }
 					</span></div>
 				<div class="set-row"><span class="set-lbl">Fullscreen on launch</span><span class="set-ctl">
 					<button class="toggle" data-event-click="toggle_fullscreen"><span class="value" data-if="fullscreen">On</span><span class="value" data-if="fullscreen == false">Off</span></button></span></div>
+				<div class="set-row"><span class="set-lbl">Exclusive fullscreen</span><span class="set-ctl">
+					<button class="toggle" data-event-click="toggle_exclusive_fullscreen"><span class="value" data-if="exclusive_fullscreen">On</span><span class="value" data-if="exclusive_fullscreen == false">Off</span></button></span></div>
 				<div class="set-row"><span class="set-lbl">Vertical sync (VSync)</span><span class="set-ctl">
 					<button class="toggle wide" data-event-click="cycle_vsync"><span class="value">{{vsync_label}}</span></button></span></div>
 				<div class="set-row"><span class="set-lbl">Low-latency input</span><span class="set-ctl">

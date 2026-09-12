@@ -123,6 +123,7 @@ struct LauncherModel {
     bool ultrawide       = false; // separate EXPERIMENTAL 21:9 choice
     bool uw_eligible     = false; // per-game offer_ultrawide gate
     bool fullscreen      = false; // launch the game window in desktop fullscreen
+    bool exclusive_fullscreen = false; // exclusive display acquisition / compositor bypass
     int  vsync           = 1;     // 0=immediate, 1=vsync, -1=adaptive
     bool low_latency_input = true;
     bool frame_interpolation = false;
@@ -800,6 +801,7 @@ Result run(SDL_Window* window, void* gl_context,
     m.turbo_loads    = io.turbo_loads;
     m.bios_hle       = io.has_bios_hle ? io.bios_hle : true;
     m.fullscreen     = io.fullscreen;
+    m.exclusive_fullscreen = io.has_exclusive_fullscreen ? io.exclusive_fullscreen : false;
     m.vsync          = io.has_vsync ? io.vsync : 1;
     m.low_latency_input = io.has_low_latency_input ? io.low_latency_input : true;
     m.frame_interpolation = false;
@@ -886,6 +888,7 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("turbo_loads",    &m.turbo_loads);
     c.Bind("bios_hle",       &m.bios_hle);
     c.Bind("fullscreen",     &m.fullscreen);
+    c.Bind("exclusive_fullscreen", &m.exclusive_fullscreen);
     c.Bind("vsync",          &m.vsync);
     c.Bind("vsync_label",    &m.vsync_label);
     c.Bind("low_latency_input", &m.low_latency_input);
@@ -1121,6 +1124,11 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.fullscreen = !m.fullscreen;
             handle.DirtyVariable("fullscreen");
+        });
+    c.BindEventCallback("toggle_exclusive_fullscreen",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.exclusive_fullscreen = !m.exclusive_fullscreen;
+            handle.DirtyVariable("exclusive_fullscreen");
         });
     c.BindEventCallback("cycle_vsync",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -1426,6 +1434,7 @@ Result run(SDL_Window* window, void* gl_context,
         io.turbo_loads = m.turbo_loads;       io.has_turbo_loads = true;
         io.bios_hle    = m.bios_hle;          io.has_bios_hle = true;
         io.fullscreen = m.fullscreen;         io.has_fullscreen = true;
+        io.exclusive_fullscreen = m.exclusive_fullscreen; io.has_exclusive_fullscreen = true;
         io.vsync = m.vsync;                   io.has_vsync = true;
         io.low_latency_input = m.low_latency_input; io.has_low_latency_input = true;
         io.frame_interpolation = false;
