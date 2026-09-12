@@ -11,6 +11,25 @@ body {
 #root { width: 100%; height: 100%; display: block; overflow-y: auto; }
 #frame { display: block; padding: 22dp 26dp; }
 
+/* ---- scrollbars ---- */
+scrollbarvertical {
+	width: 10dp;
+}
+scrollbarvertical slidertrack {
+	background-color: #11161f;
+	border-radius: 5dp;
+}
+scrollbarvertical sliderbar {
+	background-color: #2b3543;
+	border-radius: 5dp;
+}
+scrollbarvertical sliderbar:hover {
+	background-color: #3b82f6;
+}
+scrollbarvertical sliderbar:active {
+	background-color: #2563eb;
+}
+
 /* ---- top bar ---- */
 .topbar { display: flex; flex-direction: row; align-items: center; margin-bottom: 18dp; }
 .logo { width: 46dp; height: 46dp; margin-right: 16dp; decorator: image(img/logo.png contain); }
@@ -369,43 +388,44 @@ button:hover { background-color: #232d3c; }
 				<button class="toggle" data-event-click="cycle_texfilter"><span class="value">{{texfilter_label}}</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Screen model</span><span class="set-ctl">
 				<button class="toggle" data-event-click="cycle_crt"><span class="value">{{crt_label}}</span></button></span></div>
-				<div class="set-row"><span class="set-lbl">Skip FMVs</span><span class="set-ctl">
-					<button class="toggle" data-event-click="toggle_skip_fmv"><span class="value" data-if="auto_skip_fmv">On</span><span class="value" data-if="auto_skip_fmv == false">Off</span></button></span></div>
-				<div class="set-row"><span class="set-lbl">Turbo loads</span><span class="set-ctl">
-					<button class="toggle" data-event-click="toggle_turbo_loads"><span class="value" data-if="turbo_loads">On</span><span class="value" data-if="turbo_loads == false">Off</span></button>
-					</span></div>
-				<div class="set-row"><span class="set-lbl">Skip BIOS intro</span><span class="set-ctl">
-					<button class="toggle" data-event-click="toggle_bios_hle"><span class="value" data-if="bios_hle">On</span><span class="value" data-if="bios_hle == false">Off</span></button>
-					</span></div>
-				<div class="set-row"><span class="set-lbl">Fullscreen on launch</span><span class="set-ctl">
-					<button class="toggle" data-event-click="toggle_fullscreen"><span class="value" data-if="fullscreen">On</span><span class="value" data-if="fullscreen == false">Off</span></button></span></div>
-				<div class="set-row"><span class="set-lbl">Exclusive fullscreen</span><span class="set-ctl">
-					<button class="toggle" data-event-click="toggle_exclusive_fullscreen"><span class="value" data-if="exclusive_fullscreen">On</span><span class="value" data-if="exclusive_fullscreen == false">Off</span></button></span></div>
-				<div class="set-row"><span class="set-lbl">Vertical sync (VSync)</span><span class="set-ctl">
-					<button class="toggle wide" data-event-click="cycle_vsync"><span class="value">{{vsync_label}}</span></button></span></div>
-				<div class="set-row"><span class="set-lbl">Low-latency input</span><span class="set-ctl">
-					<button class="toggle" data-event-click="toggle_low_latency_input"><span class="value" data-if="low_latency_input">On</span><span class="value" data-if="low_latency_input == false">Off</span></button></span></div>
 			<div class="set-row" data-if="ws_eligible"><span class="set-lbl">Widescreen <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
 				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>
-			<div class="setting-row" data-if="uw_eligible"><span class="setting-name">Ultrawide <span class="exp">EXPERIMENTAL</span></span><span class="setting-control">
+			<div class="set-row" data-if="uw_eligible"><span class="set-lbl">Ultrawide <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_ultrawide"><span class="value" data-if="ultrawide">On</span><span class="value" data-if="ultrawide == false">Off</span></button>
 				<span class="ws-hint" data-if="ultrawide">21:9 native field-of-view</span></span></div>
 		</div>
+		<div class="panel">
+			<div class="eyebrow">PERFORMANCE &amp; SPEED</div>
+			<div class="set-row"><span class="set-lbl">Skip BIOS intro</span><span class="set-ctl">
+				<button class="toggle" data-event-click="toggle_bios_hle"><span class="value" data-if="bios_hle">On</span><span class="value" data-if="bios_hle == false">Off</span></button></span></div>
+			<div class="set-row"><span class="set-lbl">Turbo loads</span><span class="set-ctl">
+				<button class="toggle" data-event-click="toggle_turbo_loads"><span class="value" data-if="turbo_loads">On</span><span class="value" data-if="turbo_loads == false">Off</span></button></span></div>
+			<div class="set-row"><span class="set-lbl">Skip FMVs</span><span class="set-ctl">
+				<button class="toggle" data-event-click="toggle_skip_fmv"><span class="value" data-if="auto_skip_fmv">On</span><span class="value" data-if="auto_skip_fmv == false">Off</span></button></span></div>
+		</div>
 		</div>
 		<div class="settings-col">
+		<div class="panel">
+			<div class="eyebrow">DISPLAY &amp; LATENCY</div>
+			<div class="set-row"><span class="set-lbl">Fullscreen on launch</span><span class="set-ctl">
+				<button class="toggle" data-event-click="toggle_fullscreen"><span class="value" data-if="fullscreen">On</span><span class="value" data-if="fullscreen == false">Off</span></button></span></div>
+			<div class="set-row"><span class="set-lbl">Exclusive fullscreen</span><span class="set-ctl">
+				<button class="toggle" data-event-click="toggle_exclusive_fullscreen"><span class="value" data-if="exclusive_fullscreen">On</span><span class="value" data-if="exclusive_fullscreen == false">Off</span></button></span></div>
+			<div class="set-row"><span class="set-lbl">Vertical sync (VSync)</span><span class="set-ctl">
+				<button class="toggle wide" data-event-click="cycle_vsync"><span class="value">{{vsync_label}}</span></button></span></div>
+			<div class="set-row"><span class="set-lbl">Low-latency input</span><span class="set-ctl">
+				<button class="toggle" data-event-click="toggle_low_latency_input"><span class="value" data-if="low_latency_input">On</span><span class="value" data-if="low_latency_input == false">Off</span></button></span></div>
+		</div>
 		<div class="panel" data-if="lang_menu">
 			<div class="eyebrow">LOCALIZATION</div>
 			<div class="set-row"><span class="set-lbl">Language</span><span class="set-ctl">
 				<button class="toggle wide" data-event-click="cycle_language"><span class="value">{{lang_label}}</span></button></span></div>
 		</div>
 		<div class="panel">
-			<div class="eyebrow">AUDIO</div>
+			<div class="eyebrow">AUDIO &amp; INPUT</div>
 			<div class="set-row"><span class="set-lbl">SPU high-quality (float shadow)</span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_spu"><span class="value" data-if="spu_hq">On</span><span class="value" data-if="spu_hq == false">Off</span></button></span></div>
-		</div>
-		<div class="panel">
-			<div class="eyebrow">CONTROLLER</div>
 			<div class="set-row"><span class="set-lbl">Analog stick deadzone</span><span class="set-ctl">
 				<button class="toggle" data-event-click="cycle_deadzone"><span class="value">{{deadzone_pct}}%</span></button></span></div>
 		</div>
