@@ -3528,8 +3528,8 @@ int main(int argc, char** argv) {
             int lwin_w = g_video_win_w < 1280 ? 1280 : g_video_win_w;
             int lwin_h = 0;
             clamp_window_aspect(&lwin_w, &lwin_h, 4, 3);
-            std::string lwin_title = (game_name.empty() ? std::string("PSX") : game_name)
-                                     + " \xE2\x80\x94 Launcher";
+            std::string title_base = !window_title.empty() ? window_title : (!game_name.empty() ? game_name : std::string("PSX"));
+            std::string lwin_title = title_base + " \xE2\x80\x94 Launcher";
             SDL_Window* lwin = SDL_CreateWindow(
                 lwin_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                 lwin_w, lwin_h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
