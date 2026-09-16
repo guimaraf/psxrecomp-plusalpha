@@ -625,6 +625,7 @@ button:hover { background-color: #232d3c; }
 				<span class="path" data-if="disc_path != ''">{{disc_path}}</span>
 				<span class="path empty" data-if="disc_path == ''">(not set)</span></span></div>
 			<div class="set-row" data-if="has_compilers"><span class="set-lbl">Build Tools</span><span class="set-ctl">
+				<button data-event-click="open_setup" style="padding: 6dp 14dp; font-size: 13dp; margin-right: 8dp;">Open Build Setup</button>
 				<button class="clean-btn" style="padding: 6dp 14dp; font-size: 13dp; margin-right: 0dp;" data-event-click="remove_compilers">Remove Compilers (~65 MB)</button></span></div>
 			<div class="set-row" data-if="!has_compilers"><span class="set-lbl">Build Tools</span><span class="set-ctl">
 				<span class="path">Clean (Compilers Removed)</span></span></div>

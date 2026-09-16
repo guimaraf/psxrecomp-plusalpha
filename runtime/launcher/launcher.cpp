@@ -944,17 +944,12 @@ Result run(SDL_Window* window, void* gl_context,
     // Check if First-Run standalone recompilation setup is needed:
     fs::path check_exe = fs::path("local/SLUS_005.48");
     if (!fs::exists(check_exe)) check_exe = assets / "local/SLUS_005.48";
-    if (!fs::exists(check_exe)) check_exe = fs::path("../local/SLUS_005.48");
 
     fs::path check_cache = fs::path("cache/SLUS-00548");
     if (!fs::exists(check_cache)) check_cache = assets / "cache/SLUS-00548";
-    if (!fs::exists(check_cache)) check_cache = fs::path("PlusAlphaProject/cache/SLUS-00548");
-    if (!fs::exists(check_cache)) check_cache = fs::path("../cache/SLUS-00548");
 
     fs::path check_core = fs::path("game_core.dll");
     if (!fs::exists(check_core)) check_core = assets / "game_core.dll";
-    if (!fs::exists(check_core)) check_core = fs::path("PlusAlphaProject/game_core.dll");
-    if (!fs::exists(check_core)) check_core = fs::path("../game_core.dll");
 
     m.has_compilers = fs::exists("compileBuild") || fs::exists(assets / "compileBuild") ||
                       fs::exists("overlay_toolchain") || fs::exists(assets / "overlay_toolchain");
@@ -1634,6 +1629,11 @@ Result run(SDL_Window* window, void* gl_context,
             m.has_compilers = false;
             handle.DirtyVariable("has_compilers");
         });
+    c.BindEventCallback("open_setup",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.view = "first_run";
+            handle.DirtyVariable("view");
+        });
 
     // ---- First-Run Setup Worker State & Callback ----
     struct SetupWorkerState {
@@ -1814,9 +1814,7 @@ Result run(SDL_Window* window, void* gl_context,
                     // Dynamically load game_core.dll
                     std::vector<fs::path> core_cands = {
                         fs::path("game_core.dll"),
-                        assets / "game_core.dll",
-                        fs::path("PlusAlphaProject/game_core.dll"),
-                        fs::path("../game_core.dll")
+                        assets / "game_core.dll"
                     };
                     bool loaded_core = false;
                     for (const auto& cp : core_cands) {

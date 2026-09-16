@@ -3647,16 +3647,10 @@ int main(int argc, char** argv) {
     /* Dynamic game core: ensure game_core.dll is loaded */
     if (!game_core_is_loaded()) {
         int loaded = 0;
-        std::filesystem::path core_p = resolve_existing_runtime_path("game_core.dll", argv[0]);
-        if (!core_p.empty()) {
-            loaded = game_core_load(core_p.string().c_str());
-        }
-        if (!loaded) {
-            std::filesystem::path exe_dir = exe_dir_from_argv(argv[0]);
-            std::filesystem::path cand = exe_dir / "game_core.dll";
-            if (std::filesystem::exists(cand)) {
-                loaded = game_core_load(cand.string().c_str());
-            }
+        std::filesystem::path exe_dir = exe_dir_from_argv(argv[0]);
+        std::filesystem::path cand = exe_dir / "game_core.dll";
+        if (std::filesystem::exists(cand)) {
+            loaded = game_core_load(cand.string().c_str());
         }
         if (!loaded) {
             loaded = game_core_load("game_core.dll");
