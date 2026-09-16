@@ -239,6 +239,125 @@ button:hover { background-color: #232d3c; }
 .modal-btns button { margin-left: 10dp; }
 .modal-confirm { background-color: #2563eb; border-color: #3b82f6; color: #ffffff; font-weight: bold; }
 .modal-confirm:hover { background-color: #3b82f6; }
+.firstrun-panel {
+	display: block;
+	background-color: #11161f;
+	border: 1dp #1e2733;
+	border-radius: 12dp;
+	padding: 16dp 22dp;
+	margin-bottom: 10dp;
+}
+.firstrun-title {
+	display: block;
+	font-size: 20dp;
+	font-weight: bold;
+	color: #ffffff;
+	margin-bottom: 6dp;
+}
+.firstrun-desc {
+	display: block;
+	color: #9aa4b2;
+	font-size: 13dp;
+	line-height: 18dp;
+	margin-bottom: 12dp;
+}
+.setup-box {
+	display: block;
+	background-color: #161d28;
+	border: 1dp #2b3543;
+	border-radius: 9dp;
+	padding: 12dp 16dp;
+	margin-bottom: 10dp;
+}
+.setup-row {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	margin-bottom: 8dp;
+}
+.setup-lbl {
+	width: 110dp;
+	font-size: 12dp;
+	font-weight: bold;
+	color: #8b99aa;
+	letter-spacing: 1dp;
+}
+.setup-val {
+	flex-grow: 1;
+	font-size: 14dp;
+	color: #e0e8f0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	margin-right: 12dp;
+}
+.setup-progress-card {
+	display: block;
+	background-color: #0b0e14;
+	border: 1dp #202b3b;
+	border-radius: 8dp;
+	padding: 14dp 18dp;
+	margin-top: 10dp;
+	margin-bottom: 6dp;
+}
+.setup-progress-head {
+	display: flex;
+	flex-direction: row;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: 8dp;
+}
+.setup-status-txt {
+	color: #c5d1e0;
+	font-size: 13dp;
+	font-weight: 500;
+}
+.setup-pct-txt {
+	color: #ff9900;
+	font-size: 14dp;
+	font-weight: bold;
+}
+.progress-bar-wrap {
+	display: block;
+	height: 8dp;
+	background-color: #1a222f;
+	border-radius: 4dp;
+	overflow: hidden;
+}
+.progress-bar-fill {
+	display: block;
+	height: 100%;
+	background-color: #ff9900;
+	border-radius: 4dp;
+}
+.compile-btn {
+	background-color: #e07b00;
+	border: 1dp #ff9900;
+	color: #ffffff;
+	font-weight: bold;
+	padding: 10dp 24dp;
+	border-radius: 6dp;
+	font-size: 14dp;
+	cursor: pointer;
+}
+.compile-btn:hover {
+	background-color: #ff8c00;
+}
+.clean-btn {
+	background-color: #2b1f1a;
+	border: 1dp #5c3527;
+	color: #e09477;
+	font-weight: bold;
+	padding: 10dp 18dp;
+	border-radius: 6dp;
+	font-size: 13dp;
+	cursor: pointer;
+	margin-right: 12dp;
+}
+.clean-btn:hover {
+	background-color: #4a281d;
+	color: #ffab8c;
+}
 </style>
 </head>
 
@@ -258,6 +377,68 @@ button:hover { background-color: #232d3c; }
 			<button class="top-btn primary" data-if="view == 'gamepad'" data-event-click="show_dashboard">‹ Back to dashboard</button>
 			<button class="top-btn primary" data-if="view == 'keyboard' || view == 'controls'" data-event-click="show_dashboard">‹ Back to dashboard</button>
 			<button class="top-btn primary" data-if="view == 'settings'" data-event-click="show_dashboard">‹ Back to dashboard</button>
+		</div>
+	</div>
+
+	<!-- ================= FIRST-RUN SETUP VIEW ================= -->
+	<div data-if="view == 'first_run'">
+		<div class="firstrun-panel">
+			<div class="eyebrow">STANDALONE LOCAL PIPELINE</div>
+			<div class="firstrun-title">First-Time Setup: Street Fighter EX Plus Alpha</div>
+			<div class="firstrun-desc">
+				To comply with clean-room legal requirements, game assets and combat overlays are compiled locally on your machine.
+				Select your PlayStation disc image and BIOS file below. Once both files are verified, start compilation to extract the executable, recompile MIPS code, and generate native combat overlays in ~8 seconds.
+			</div>
+
+			<div class="setup-box">
+				<div class="setup-row">
+					<span class="setup-lbl">DISC IMAGE:</span>
+					<span class="setup-val" data-if="disc_path != ''">{{disc_file}}</span>
+					<span class="setup-val path empty" data-if="disc_path == ''">Please select your game disc (.cue / .bin / .iso)</span>
+					<button data-event-click="browse_disc">Browse Disc</button>
+				</div>
+				<div class="results" data-if="disc_path != ''">
+					<div class="results-title">DISC VALIDATION</div>
+					<div class="checks">
+						<span class="check"><span class="check-icon" data-class-on="v_header"></span><span class="check-lbl">ISO9660 Header</span></span>
+						<span class="check"><span class="check-icon" data-class-on="v_crc"></span><span class="check-lbl">Serial ({{disc_serial}})</span></span>
+						<span class="check"><span class="check-icon" data-class-on="v_verified"></span><span class="check-lbl">Disc Verified</span></span>
+					</div>
+				</div>
+			</div>
+
+			<div class="setup-box">
+				<div class="setup-row">
+					<span class="setup-lbl">PSX BIOS:</span>
+					<span class="setup-val" data-if="bios_path != ''">{{bios_file}}</span>
+					<span class="setup-val path empty" data-if="bios_path == ''">Please select your PlayStation BIOS (SCPH1001.BIN / 512 KB)</span>
+					<button data-event-click="browse_bios">Browse BIOS</button>
+				</div>
+				<div class="results" data-if="bios_path != ''">
+					<div class="results-title">BIOS VALIDATION</div>
+					<div class="checks">
+						<span class="check"><span class="check-icon" data-class-on="v_bios_size"></span><span class="check-lbl">512 KB ROM</span></span>
+						<span class="check"><span class="check-icon" data-class-on="v_bios_crc"></span><span class="check-lbl">{{bios_desc}}</span></span>
+						<span class="check"><span class="check-icon" data-class-on="v_bios_verified"></span><span class="check-lbl">BIOS Verified</span></span>
+					</div>
+				</div>
+			</div>
+
+			<div class="setup-progress-card">
+				<div class="setup-progress-head">
+					<span class="setup-status-txt">{{setup_status}}</span>
+					<span class="setup-pct-txt">{{setup_pct}}%</span>
+				</div>
+				<div class="progress-bar-wrap">
+					<div class="progress-bar-fill" data-style-width="setup_pct_str"></div>
+				</div>
+			</div>
+
+			<div style="display: flex; flex-direction: row; justify-content: flex-end; align-items: center; margin-top: 14dp;">
+				<button class="clean-btn" data-if="setup_complete && has_compilers" data-event-click="remove_compilers">REMOVE COMPILERS</button>
+				<button class="compile-btn" data-if="setup_running == false" data-event-click="start_setup">{{setup_button_text}}</button>
+				<button class="compile-btn" data-if="setup_running == true" disabled="disabled">BUILDING RELEASE...</button>
+			</div>
 		</div>
 	</div>
 
@@ -443,6 +624,10 @@ button:hover { background-color: #232d3c; }
 				<button data-event-click="browse_disc">Browse</button>
 				<span class="path" data-if="disc_path != ''">{{disc_path}}</span>
 				<span class="path empty" data-if="disc_path == ''">(not set)</span></span></div>
+			<div class="set-row" data-if="has_compilers"><span class="set-lbl">Build Tools</span><span class="set-ctl">
+				<button class="clean-btn" style="padding: 6dp 14dp; font-size: 13dp; margin-right: 0dp;" data-event-click="remove_compilers">Remove Compilers (~65 MB)</button></span></div>
+			<div class="set-row" data-if="!has_compilers"><span class="set-lbl">Build Tools</span><span class="set-ctl">
+				<span class="path">Clean (Compilers Removed)</span></span></div>
 		</div>
 	</div>
 
@@ -481,7 +666,7 @@ button:hover { background-color: #232d3c; }
 	</div>
 
 	<!-- ================= FOOTER ================= -->
-	<div class="footer">
+	<div class="footer" data-if="view != 'first_run'">
 		<span class="switch" data-class-on="skip_launcher" data-event-click="toggle_skip_launcher"><span class="knob"></span></span>
 		<span class="skip-lbl">Skip Launcher on Boot</span>
 		<span class="foot-status"><span class="dot"></span><span class="status-txt">Recompiler ready</span></span>
