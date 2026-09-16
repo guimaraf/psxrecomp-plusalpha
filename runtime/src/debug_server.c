@@ -134,6 +134,10 @@ static char *s_resp_buf = NULL;            /* response bytes (emu -> I/O)       
 static size_t s_resp_len = 0, s_resp_cap = 0;
 static int    s_resp_overflow = 0;
 static int    s_in_command = 0;            /* 1 while emu runs process_command  */
+static char *s_io_resp_buf = NULL;         /* response bytes for off-thread cmd */
+static size_t s_io_resp_len = 0, s_io_resp_cap = 0;
+static int    s_io_resp_overflow = 0;
+static int    s_in_io_command = 0;         /* 1 while running off-thread cmd    */
 static int    io_thread_main(void *arg);   /* defined near debug_server_poll    */
 static uint64_t monotonic_ms(void);         /* shared by timer instrumentation   */
 
@@ -4932,8 +4936,27 @@ static int send_all_blocking(sock_t sock, const char *data, size_t len)
  * protocol and are dropped — matching the prior near-no-op behaviour. */
 void debug_server_send_line(const char *json)
 {
-    if (!s_in_command) return;
+    if (!s_in_command && !s_in_io_command) return;
     size_t len = strlen(json);
+    if (s_in_io_command) {
+        size_t need = s_io_resp_len + len + 2;          /* + '\n' + NUL */
+        if (need > s_io_resp_cap) {
+            size_t cap = s_io_resp_cap ? s_io_resp_cap : 65536;
+            while (cap < need) cap *= 2;
+            if (cap > (64u * 1024u * 1024u)) {        /* hard cap: drop the overflow */
+                s_io_resp_overflow = 1;
+                return;
+            }
+            char *nb = (char *)realloc(s_io_resp_buf, cap);
+            if (!nb) { s_io_resp_overflow = 1; return; }
+            s_io_resp_buf = nb; s_io_resp_cap = cap;
+        }
+        memcpy(s_io_resp_buf + s_io_resp_len, json, len);
+        s_io_resp_len += len;
+        s_io_resp_buf[s_io_resp_len++] = '\n';
+        s_io_resp_buf[s_io_resp_len] = '\0';
+        return;
+    }
     size_t need = s_resp_len + len + 2;          /* + '\n' + NUL */
     if (need > s_resp_cap) {
         size_t cap = s_resp_cap ? s_resp_cap : 65536;
@@ -13374,7 +13397,9 @@ void debug_server_init(int port)
     s_io_resp_cv = SDL_CreateCond();
     s_resp_cap   = 65536;
     s_resp_buf   = (char *)malloc(s_resp_cap);
-    if (s_io_mutex && s_io_req_cv && s_io_resp_cv && s_resp_buf) {
+    s_io_resp_cap = 65536;
+    s_io_resp_buf = (char *)malloc(s_io_resp_cap);
+    if (s_io_mutex && s_io_req_cv && s_io_resp_cv && s_resp_buf && s_io_resp_buf) {
         s_io_running = 1;
         s_io_thread = SDL_CreateThread(io_thread_main, "psx-dbg-io", NULL);
         if (!s_io_thread) s_io_running = 0;
@@ -13717,10 +13742,78 @@ static int recv_line(sock_t c, char *buf, int cap)
     return cap - 1;   /* over-long line: take what we have */
 }
 
-/* The TCP I/O thread: owns accept/recv/send. Hands each request to the emu
+/* Check whether a command is a read-only telemetry / diagnostic query that can
+ * execute completely off-thread on the dedicated TCP I/O thread. Running these
+ * off-thread ensures the emulator thread's 60 FPS timeline is never paused,
+ * delayed, or jittered by telemetry serialization, qsort, or socket writes. */
+static int is_telemetry_offthread_cmd(const char *cmd) {
+    static const char * const s_offthread_cmds[] = {
+        "static_text_misses",
+        "overlay_interp_hot",
+        "dirty_ram_stats",
+        "dispatch_stats",
+        "overlay_loader_status",
+        "autocompile_status",
+        "sljit_status",
+        "overlay_capture_dump",
+        "dirty_ram_unsupported",
+        "unknown_dispatch_log",
+        "turbo_state",
+        "pad_status",
+        "first_failure",
+        "insn_freeze_status",
+        "card_read_summary",
+        "card_data_writes",
+        NULL
+    };
+    for (int i = 0; s_offthread_cmds[i]; i++) {
+        if (strcmp(cmd, s_offthread_cmds[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+static int try_handle_telemetry_offthread(sock_t c, const char *line)
+{
+    char cmd[64];
+    if (!json_get_str(line, "cmd", cmd, sizeof(cmd))) {
+        strncpy(cmd, line, sizeof(cmd) - 1);
+        cmd[sizeof(cmd) - 1] = '\0';
+        int len = (int)strlen(cmd);
+        while (len > 0 && (cmd[len-1] == '\r' || cmd[len-1] == ' '))
+            cmd[--len] = '\0';
+    }
+    if (!is_telemetry_offthread_cmd(cmd)) return 0;
+
+    int id = json_get_int(line, "id", 0);
+    const CmdEntry *target_entry = NULL;
+    for (const CmdEntry *e = s_commands; e->name; e++) {
+        if (strcmp(cmd, e->name) == 0) {
+            target_entry = e;
+            break;
+        }
+    }
+    if (!target_entry) return 0;
+
+    s_io_resp_len = 0;
+    s_io_resp_overflow = 0;
+    s_in_io_command = 1;
+    ls_suppress_begin();
+    target_entry->handler(id, line);
+    ls_suppress_end();
+    s_in_io_command = 0;
+
+    if (s_io_resp_len > 0) {
+        send_all_blocking(c, s_io_resp_buf, s_io_resp_len);
+    }
+    sock_close(c);
+    return 1;
+}
+
+/* The TCP I/O thread: owns accept/recv/send. Hands mutating requests to the emu
  * thread (processed in debug_server_poll at a safe point) and sends the
- * buffered response. `ping` is answered directly here so liveness is queryable
- * even when the emu thread is buried or frozen. */
+ * buffered response. `ping` and all telemetry queries are answered directly
+ * here off-thread so liveness and metrics are queryable without halting the
+ * emu thread's 60 FPS timeline. */
 static int io_thread_main(void *arg)
 {
     (void)arg;
@@ -13740,6 +13833,13 @@ static int io_thread_main(void *arg)
             const char *pong = "{\"id\":0,\"ok\":true,\"pong\":true,\"io_thread\":true}\n";
             send_all_blocking(c, pong, strlen(pong));
             sock_close(c);
+            continue;
+        }
+
+        /* Off-thread telemetry queries: executed directly on the dedicated I/O
+         * thread so the main emu thread's 60 FPS timeline is NEVER blocked or
+         * interrupted by telemetry sorting, formatting, or socket transmission. */
+        if (try_handle_telemetry_offthread(c, req)) {
             continue;
         }
 
@@ -13935,6 +14035,18 @@ void debug_server_shutdown(void)
     if (s_client != SOCK_INVALID) {
         sock_close(s_client);
         s_client = SOCK_INVALID;
+    }
+    if (s_resp_buf) {
+        free(s_resp_buf);
+        s_resp_buf = NULL;
+        s_resp_cap = 0;
+        s_resp_len = 0;
+    }
+    if (s_io_resp_buf) {
+        free(s_io_resp_buf);
+        s_io_resp_buf = NULL;
+        s_io_resp_cap = 0;
+        s_io_resp_len = 0;
     }
 #ifdef _WIN32
     WSACleanup();
