@@ -551,6 +551,9 @@ function(psxrecomp_add_runtime_target target)
     if(PSX_UWP)
         # SDL2's WindowsStore target supplies the UWP platform libraries.
     elseif(WIN32 OR MINGW)
+        if(MINGW)
+            target_link_options(${target} PRIVATE "-Wl,--export-all-symbols")
+        endif()
         # opengl32: GL backend (gpu_gl_renderer.c). GL 1.x is exported directly
         # by opengl32; Phase 2b will load modern GL via SDL_GL_GetProcAddress.
         target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32 opengl32)
