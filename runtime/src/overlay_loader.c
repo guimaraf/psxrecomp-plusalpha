@@ -856,6 +856,48 @@ static void overlay_image_warm_init(void) {
     s_image_warm_not_before_ms = GetTickCount64() + 5000u;
 }
 
+#if defined(PSX_OVERLAY_PRELOAD_ALL)
+/* Map images before gameplay, without changing candidate registration order.
+ * The normal load path acquires its own reference before releasing this one;
+ * live-byte validation and overlay_init still run at the original safe point. */
+static void overlay_image_preload_all(void) {
+    const char *e = getenv("PSX_OVERLAY_PRELOAD_ALL");
+    if (e && e[0] == '0') return; /* same-binary A/B control */
+    int loaded = 0, failed = 0;
+    ULONGLONG start = GetTickCount64();
+    fprintf(stderr, "overlay preload: mapping %d cached DLLs before gameplay...\n",
+            s_cache_idx_count);
+    for (int ci = 0; ci < s_cache_idx_count; ci++) {
+        HMODULE h = LoadLibraryA(s_cache_idx[ci].path);
+        if (!h) {
+            fprintf(stderr, "overlay preload: load failed (%lu): %s\n",
+                    (unsigned long)GetLastError(), s_cache_idx[ci].path);
+            failed++;
+            continue;
+        }
+        typedef int (*AbiFn)(void);
+        AbiFn abi_fn = (AbiFn)GetProcAddress(h, "overlay_abi");
+        if (!abi_fn || abi_fn() != PSX_OVERLAY_ABI_TAG ||
+            !GetProcAddress(h, "overlay_init") ||
+            !GetProcAddress(h, "overlay_flush_cycles")) {
+            fprintf(stderr, "overlay preload: incompatible DLL: %s\n",
+                    s_cache_idx[ci].path);
+            FreeLibrary(h);
+            failed++;
+            continue;
+        }
+        s_image_warm[ci].handle = h;
+        InterlockedExchange(&s_image_warm[ci].state, 2);
+        InterlockedIncrement(&g_overlay_image_warm_loaded);
+        loaded++;
+    }
+    fprintf(stderr, "overlay preload: complete; indexed=%d resident=%d failed=%d "
+                    "elapsed_ms=%llu\n", s_cache_idx_count, loaded, failed,
+                    (unsigned long long)(GetTickCount64() - start));
+    fflush(stderr);
+}
+#endif
+
 static void overlay_image_warm_queue(const int *indices, int count) {
     if (!s_image_warm_enabled || count <= 0) return;
     size_t bytes = sizeof(ImageWarmBatch) +
@@ -2025,6 +2067,9 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
     init_callbacks();
     scan_cache_dir();
     overlay_image_warm_init();
+#if defined(_WIN32) && defined(PSX_OVERLAY_PRELOAD_ALL)
+    overlay_image_preload_all();
+#endif
     overlay_image_warm_seed_boot_text();
     /* Persisted sljit shard cache (Stage 2): the cache is enabled (this init only
      * runs when [runtime] overlay_cache is on), so persist JIT'd shards and reload
