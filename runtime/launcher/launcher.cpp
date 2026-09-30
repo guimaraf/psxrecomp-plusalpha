@@ -1025,6 +1025,9 @@ Result run(SDL_Window* window, void* gl_context,
     }
     Rml::String title = game.name ? Rml::String(game.name) : Rml::String("PSX");
     c.BindFunc("game_name", [title](Rml::Variant& out) { out = title; });
+    c.BindFunc("play_time", [value = Rml::String(game.play_time)](Rml::Variant& out) {
+        out = value;
+    });
     c.Bind("supersampling",  &m.supersampling);
     c.Bind("antialiasing",   &m.antialiasing);
     c.Bind("auto_skip_fmv",  &m.auto_skip_fmv);

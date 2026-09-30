@@ -44,6 +44,7 @@ enum class Result {
 // Static facts about the game the launcher is configuring. Drives the title and
 // the disc-verification badge. Extends naturally for later phases.
 struct GameInfo {
+    std::string play_time = "000:00";        // read-only total from gametime.save
     const char* name             = nullptr;  // display name, e.g. "Tomba!"
     const char* expected_serial  = nullptr;  // game id "SCUS-94236" (null = no serial check)
     uint32_t    expected_crc     = 0;        // full-file CRC32 of the data track

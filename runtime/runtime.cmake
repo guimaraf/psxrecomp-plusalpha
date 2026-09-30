@@ -175,6 +175,8 @@ endif()
 
 set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/main.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/game_time.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/game_time_posix.cpp
     ${PSXRECOMP_ROOT}/runtime/src/memory.c
     ${PSXRECOMP_ROOT}/runtime/src/platform_paths.cpp
     ${PSXRECOMP_ROOT}/runtime/src/gpu.c
@@ -556,8 +558,25 @@ function(psxrecomp_add_runtime_target target)
         endif()
         # opengl32: GL backend (gpu_gl_renderer.c). GL 1.x is exported directly
         # by opengl32; Phase 2b will load modern GL via SDL_GL_GetProcAddress.
-        target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32 opengl32)
+        target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32 opengl32 crypt32)
     else()
+        if(APPLE)
+            # Link sodium statically so the macOS package does not need a Homebrew dylib.
+            find_path(PSX_SODIUM_INCLUDE_DIR sodium.h
+                HINTS /opt/homebrew/include /usr/local/include REQUIRED)
+            find_file(PSX_SODIUM_STATIC_LIBRARY libsodium.a
+                HINTS /opt/homebrew/lib /usr/local/lib REQUIRED)
+            find_library(PSX_SECURITY_FRAMEWORK Security REQUIRED)
+            find_library(PSX_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+            target_include_directories(${target} PRIVATE "${PSX_SODIUM_INCLUDE_DIR}")
+            target_link_libraries(${target} PRIVATE "${PSX_SODIUM_STATIC_LIBRARY}"
+                "${PSX_SECURITY_FRAMEWORK}" "${PSX_COREFOUNDATION_FRAMEWORK}")
+        else()
+            find_package(PkgConfig REQUIRED)
+            pkg_check_modules(PSX_SODIUM REQUIRED IMPORTED_TARGET libsodium>=1.0.12)
+            pkg_check_modules(PSX_SECRET REQUIRED IMPORTED_TARGET libsecret-1)
+            target_link_libraries(${target} PRIVATE PkgConfig::PSX_SODIUM PkgConfig::PSX_SECRET)
+        endif()
         if(CMAKE_DL_LIBS)
             target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
         endif()

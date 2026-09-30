@@ -54,6 +54,7 @@
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #include "psx_gamepad_binds.h" /* configurable gamepad->DualShock binds (input.ini) */
 #include "platform_paths.h"
+#include "game_time.h"
 #if defined(PSX_LAUNCHER)
 #include "launcher.h"
 #endif
@@ -3462,6 +3463,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    const auto game_time_path = psx_game_time::save_path(exe_dir_from_argv(argv[0]), game_id);
 #if defined(PSX_LAUNCHER)
     /* Integrated launcher: shown in its own GL window before the emulator
      * boots. Seeded with the effective settings (game.toml ∪ settings.toml);
@@ -3541,6 +3543,7 @@ int main(int argc, char** argv) {
                     SDL_GL_SetSwapInterval(1);
                     std::string assets = exe_dir_from_argv(argv[0]).string();
                     psx_launcher::GameInfo ginfo;
+                    ginfo.play_time = psx_game_time::display(game_time_path, game_id);
                     ginfo.name             = game_name.empty() ? nullptr : game_name.c_str();
                     ginfo.expected_serial  = game_id.empty()   ? nullptr : game_id.c_str();
                     ginfo.expected_crc     = game_disc_crc;
@@ -4108,6 +4111,8 @@ int main(int argc, char** argv) {
     debug_server_set_cpu(&cpu);
 
     /* Execute. */
+    if (!g_headless)
+        psx_game_time::start(game_time_path, game_id);
     std::fprintf(stdout, "psxrecomp runtime: executing from PC=0x%08X\n", cpu.pc);
 
 #if defined(PSX_ORACLE_BUILD)

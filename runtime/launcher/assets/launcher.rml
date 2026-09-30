@@ -82,7 +82,8 @@ h1 { display: block; font-size: 27dp; font-weight: bold; color: #ffffff; }
 .disc-info { display: block; flex: 1 1 auto; }
 .disc-title { display: block; font-size: 32dp; font-weight: bold; color: #ffffff; }
 .disc-sub { display: block; color: #9aa4b2; font-size: 16dp; margin-bottom: 16dp; }
-.meta-row { display: flex; flex-direction: row; margin-bottom: 16dp; }
+.meta-row { display: flex; flex-direction: row; position: relative; margin-bottom: 16dp; padding-right: 190dp; }
+.play-time { position: absolute; right: 2dp; bottom: 0; color: #e6e9ef; font-size: 15dp; }
 .meta { display: block; margin-right: 40dp; }
 .meta-k { display: block; color: #6e7781; font-size: 11dp; font-weight: bold; margin-bottom: 3dp; }
 .meta-v { display: block; color: #e6e9ef; font-size: 15dp; }
@@ -455,6 +456,7 @@ button:hover { background-color: #232d3c; }
 					<div class="meta"><div class="meta-k">FILE</div><div class="meta-v">{{disc_file}}</div></div>
 					<div class="meta"><div class="meta-k">REGION</div><div class="meta-v">{{disc_region}}</div></div>
 					<div class="meta"><div class="meta-k">SERIAL</div><div class="meta-v">{{disc_serial}}</div></div>
+					<div class="play-time">Play Time - {{play_time}}</div>
 				</div>
 				<div class="results">
 					<div class="results-title">VERIFICATION RESULTS</div>

@@ -93,6 +93,9 @@ games/*/*
 # Runtime memory cards (local save data; never distribute)
 *.mcd
 *.mcr
+gametime.save
+gametime.save.tmp.*
+gametime.save.lock
 
 # macOS .app bundle (contains recompiled BIOS-derived binary — not distributable)
 /dist/
