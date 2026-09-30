@@ -136,6 +136,7 @@ struct LauncherModel {
     bool exclusive_fullscreen = false; // exclusive display acquisition / compositor bypass
     int  vsync           = 1;     // 0=immediate, 1=vsync, -1=adaptive
     bool low_latency_input = true;
+    bool show_fps = true;
     bool frame_interpolation = false;
     int  frame_interpolation_fps = 0; // 0 = current display refresh
     bool opengl_renderer = false;
@@ -909,6 +910,7 @@ Result run(SDL_Window* window, void* gl_context,
     m.exclusive_fullscreen = io.has_exclusive_fullscreen ? io.exclusive_fullscreen : false;
     m.vsync          = io.has_vsync ? io.vsync : 1;
     m.low_latency_input = io.has_low_latency_input ? io.low_latency_input : true;
+    m.show_fps = io.has_show_fps ? io.show_fps : true;
     m.frame_interpolation = false;
     m.frame_interpolation_fps = 0;
     m.skip_launcher  = io.skip_launcher;
@@ -1038,6 +1040,7 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("vsync",          &m.vsync);
     c.Bind("vsync_label",    &m.vsync_label);
     c.Bind("low_latency_input", &m.low_latency_input);
+    c.Bind("show_fps", &m.show_fps);
     c.Bind("frame_interpolation", &m.frame_interpolation);
     c.Bind("interpolation_fps_label", &m.interpolation_fps_label);
     c.Bind("opengl_renderer", &m.opengl_renderer);
@@ -1375,6 +1378,11 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.low_latency_input = !m.low_latency_input;
             handle.DirtyVariable("low_latency_input");
+        });
+    c.BindEventCallback("toggle_show_fps",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.show_fps = !m.show_fps;
+            handle.DirtyVariable("show_fps");
         });
     c.BindEventCallback("toggle_frame_interpolation",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -2102,6 +2110,7 @@ Result run(SDL_Window* window, void* gl_context,
         io.exclusive_fullscreen = m.exclusive_fullscreen; io.has_exclusive_fullscreen = true;
         io.vsync = m.vsync;                   io.has_vsync = true;
         io.low_latency_input = m.low_latency_input; io.has_low_latency_input = true;
+        io.show_fps = m.show_fps;             io.has_show_fps = true;
         io.frame_interpolation = false;
         io.has_frame_interpolation = true;
         io.frame_interpolation_fps = 0;

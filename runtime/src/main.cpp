@@ -320,6 +320,7 @@ static int           g_fmv_skip_no_xa_hold  = 4;
  * (1=vsync/tear-free, 0=immediate/lowest display latency+tearing, -1=adaptive);
  * it trims the display-side scanout latency the CPU-side ring can't see. */
 static int           g_low_latency_input = 1;
+static bool          g_show_fps = true;
 static int           g_video_vsync        = 1;
 static int           g_frame_interpolation = 0;
 static int           g_frame_interpolation_fps = 0;
@@ -2277,10 +2278,14 @@ static void sdl_vblank_present(void) {
             const double fps = (double)(s_frame_count - fps_last_frame) / seconds;
             const double speed = fps / 59.94;
             if (!g_headless && sdl_window) {
-                char title[256];
-                snprintf(title, sizeof(title), "%s  [%.0f fps %.2fx]",
-                         fps_base_title.c_str(), fps, speed);
-                SDL_SetWindowTitle(sdl_window, title);
+                if (g_show_fps) {
+                    char title[256];
+                    snprintf(title, sizeof(title), "%s  [%.0f fps %.2fx]",
+                             fps_base_title.c_str(), fps, speed);
+                    SDL_SetWindowTitle(sdl_window, title);
+                } else {
+                    SDL_SetWindowTitle(sdl_window, fps_base_title.c_str());
+                }
             }
             std::fprintf(stderr, "[FPS] game: %.1f fps (%.2fx) | frames: %llu\n",
                          fps, speed, (unsigned long long)s_frame_count);
@@ -3357,6 +3362,7 @@ int main(int argc, char** argv) {
         if (us.has_p2_mode) p2_mode = us.p2_mode;
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
+        if (us.has_show_fps)          g_show_fps = us.show_fps;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
         if (us.has_frame_interpolation)
             g_frame_interpolation = us.frame_interpolation ? 1 : 0;
@@ -3492,6 +3498,7 @@ int main(int argc, char** argv) {
             seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
             seed.fullscreen = (g_fullscreen != 0);        seed.has_fullscreen = true;
             seed.exclusive_fullscreen = (g_exclusive_fullscreen != 0); seed.has_exclusive_fullscreen = true;
+            seed.show_fps = g_show_fps;                   seed.has_show_fps = true;
             seed.frame_interpolation = (g_frame_interpolation != 0);
             seed.has_frame_interpolation = true;
             seed.frame_interpolation_fps = g_frame_interpolation_fps;
@@ -3580,6 +3587,7 @@ int main(int argc, char** argv) {
                 bios_hle  = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen ? 1 : 0;
                 g_exclusive_fullscreen = seed.exclusive_fullscreen ? 1 : 0;
+                g_show_fps = seed.show_fps;
                 g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
                 g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;

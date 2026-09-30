@@ -601,6 +601,8 @@ button:hover { background-color: #232d3c; }
 				<button class="toggle wide" data-event-click="cycle_vsync"><span class="value">{{vsync_label}}</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Low-latency input</span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_low_latency_input"><span class="value" data-if="low_latency_input">On</span><span class="value" data-if="low_latency_input == false">Off</span></button></span></div>
+			<div class="set-row"><span class="set-lbl">Show FPS</span><span class="set-ctl">
+				<button class="toggle" data-event-click="toggle_show_fps"><span class="value" data-if="show_fps">On</span><span class="value" data-if="show_fps == false">Off</span></button></span></div>
 		</div>
 		<div class="panel" data-if="lang_menu">
 			<div class="eyebrow">LOCALIZATION</div>
