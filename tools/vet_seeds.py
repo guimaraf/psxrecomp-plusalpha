@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-vet_seeds.py - Vet dirty_ram miss addresses as function-seed candidates.
+vet_seeds.py — Vet dirty_ram miss addresses as function-seed candidates.
 
 For each candidate address applies two checks directly against the game EXE:
 
-  1. BOUNDARY: before the address there must be `jr $ra` (0x03E00008)
-     followed by its delay slot and at most 3 alignment NOPs.
-     Fail -> REJECT (mid-function address, never safe to seed).
+  1. BOUNDARY: the 8 bytes immediately before the address must be
+     `jr $ra` (0x03E00008) followed by `nop` (0x00000000).
+     Fail → REJECT (mid-function address, never safe to seed).
 
   2. PROLOGUE: at least one of the first 4 instructions must be
      `addiu $sp, $sp, -N` (N > 0).
-     Fail -> WARN (frameless: leaf function or frame-borrower like DF00).
+     Fail → WARN (frameless: leaf function or frame-borrower like DF00).
      Frame-borrowers crash when called from a context that hasn't set up
      the expected caller frame. Requires manual confirmation before seeding.
 
 Verdict summary:
-  ACCEPT  - boundary + prologue: safe to seed.
-  WARN    - boundary, no prologue: manual review required.
-  REJECT  - no boundary: mid-function, never seed.
+  ACCEPT  — boundary + prologue: safe to seed.
+  WARN    — boundary, no prologue: manual review required.
+  REJECT  — no boundary: mid-function, never seed.
 
 Usage:
   python3 tools/vet_seeds.py --game <game.toml> <miss_file>
@@ -36,7 +36,7 @@ import struct
 import argparse
 
 # ---------------------------------------------------------------------------
-# Minimal TOML reader - only parses [game] section fields we need.
+# Minimal TOML reader — only parses [game] section fields we need.
 # ---------------------------------------------------------------------------
 
 def _parse_toml_str(path, section, key):
@@ -69,35 +69,11 @@ def _is_nop(w):
     return w == 0x00000000
 
 def _is_addiu_sp_neg(w):
-    """addiu $sp, $sp, -N  (N > 0) - stack frame setup."""
+    """addiu $sp, $sp, -N  (N > 0) — stack frame setup."""
     return ((w >> 26) & 0x3F) == 9 \
         and ((w >> 21) & 0x1F) == 29 \
         and ((w >> 16) & 0x1F) == 29 \
         and (w & 0x8000) != 0
-
-
-MAX_ALIGNMENT_NOPS = 3
-
-
-def _find_return_boundary(data, function_off, text_off):
-    """Return (delay_slot, padding_words) for a nearby jr $ra boundary."""
-    for padding_words in range(MAX_ALIGNMENT_NOPS + 1):
-        jr_off = function_off - 8 - padding_words * 4
-        if jr_off < text_off:
-            break
-        if not _is_jr_ra(_word(data, jr_off)):
-            continue
-
-        padding_off = jr_off + 8
-        if any(
-            not _is_nop(_word(data, off))
-            for off in range(padding_off, function_off, 4)
-        ):
-            continue
-
-        return _word(data, jr_off + 4), padding_words
-
-    return None
 
 # ---------------------------------------------------------------------------
 # Vetting logic
@@ -119,36 +95,26 @@ def vet(exe_bytes, base_phys, text_size, vaddr):
     if off < 8 or off + 16 > len(exe_bytes):
         return 'REJECT', 'EXE offset out of range'
 
-    # Check 1: boundary - jr $ra followed by any delay slot (nop is common),
-    # optionally followed by up to three NOPs used to align the next function.
-    boundary = _find_return_boundary(exe_bytes, off, EXE_HEADER)
-    if boundary is None:
-        prev_a = _word(exe_bytes, off - 8)
-        prev_b = _word(exe_bytes, off - 4)
+    # Check 1: boundary — jr $ra followed by any delay slot (nop is common
+    # but some compilers emit a useful instruction in the delay slot).
+    prev_jr   = _word(exe_bytes, off - 8)
+    prev_ds   = _word(exe_bytes, off - 4)
+    has_boundary = _is_jr_ra(prev_jr)
+    if not has_boundary:
         return 'REJECT', (
-            f'no jr $ra boundary within {MAX_ALIGNMENT_NOPS} alignment NOPs '
-            f'(nearest words 0x{prev_a:08X} / 0x{prev_b:08X})'
+            f'no jr $ra/nop boundary '
+            f'(saw 0x{prev_jr:08X} / 0x{prev_ds:08X})'
         )
-
-    prev_ds, padding_words = boundary
-    # Note non-nop delay slot - still a valid boundary but worth flagging.
+    # Note non-nop delay slot — still a valid boundary but worth flagging.
     delay_note = '' if _is_nop(prev_ds) else f' (non-nop delay slot 0x{prev_ds:08X})'
-    alignment_note = (
-        '' if padding_words == 0
-        else f' ({padding_words} alignment NOP'
-             f'{"s" if padding_words != 1 else ""})'
-    )
 
     # Check 2: prologue
     for i in range(4):
         if _is_addiu_sp_neg(_word(exe_bytes, off + i * 4)):
-            return 'ACCEPT', (
-                f'boundary + prologue at instr {i}'
-                f'{delay_note}{alignment_note}'
-            )
+            return 'ACCEPT', f'boundary + prologue at instr {i}{delay_note}'
 
     return 'WARN', (
-        f'boundary + no addiu $sp,$sp,-N{delay_note}{alignment_note}'
+        f'boundary + no addiu $sp,$sp,-N{delay_note}'
         ' -- frameless (leaf or frame-borrower); manual Ghidra check required'
     )
 
@@ -229,13 +195,13 @@ def main():
 
     if warned:
         print()
-        print('WARN - verify in Ghidra before seeding (check callers set up a frame):')
+        print('WARN — verify in Ghidra before seeding (check callers set up a frame):')
         for a in warned:
             print(f'  0x{a:08X}')
 
     if rejected:
         print()
-        print('REJECT - mid-function or out-of-range (high confidence); rare false-rejects')
+        print('REJECT — mid-function or out-of-range (high confidence); rare false-rejects')
         print('  possible when the preceding function ends with jr $t0 / jalr instead of jr $ra.')
         print('  Investigate in Ghidra if you suspect a false-reject:')
         for addr, reason in rejected:

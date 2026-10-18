@@ -1,4 +1,4 @@
-#ifndef PSXRECOMP_CDROM_H
+﻿#ifndef PSXRECOMP_CDROM_H
 #define PSXRECOMP_CDROM_H
 
 #include <stdint.h>
@@ -8,6 +8,17 @@ extern "C" {
 #endif
 
 void cdrom_init(const char* cue_path);
+uint32_t cdrom_snapshot_bytes(void);
+int cdrom_snapshot_validate(const uint8_t *p, uint32_t len);
+
+/* Did cdrom_init() actually mount an image? 0 = the drive is empty.
+ *
+ * cdrom_init() is deliberately non-fatal when iso_open() fails (a BIOS-only
+ * target legitimately runs with no disc), so a game that was GIVEN a disc path
+ * whose image could not be mounted would otherwise boot straight into an empty
+ * drive and render nothing -- a black screen with no explanation. Callers that
+ * passed a real path must check this and report. */
+int cdrom_has_disc(void);
 /* Disc license region for GetID ("SCEE"/"SCEA"/"SCEI"); derived from the
  * mounted disc's boot serial at launch. Defaults to "SCEA" (SCPH1001). */
 void cdrom_set_disc_scex(const char scex[4]);
@@ -29,11 +40,74 @@ int  cdrom_get_setloc_lba(void);
 void cdrom_set_instant_rate(int per_frame);
 int  cdrom_get_instant_rate(void);
 
+/* Strict, config-driven warm-load route accelerator. Up to 16 routes may be
+ * registered after cdrom_init. A route arms only after arm_lba and activates
+ * only if the following SetLoc values match lbas in order. Any mismatch
+ * restores normal disc timing. Only non-XA read cadence is accelerated. */
+void cdrom_register_warm_route(int arm_lba, const int* lbas, int count,
+                               int instant_max_per_frame);
+void cdrom_warm_route_set_enabled(int enabled);
+void cdrom_warm_route_stats_json(char* out, int cap);
+
+/* Passive physical-deadline -> buffer -> INT1 exposure telemetry (L1.5).
+ * Diagnostics only: recording never changes CD scheduling or delivery. */
+void cdrom_timing_reset(void);
+void cdrom_timing_stats_json(char* out, int cap);
+int cdrom_get_delivered_lba(void);
+
+/* Per-record view of the same ring, for localising a single lost/skipped
+ * sector rather than summarising thousands. */
+typedef struct CdTimingPub {
+    uint64_t seq;
+    uint64_t due_cycle;
+    uint64_t buffer_cycle;
+    uint64_t irq_arm_cycle;
+    uint64_t intc_cycle;
+    uint32_t frame;
+    int32_t  lba;
+    uint8_t  flags;      /* CDT_* bits, mirrored in the JSON as named fields */
+} CdTimingPub;
+uint64_t cdrom_timing_total(void);
+int cdrom_timing_record(uint64_t seq, CdTimingPub* out);
+/* Notify the guest that the mounted disc was reinserted. The controller stops
+ * active transfers, reports an open shell, waits two emulated seconds, then
+ * makes the mounted media readable. This call does not mount a different image. */
+void debug_force_cd_reinsert(void);
+
+/* Multi-disc support. The roster is the image set this build was made from
+ * (game.toml [game] discs), registered once at launch in roster order.
+ *
+ * cdrom_disc_select() mounts a different image while the game runs, through
+ * the same tray-open event as a reinsert, so a title that asks for its other
+ * disc can be answered. Returns 0 if the index is outside the roster or the
+ * image will not open. Indexes are 1-based, matching [disc] selected. */
+void cdrom_disc_roster_set(const char *const *paths, int count,
+                           int selected_1based);
+int  cdrom_disc_roster_count(void);
+int  cdrom_disc_selected(void);
+const char *cdrom_disc_roster_path(int index_1based);
+int  cdrom_disc_select(int index_1based);
+
+/* TOC of the image currently mounted; 0 when the drive is empty. Two images
+ * of a set have different TOCs, so this is how a caller confirms that a disc
+ * change reached the reader instead of only moving an index. */
+uint32_t cdrom_mounted_sector_count(void);
+int      cdrom_mounted_track_count(void);
+
 /* FMV auto-skip detection: cdrom_xa_stream_active() lets the frontend detect
  * that streaming XA (FMV/CDDA) is in progress. The skip itself is done by the
  * frontend via uncapped pacing (it does NOT alter CD timing — flooding XA
  * sectors desyncs and hangs the player). */
 int  cdrom_xa_stream_active(void);
+/* True while a CD read is armed with XA/FMV mode bits (or XA already
+ * streaming). Netplay uses this to arm no-invent / refuse tip episodes
+ * before the first MDEC colour decode — MotK intro invent≠Start at FMV
+ * entry opened a tip episode into a matched black wait. */
+int  cdrom_fmv_stream_pending(void);
+/* Re-arm host absolute CD deadlines from restored relative delays after
+ * boot_state / RB snap load (read stream + pending/present dues from snap).
+ * Does NOT clamp delays (unlike accelerate). */
+void cdrom_resync_deadlines_after_restore(void);
 
 /* CD load-burst ring (always-on). One record per gap-separated run of
  * delivered data sectors. `out` receives up to `max` records, newest first
@@ -48,17 +122,30 @@ typedef struct CdBurstRecord {
 int      cdrom_get_bursts(void *out, int max);
 uint32_t cdrom_get_burst_total(void);
 
-/* Host-wall time since the most recent delivered data sector. Returns
- * UINT64_MAX until the first data sector has been delivered. This is kept
- * separate from cdrom_load_in_progress(): the latter deliberately bridges
- * guest-frame gaps, while turbo qualification must not inherit acceleration
- * across a host-visible idle interval. */
-uint64_t cdrom_data_sector_idle_ms(void);
-
 /* True while a data-sector load is in progress (read stream active or a
  * data sector delivered within the burst-gap window). XA streaming is never
  * a load. Drives turbo-through-loads (step 4). */
 int cdrom_load_in_progress(void);
+/* Physical non-XA data-read command state, without the logical load gap
+ * bridge used by cdrom_load_in_progress(). Diagnostics only. */
+int cdrom_data_read_active(void);
+
+/* boot_state / netplay digest — full controller FSM (sector FIFOs included). */
+uint32_t cdrom_snapshot_bytes(void);
+void     cdrom_snapshot_write(uint8_t *p);
+int      cdrom_snapshot_read(const uint8_t *p, uint32_t len);
+
+/* After savestate restore: clamp long CD second-response / read-start delays
+ * and arm a short boost window so post-load ReadTOC/seek/Init waits do not
+ * freeze the picture for ~1s+. Completions still fire (IRQs preserved). */
+void cdrom_accelerate_after_savestate(void);
+/* Call once per host vblank while the boost window is armed. */
+void cdrom_savestate_boost_vblank(void);
+/* Non-zero while boost is armed AND a CD wait is outstanding (pending
+ * second response or non-XA read). Lets turbo_loads unpace those waits. */
+int  cdrom_savestate_cd_wait_active(void);
+/* Remaining boost vblanks (0 when idle). Diagnostics / post-load probe. */
+int  cdrom_savestate_boost_vblanks_remaining(void);
 
 /* MMIO read/write (0x1F801800-0x1F801803) */
 uint32_t cdrom_read(uint32_t addr);
@@ -91,7 +178,6 @@ typedef struct CDROMDebugState {
     uint8_t seek_min;
     uint8_t seek_sec;
     uint8_t seek_sect;
-    uint8_t setloc_pending;
     uint8_t pending_cmd;
     uint8_t queued_cmd;
     uint8_t queued_pending;
@@ -104,7 +190,6 @@ typedef struct CDROMDebugState {
     int sector_available;
     int sector_size;
     int reading;
-    uint8_t read_paused;
     int read_min;
     int read_sec;
     int read_sect;
@@ -113,9 +198,13 @@ typedef struct CDROMDebugState {
     uint8_t filter_channel;
     uint8_t muted;
     int read_delay;
+    /* Cycles until a held CD response is presented to INTC (0 = ready). */
+    int irq_present_delay;
     int pending_pending;
     int pending_delay;
     int pending_phase;
+    /* Operating disc-speed divisor (1 during BIOS; game.toml post-entry). */
+    int speed_divisor;
     uint32_t i_stat;
     int last_sector_lba;
     int last_sector_size;
@@ -131,6 +220,17 @@ typedef struct CDROMDebugState {
     /* One-deep pended data-ready INT1 accounting (Beetle SetAIP analog). */
     uint64_t int1_pended;
     uint64_t int1_lost;
+    /* Accelerated-read flow control: holds where a faster-than-hardware
+     * sector was deferred rather than allowed to clobber an unconsumed one.
+     * Nonzero is healthy (the guest was busy and the enhancement waited);
+     * int1_lost rising while the speed divisor != 1 is the regression. */
+    /* Sector-ring tripwires: starved = a drain found its slot exhausted
+     * while the writer had moved on (must stay 0); dropped = an unread slot
+     * was overwritten because the guest fell a full ring behind. */
+    uint64_t ring_starved;
+    uint64_t ring_dropped;
+    uint64_t accel_consumer_waits;
+    uint64_t accel_consumer_wait_cycles;
     uint8_t  int1_pending_now;
 } CDROMDebugState;
 
@@ -182,6 +282,10 @@ typedef struct CDROMTraceEntry {
 
 typedef struct CDROMCommandHistoryEntry {
     uint64_t seq;
+    /* Guest cycle at which this command was issued/executed. Frame numbers
+     * cannot separate "the guest had not asked yet" from "the command was
+     * queued behind an unacked INT" -- both look like one frame. */
+    uint64_t cycle;
     uint32_t frame;
     uint32_t func;
     uint32_t pc;
@@ -198,17 +302,19 @@ typedef struct CDROMCommandHistoryEntry {
     uint8_t seek_min;
     uint8_t seek_sec;
     uint8_t seek_sect;
-    uint8_t setloc_pending;
     uint8_t read_min;
     uint8_t read_sec;
     uint8_t read_sect;
     uint8_t read_cmd;
     uint8_t reading;
-    uint8_t read_paused;
     uint8_t pending_cmd;
     uint8_t pending_pending;
     uint8_t queued_cmd;
     uint8_t queued_pending;
+    /* Immediate response FIFO as the guest will read it (e.g. the GetTD MSF,
+     * the GetTN track range), so a TOC can be checked from the ring. */
+    uint8_t response_count;
+    uint8_t response[16];
 } CDROMCommandHistoryEntry;
 
 typedef struct CDROMSectorHistoryEntry {

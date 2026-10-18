@@ -41,12 +41,51 @@ struct TranslateResult {
     // every other instruction. The slice walker's emit logic emits this
     // as an EmittedInstr right before the delay slot when non-empty.
     std::string pre_delay_code;
+
+    // MIPS-I load-delay modeling (simple loads only: LB/LBU/LH/LHU/LW with
+    // rt != 0). load_dest is the architectural destination register, and
+    // c_code_deferred is an alternative emission that assigns the loaded
+    // value into the function-scope temp `psx_ldd_<addr>` instead of
+    // cpu->gpr[load_dest]. The emitter uses it when the NEXT instruction
+    // reads load_dest (a dependent pair): on a real R3000A that successor
+    // executes in the load's delay shadow and sees the register's OLD
+    // value — OpenBIOS cardfasttrack.s depends on this deliberately
+    // ("gotta break those bad emulators"). The emitter flushes
+    // cpu->gpr[load_dest] = psx_ldd_<addr> after the successor's register
+    // reads. -1 / empty for everything that is not a simple load.
+    // LWL/LWR are excluded: their rt-merge plus the hardware's special
+    // LWL/LWR chain bypass need different treatment (logged if dependent).
+    int         load_dest = -1;
+    std::string c_code_deferred;
 };
 
 class StrictTranslator {
 public:
     // Translate a single decoded instruction. Pure function — no state.
+    // d.address is the compile (ROM) address; it names the function-scope
+    // temporaries (psx_ldd_/psx_brA_/psx_jt_) and terminator_target, which
+    // the emitter resolves in ROM space.
+    //
+    // runtime_pc is the PC the CPU executes the instruction at (for the BIOS,
+    // BiosAddressModel::runtime_pc: relocated kernel/shell code runs at its
+    // RAM address). Every PC the non-terminator c_code hands the runtime goes
+    // through it: the store-PC stamp (memory.c store filters and the GP0
+    // source key compare it), the syscall EPC (cpu->pc), the break PC and
+    // the unaligned-access PC (docs/SEGMENT_AWARE_CODE.md §5.2). Terminator
+    // c_code is the Phase 1a slice walker's and keeps d.address; that walker
+    // covers the in-place boot slice only, where the two are equal. The
+    // one-argument form translates at runtime_pc == d.address.
     static TranslateResult translate(const PSXRecomp::DecodedInstruction& d);
+    static TranslateResult translate(const PSXRecomp::DecodedInstruction& d,
+                                     uint32_t runtime_pc);
+
+private:
+    // The per-opcode translation body; translate() wraps its c_code with the
+    // shared PGXP hook grammar (CodeGenerator::append_pgxp_hooks).
+    static TranslateResult translate_impl(const PSXRecomp::DecodedInstruction& d,
+                                          uint32_t runtime_pc);
+
+public:
 };
 
 } // namespace PSXRecompV4

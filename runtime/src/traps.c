@@ -5,6 +5,10 @@
  */
 
 #include "cpu_state.h"
+#include "psx_memory.h"
+#include "interrupts.h"
+#include "mod_runtime.h"
+#include "psx_bss.h"
 #include "psx_runtime.h"   /* fix B: psx_exc_escape_reason_t + g_exc_escape_reason */
 #include "debug_server.h"
 #include "crash_trace.h"
@@ -24,6 +28,7 @@ static uint32_t traps_parity_rw(void* ctx, uint32_t addr) {
 /* Forward declarations from interrupts.c */
 int psx_get_in_exception(void);
 void psx_exception_longjmp(void);
+void psx_irq_refresh_cause_ip2(void);
 
 /* ── Deterministic TCB scheduler — SCAFFOLDING (plan steps 1-2, INERT) ───────
  * These definitions back psx_scheduler.h. They are NOT yet wired into the live
@@ -59,7 +64,7 @@ typedef struct SchedEscapeEntry {
     uint32_t sp;
 } SchedEscapeEntry;
 #define SCHED_ESCAPE_RING_CAP 256u
-SchedEscapeEntry g_sched_escape_ring[SCHED_ESCAPE_RING_CAP];
+PSX_BSS SchedEscapeEntry g_sched_escape_ring[SCHED_ESCAPE_RING_CAP];
 uint64_t g_sched_escape_seq = 0;
 
 static void sched_escape_ring_log(CPUState* cpu, uint32_t reason,
@@ -271,7 +276,7 @@ typedef struct ThreadCtxRingEntry {
     uint32_t cop0_epc;
 } ThreadCtxRingEntry;
 #define THREAD_CTX_RING_CAP 256u
-ThreadCtxRingEntry g_thread_ctx_ring[THREAD_CTX_RING_CAP];
+PSX_BSS ThreadCtxRingEntry g_thread_ctx_ring[THREAD_CTX_RING_CAP];
 uint64_t g_thread_ctx_ring_seq = 0;
 
 extern uint64_t s_frame_count;
@@ -340,7 +345,14 @@ static uint32_t psx_restore_context_from_tcb(CPUState* cpu, uint32_t tcb)
         uint32_t saved_sr = cpu->read_word(save + 140u);
         cpu->cop0[12] = (saved_sr & 0xFFFFFFC0u) | ((saved_sr >> 2) & 0x0Fu);
     }
+    /* Restore the saved CAUSE, then re-derive IP2. On hardware the IP field is
+     * live interrupt-line state and is never storage, so it cannot meaningfully
+     * be saved and restored: a context captured while an interrupt was pending
+     * and restored after the ack would re-latch a phantom IP2 out of guest
+     * memory. Reload the architecturally-saved bits, then let the single owner
+     * recompute bit 10 from the actual line. */
     cpu->cop0[13] = cpu->read_word(save + 144u);
+    psx_irq_refresh_cause_ip2();
     cpu->gpr[26] = cpu->read_word(save + 128u);
     psx_assert_no_sentinel_pc("restore_context_from_tcb", tcb, cpu->gpr[26]);
     thread_ctx_ring_log(cpu, tcb, cpu->gpr[26], 1);
@@ -535,6 +547,9 @@ static HostThreadFiber* psx_get_or_create_host_thread(CPUState* cpu, uint32_t tc
 static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
 {
     uint32_t current_tcb = psx_current_tcb_ptr(cpu);
+    /* data-shard purity: a green-thread switch inside a capture window would
+     * record OTHER threads' work into the shard — poison the capture. */
+    { extern void ds_note_thread_switch(void); ds_note_thread_switch(); }
     debug_server_log_thread_event(3, cpu, current_tcb, target_tcb, 0);
     if (!psx_is_valid_tcb(cpu, current_tcb) || !psx_is_valid_tcb(cpu, target_tcb)) {
         debug_server_log_thread_event(4, cpu, current_tcb, target_tcb, 0);
@@ -547,22 +562,24 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
         return 1;
     }
 
+    /* Never let a speculative native shadow pass switch host/guest threads.
+     * The authoritative interpreter pass would already have escaped if this
+     * switch were real; reaching it only in native code proves divergence. */
+    {
+        extern int overlay_loader_shadow_native_thread_switch_bail(void);
+        if (overlay_loader_shadow_native_thread_switch_bail()) return -1;
+    }
+
     HostThreadFiber* current = psx_bind_current_host_thread(cpu, current_tcb);
     int saved_current_context = 0;
-    uint32_t current_state = psx_tcb_state(cpu, current_tcb);
-    /* SYS(03) saves the outgoing CPU context before selecting the target TCB,
-     * even when CloseTh has just marked the current TCB free (0x1000). OpenTh
-     * deliberately leaves most registers, including SR, untouched when that
-     * slot is reused. Skipping this write therefore resurrects stale SR state
-     * and can start the reopened thread with interrupts incorrectly disabled. */
-    psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
-    if (current_state == 0x4000u) {
+    if (psx_tcb_state(cpu, current_tcb) == 0x4000u) {
+        psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
         saved_current_context = 1;
     } else {
         /* 0x1000 is the BIOS closed/free state and must retire the host fiber.
          * Other non-runnable states can still have a suspended generated C
          * stack that must be resumed later. */
-        if (current_state == 0x1000u) {
+        if (psx_tcb_state(cpu, current_tcb) == 0x1000u) {
             current->closed = 1;
         }
         debug_server_log_thread_event(6, cpu, current_tcb, target_tcb, 0);
@@ -644,8 +661,8 @@ static int psx_request_thread_switch(CPUState* cpu, uint32_t target_tcb)
     }
     if (current_tcb == target_tcb) {
         /* Same thread — not a switch. The syscall wrapper returns 0 and falls
-         * through to its own jr $ra (CPS); the thread simply continues. No
-         * cpu->pc=0 host signal (removed with the fiber bridge). */
+         * through to its own jr $ra (CPS); the thread simply continues.
+         * psx_syscall clears cpu->pc for the interpreter's caller. */
         debug_server_log_thread_event(5, cpu, current_tcb, target_tcb, cpu->gpr[31]);
         return 1;
     }
@@ -656,12 +673,19 @@ static int psx_request_thread_switch(CPUState* cpu, uint32_t target_tcb)
         debug_server_log_thread_event(7, cpu, current_tcb, target_tcb, 0);
         return 0;
     }
-    /* SYS(03) commits the outgoing context before selecting the target TCB,
-     * regardless of whether CloseTh has just marked the outgoing slot free.
-     * This write is architecturally observable: OpenTh intentionally preserves
-     * the slot's old SR, so a reopened thread must inherit the SR saved here.
-     * resume PC = the return address after the ChangeThread call. */
-    psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
+    /* Contain a native-only shadow divergence before it mutates TCB/RAM,
+     * scheduler targets, or crosses run_shadow_diff with a longjmp. */
+    {
+        extern int overlay_loader_shadow_native_thread_switch_bail(void);
+        if (overlay_loader_shadow_native_thread_switch_bail()) return -1;
+    }
+    /* Commit the yielding thread's context so it can be re-dispatched later.
+     * resume PC = its return address (resume right after the ChangeThread call).
+     * Only a still-running (0x4000) thread keeps a live context; a closed/free
+     * (0x1000) thread is being torn down and must not be saved. */
+    if (psx_tcb_state(cpu, current_tcb) == 0x4000u) {
+        psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
+    }
     psx_set_current_tcb(cpu, target_tcb);
     g_sched_return_tcb        = current_tcb; /* one-level switch-back safety net */
     g_sched_escape.target_tcb = target_tcb;
@@ -683,6 +707,21 @@ static int psx_request_thread_switch(CPUState* cpu, uint32_t target_tcb)
  * on the old stack (safe: the restored state is complete in CPUState/RAM/devices
  * and every block leader is re-enterable). MUST be called on the scheduler fiber
  * (HLE mode, default) at a block-leader boundary with in_exception == 0. */
+/* Set by resume_at; cleared on first post-resume finish_frame (or abort). */
+static int g_sched_top_level_resume;
+
+int psx_scheduler_top_level_resume_active(void)
+{
+    return g_sched_top_level_resume;
+}
+
+void psx_scheduler_top_level_resume_clear(void)
+{
+    g_sched_top_level_resume = 0;
+}
+
+static int g_sched_restore_edge_check = 0;
+
 void psx_scheduler_resume_at(uint32_t resume_pc)
 {
     if (!psx_is_dispatchable(resume_pc)) {
@@ -695,6 +734,22 @@ void psx_scheduler_resume_at(uint32_t resume_pc)
     g_sched_escape.target_tcb = 0;
     g_sched_escape.resume_pc  = resume_pc;
     g_sched_escape.reason     = PSX_RUN_RESUME_CURRENT;
+    /* longjmp abandons every mid-block CPS frame — sentinel RFE must not
+     * treat the new top-level dispatch as a continuable live chain. */
+    g_sched_top_level_resume = 1;
+    /* Every caller is a state restore (savestate, rewind, selfcheck, rollback
+     * load). The snap was taken by a poll inside psx_check_interrupts at this
+     * very block edge, and the live run went on to evaluate delivery at that
+     * same edge. The resumed run must do the same before the block executes,
+     * or a pending IRQ (VBlank at a tick boundary) is taken one block later
+     * at a different PC than live (#636). */
+    g_sched_restore_edge_check = 1;
+    /* Publish before the longjmp lands in dispatch: sticky I_STAT can deliver
+     * on the first edge with take_pc=0 otherwise (LEGACY_SENTINEL fork). */
+    {
+        extern void psx_irq_arm_compiled_resume_pc(uint32_t pc);
+        psx_irq_arm_compiled_resume_pc(resume_pc);
+    }
     longjmp(g_scheduler_jmpbuf, 1); /* unwind to psx_scheduler_run; never returns */
 }
 
@@ -735,40 +790,94 @@ static int psx_change_thread(CPUState* cpu, uint32_t target_tcb)
     return psx_change_thread_fiber(cpu, target_tcb);
 }
 
+static int g_in_scheduler_run = 0;
+static int g_return_to_lobby_req = 0;
+
+void psx_clear_return_to_lobby(void)
+{
+    g_return_to_lobby_req = 0;
+}
+
+int psx_return_to_lobby_requested(void)
+{
+    return g_return_to_lobby_req;
+}
+
+void psx_request_return_to_lobby(void)
+{
+    g_return_to_lobby_req = 1;
+    if (!g_in_scheduler_run) {
+        return;
+    }
+    g_sched_escape.target_tcb = 0;
+    g_sched_escape.resume_pc = 0;
+    g_sched_escape.reason = PSX_RUN_RETURN_TO_LOBBY;
+    longjmp(g_scheduler_jmpbuf, 1);
+}
+
 void psx_scheduler_run(CPUState* cpu)
 {
     extern int g_psx_dispatch_depth;
+    g_in_scheduler_run = 1;
     g_sched_escape.reason = PSX_RUN_CONTINUE;
     for (;;) {
         if (setjmp(g_scheduler_jmpbuf) != 0) {
+            psx_snapshot_host_call_reset();
+            /* The jump also abandoned mod callbacks. Their native epilogues
+             * cannot clear the snapshot gate or restore callback ownership. */
+            const ModFunctionEntryContext no_callback = {0};
+            mod_runtime_function_entry_context_restore(&no_callback);
             /* A structured escape unwound the native stack to here. Reset the
              * invariants the skipped psx_dispatch_impl frames would otherwise
              * own. No exception_jmpbuf frame is ever skipped (switch fires only
              * with in_exception==0), so interrupt state needs no fixup here. */
+            extern void overlay_loader_shadow_scheduler_escape_fixup(void);
+            overlay_loader_shadow_scheduler_escape_fixup();
             g_psx_dispatch_depth = 0;
             g_psx_call_bail      = 0;
+            /* Soft-exit / yield longjmps out of vblank inside
+             * psx_devices_service_to_now; without this the re-entrancy guard
+             * stays set and every later advance skips device service forever. */
+            { extern int psx_in_device_service; psx_in_device_service = 0; }
             /* A longjmp-out through a nested call unit (overlay_loader_call_native
              * or dispatch_nonlocal_call) would skip its depth restore; clear the
              * nested-unit gate so IRQ checks are not wedged-off after the escape
              * (backstop for the Ape memcard native<->interp fix). */
             { extern int g_call_unit_depth; g_call_unit_depth = 0; }
+            /* flush_resume / savestate longjmp skips generated bb_defer cleanup. */
+            {
+                extern int g_psx_cyc_bb_defer;
+                extern uint32_t g_psx_cyc_batch;
+                extern uint32_t *g_psx_cyc_local_acc;
+                if (g_psx_cyc_local_acc) *g_psx_cyc_local_acc = 0;
+                g_psx_cyc_local_acc = NULL;
+                g_psx_cyc_bb_defer = 0;
+                g_psx_cyc_batch = 0;
+            }
         }
 
         switch (g_sched_escape.reason) {
             case PSX_RUN_FATAL:
+                g_in_scheduler_run = 0;
                 trap_crash("scheduler: structured FATAL escape");
                 return;
             case PSX_RUN_GUEST_EXIT:
+                g_in_scheduler_run = 0;
                 return; /* abnormal top-level exit — main.cpp dumps diagnostics */
+            case PSX_RUN_RETURN_TO_LOBBY:
+                g_in_scheduler_run = 0;
+                return; /* netplay soft-exit — main.cpp reopens lobby UI */
             default:
                 break;  /* CONTINUE / YIELD_TO_TCB / RESUME_CURRENT */
         }
 
         uint32_t run_pc;
+        int from_top_resume = 0;
         if (g_sched_escape.reason == PSX_RUN_RESUME_CURRENT &&
             g_sched_escape.resume_pc != 0u) {
             /* Same-thread RFE: GPRs already committed by the RFE; just re-dispatch. */
             run_pc = g_sched_escape.resume_pc;
+            from_top_resume = 1;
         } else {
             uint32_t cur = psx_current_tcb_ptr(cpu);
             if (psx_is_valid_tcb(cpu, cur)) {
@@ -788,13 +897,27 @@ void psx_scheduler_run(CPUState* cpu)
 
         cpu->pc = run_pc;
         g_sched_escape.reason = PSX_RUN_CONTINUE;
+        /* Re-arm on the dispatch that consumes RESUME_CURRENT (covers
+         * recover_null_pc continues that skip resume_at). */
+        if (from_top_resume) {
+            extern void psx_irq_arm_compiled_resume_pc(uint32_t pc);
+            psx_irq_arm_compiled_resume_pc(run_pc);
+            if (g_sched_restore_edge_check) {
+                g_sched_restore_edge_check = 0;
+                /* Same edge check the dispatch entry runs (deduped there by
+                 * cycle+PC), so compiled-game entries are not checked twice;
+                 * BIOS ROM and continuation resumes get the check they lacked. */
+                psx_check_interrupts_dispatch_entry(cpu, run_pc);
+            }
+        }
         psx_dispatch(cpu, run_pc);
 
         /* psx_dispatch returned with NO structured escape => the outermost
          * dispatch saw cpu->pc==0. If a thread yielded to us and then ran to
          * completion, hand control back to its yielder (one-level safety net)
          * instead of tearing down the whole run. Otherwise it's the legacy
-         * top-level abnormal exit. */
+         * top-level abnormal exit — unless an RB top-level resume can recover
+         * at $ra / sticky BB (returning-leaf snap after flush_resume). */
         if (psx_is_valid_tcb(cpu, g_sched_return_tcb) &&
             g_sched_return_tcb != psx_current_tcb_ptr(cpu)) {
             uint32_t yielder = g_sched_return_tcb;
@@ -805,7 +928,18 @@ void psx_scheduler_run(CPUState* cpu)
                                   psx_current_tcb_ptr(cpu), yielder, 0);
             continue;
         }
+        {
+            extern int psx_netplay_rb_recover_null_pc(CPUState *c, uint32_t *out_pc);
+            uint32_t recover_pc = 0;
+            if (psx_netplay_rb_recover_null_pc(cpu, &recover_pc) && recover_pc) {
+                g_sched_escape.target_tcb = 0;
+                g_sched_escape.resume_pc = recover_pc;
+                g_sched_escape.reason = PSX_RUN_RESUME_CURRENT;
+                continue;
+            }
+        }
         g_sched_escape.reason = PSX_RUN_GUEST_EXIT;
+        g_in_scheduler_run = 0;
         return;
     }
 }
@@ -814,7 +948,7 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
     /*
      * PS1 BIOS SYSCALL convention:
      *   $a0 = 1: EnterCriticalSection — disable interrupts, return old SR
-     *   $a0 = 2: ExitCriticalSection  — enable interrupts, return old SR
+     *   $a0 = 2: ExitCriticalSection  — enable interrupts, preserve GPRs
      *   $a0 = 3: ReturnFromException  — restore full TCB state + RFE
      *
      * Syscalls 1 and 2 are always handled directly — they only touch IEc
@@ -843,7 +977,9 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
 
         case 2: /* ExitCriticalSection: enable interrupts */
             cpu->cop0[12] = sr | 0x0401u; /* set IEc (bit 0) + IM[2] (bit 10) */
-            cpu->gpr[2] = 0;
+            /* SYS(02h) has no return value: it preserves the caller's v0.
+             * SDK wrappers can return an earlier BIOS result through this
+             * call, so assigning zero here changes their guest contract. */
             g_pc0_reason = PSX_PC0_CRIT_SECTION;
             cpu->pc = 0;
             return 0;
@@ -860,13 +996,27 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
              * diverts it (Case B). */
             debug_server_log_thread_event(psx_get_in_exception() ? 24u : 20u, cpu,
                                           psx_current_tcb_ptr(cpu), target_tcb, cpu->pc);
-            if (!psx_get_in_exception() && psx_change_thread(cpu, target_tcb)) {
+            int switch_result = 0;
+            if (!psx_get_in_exception())
+                switch_result = psx_change_thread(cpu, target_tcb);
+            if (switch_result < 0) {
+                /* Native shadow validation requested an impossible thread
+                 * switch. Its bail flag unwinds the speculative call; return
+                 * true so CPS syscall wrappers stop this block immediately. */
+                return 1;
+            }
+            if (switch_result > 0) {
                 /* Thread switched (and this thread has since been resumed): the
                  * fiber scheduler leaves cpu->pc == 0. Under CPS that must NOT
                  * be a transfer — return 0 so the syscall wrapper falls through
                  * to its own jr $ra and this thread resumes at its caller via
                  * the flat trampoline. Legacy ignores the return value (it uses
-                 * cpu->pc == 0 + the nested-dispatch C-return to resume). */
+                 * cpu->pc == 0 + the nested-dispatch C-return to resume).
+                 * The HLE scheduler's same-thread ChangeThread also lands here
+                 * and leaves the SYSCALL's own PC in cpu->pc. The dirty-RAM
+                 * interpreter transfers whenever cpu->pc != 0, so it re-ran the
+                 * SYSCALL forever. Clear it, as the SYS01/02 continuations do. */
+                cpu->pc = 0;
                 return 0;
             }
 
@@ -1088,7 +1238,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
                 int hits = 0;
                 pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
                                 "\n  RAM scan for 0x%08X:\n", needles[n]);
-                for (uint32_t off = 0; off + 4 <= 2u * 1024u * 1024u; off += 4) {
+                for (uint32_t off = 0; off + 4 <= psx_ram_live_bytes(); off += 4) {
                     uint32_t word;
                     memcpy(&word, ram + off, sizeof(word));
                     if (word != needles[n]) continue;
@@ -1099,7 +1249,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
                 }
                 if (!hits)
                     pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-                                    "    (not found in 2MB PSX RAM)\n");
+                                    "    (not found in live PSX RAM)\n");
             }
         }
 

@@ -4,11 +4,17 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <ostream>
 #include <set>
+#include <map>
+#include <array>
 #include "ps1_exe_parser.h"
 #include "function_analysis.h"
 #include "control_flow.h"
 #include "../src/annotations.hpp"
+#include "../src/config_loader.h"
+
+namespace PSXRecompV4 { class BiosAddressModel; }
 
 namespace PSXRecomp {
 
@@ -43,12 +49,40 @@ struct CodeGenConfig {
     // mismatch is EXPECTED (apply the transform only where the bytes match, skip
     // it elsewhere) rather than a hard config error.
     bool overlay_mode = false;
+    std::vector<PSXRecompV4::WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     std::string indent;           // Indentation string (default: "    ")
     // Widescreen sprite-tag hooks ([widescreen] sprite_tag_funcs): functions
     // that get a psx_ws_sprite_tag(cpu) callback emitted at entry, so the
     // runtime can record the per-prim pointer ($a0) + projected anchor for
     // proportion correction at GP0 submission. Empty = no hooks (default).
     std::set<uint32_t> ws_sprite_tag_funcs;
+
+    // Data-shard hooks ([data_shards] funcs): memoized pure-function replay.
+    // Entry gets `if (psx_datashard_enter(cpu, KEY)) return;` (replay path),
+    // every jr-$ra return gets `psx_datashard_ret(cpu)` (capture finalize).
+    // See docs/DATA_SHARDS.md. Empty = no hooks (default).
+    std::set<uint32_t> data_shard_funcs;
+
+    // Trusted game-mod entry hooks ([recompiler] mod_function_entry_funcs).
+    // Only explicitly listed guest functions call the runtime dispatcher.
+    std::set<uint32_t> mod_function_entry_funcs;
+    std::set<uint32_t> mod_instruction_sites;
+
+    // [recompiler] hot_funcs: emit __attribute__((hot)) on these guest
+    // addresses (MotK VLC leaves, etc.). Host locality hint only.
+    std::set<uint32_t> hot_funcs;
+
+    // [recompiler] load_charge_batch(_funcs): install a function-local
+    // cycle accumulator so load charges skip deadline probes until IRQ/MMIO
+    // / function exit. Guest totals at those barriers are unchanged.
+    std::set<uint32_t> load_charge_batch_funcs;
+
+    // [load_accel.vsync_query] verified PsyQ VSync functions whose mode=-1
+    // path may bypass its unused GPUSTAT/Timer1 reads.  The map value is the
+    // guest RAM VBlank counter returned by that query path.  Empty = inert.
+    // value = {VBlank counter, GPUSTAT-pointer global, Timer1-pointer global,
+    //          cached Timer1 global}
+    std::map<uint32_t, std::array<uint32_t, 4>> vsync_query_hle_funcs;
 
     // MMX6-class 2D tile-ring stage initializer. Emit a reveal-invalidation
     // callback at entry so host-only wide pixels cannot survive a stage swap.
@@ -68,14 +102,93 @@ struct CodeGenConfig {
     // nop replaced with `a1 += margin`, or move rD,a1 replaced with
     // `rD = a1 + margin`. See config_loader.h. Empty = default.
     std::set<uint32_t> ws_cull_bias_sites;
+    // Lower endpoint counterpart: addi/addiu immediate minus activation margin.
+    std::set<uint32_t> ws_cull_bias_lower_sites;
     std::set<uint32_t> ws_cull_range_sites;
     std::set<uint32_t> ws_cull_a1_sites;
     std::set<uint32_t> ws_cull_screen_x_sites;
+    // Extra lead for bias/range activation windows only. Render/terrain
+    // helpers continue to use psx_ws_x_margin() without this term.
+    int ws_cull_activation_guard_pixels = 0;
 
     // Explicit signed right-edge widen sites ([widescreen.cull] slti_sites):
     // `slti rt, sx, W` emitted through psx_ws_cull_slti for funnel functions
     // the auto-detector cannot qualify (X-only test, no height compare).
     std::set<uint32_t> ws_cull_slti_sites;
+    // Signed lower-bound counterpart: `slti rt,sx,-W` compares against
+    // `-W-x_margin`, preserving the original result at 4:3.
+    std::set<uint32_t> ws_cull_slti_lower_sites;
+
+    // `bltz rs, reject` emitted through psx_ws_cull_bltz — the explicit
+    // LEFT-edge counterpart to ws_cull_slti_sites ([widescreen.cull]
+    // bltz_sites), for X-only funnels the auto-detector cannot qualify.
+    std::set<uint32_t> ws_cull_bltz_sites;
+    // `bgez rs, keep` emitted through psx_ws_cull_bgez ([widescreen.cull]
+    // bgez_sites): keep while rs >= -margin. Pairs with bltz_sites to make a
+    // signed per-vertex left-edge chain exact. Identity at 4:3.
+    std::set<uint32_t> ws_cull_bgez_sites;
+    // lh/lhu/lw screen-X clip-bound loads emitted through psx_ws_clip_edge_x
+    // ([widescreen.cull] clip_edge_x_load_sites): 0 -> -margin and
+    // ws_cull_clip_edge_width -> width+margin while revealed; identity at 4:3.
+    std::set<uint32_t> ws_cull_clip_edge_x_load_sites;
+    uint32_t ws_cull_clip_edge_width = 0x140;
+
+    // Explicit horizontal low-edge widen sites ([widescreen.cull]
+    // negsub_sites): `subu rd, zero, rs` becomes `-rs - x_margin`.
+    // Identity at 4:3; empty by default.
+    std::set<uint32_t> ws_cull_negsub_sites;
+
+    // Explicit masked-16-bit screen-X window sites ([widescreen.cull]
+    // vxrange_sites). The configured sltiu is routed through the shared
+    // runtime helper so native and interpreted overlays use identical math.
+    std::set<uint32_t> ws_cull_vxrange_sites;
+
+    // Explicit aspect-scaled far-bound sites ([widescreen.cull]
+    // depth_sites). Configured slti/sltiu instructions route through the
+    // runtime helper; empty by default.
+    std::set<uint32_t> ws_cull_depth_sites;
+
+    // Side frustum-plane normal-X load sites ([widescreen.cull]
+    // plane_nx_sites). The configured lw routes through the runtime helper
+    // (inverse-aspect scale while revealed, identity at 4:3).
+    std::set<uint32_t> ws_cull_plane_nx_sites;
+    std::set<uint32_t> netplay_local_viewport_width_sites;
+
+    // Per-primitive X-reject bound load sites ([widescreen.cull]
+    // xclip_load_sites). The configured lw routes through the runtime helper
+    // (INT32_MAX while revealed, vanilla at 4:3); empty by default.
+    std::set<uint32_t> ws_cull_xclip_load_sites;
+
+    // Exact `bltz MAC0, reject`-style NCLIP/backface rejects to suppress while
+    // widescreen reveals extra world. 4:3 keeps the original branch predicate.
+    std::set<uint32_t> ws_cull_nclip_keep_sites;
+
+    // Exact `bltz MAC0, reject`-style NCLIP/backface sites that consume the
+    // validated precise sign while wide, without changing guest-visible MAC0.
+    std::set<uint32_t> ws_cull_nclip_exact_sites;
+
+    // Exact branch PCs whose reject target is suppressed while widescreen
+    // reveals extra world. 4:3 keeps the original branch predicate.
+    std::set<uint32_t> ws_cull_branch_keep_sites;
+
+    // Exact, full-word-guarded comparison sites whose result is forced only
+    // while widescreen reveals extra world. 4:3 evaluates the original compare.
+    std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep_sites;
+    std::vector<PSXRecompV4::WidescreenMaskedRejectSite> ws_cull_masked_reject_sites;
+    std::vector<PSXRecompV4::WidescreenCullScaleSite> ws_cull_scale_sites;
+
+    // Exact `addi[u] rt,zero,imm` 12-bit angular half-extents. The runtime
+    // scales tan(angle) by the current horizontal reveal factor.
+    std::vector<PSXRecompV4::WidescreenAngleSite> ws_cull_angle_sites;
+
+    // [[draw_distance.clamp]]: main-EXE ordering-table range guards. While
+    // g_psx_draw_distance_clamp is set the site's register is clamped to its
+    // max before the instruction runs; overlay code keeps its own code.
+    std::vector<PSXRecompV4::DrawDistanceClampSite> draw_distance_clamp_sites;
+
+    // Exact model-participation cosine compares that gain a camera-horizontal
+    // aspect envelope while preserving the vanilla vertical cone.
+    PSXRecompV4::WidescreenAspectConeConfig ws_aspect_cone;
 
     // Screen-extent signature immediates ([widescreen.cull] screen_w_imms /
     // screen_h_imms) — per-game display-width-derived bounds. Defaults are the
@@ -147,11 +260,22 @@ struct GeneratedFunction {
     std::string body;             // C code body
     std::string full_code;        // signature + body
     int line_count;               // Number of lines generated
+    // False for fail-closed data/untranslatable stubs whose only operation is
+    // psx_unknown_dispatch. They remain emitted for direct diagnostics, but
+    // must not advertise themselves as executable native game entries.
+    bool dispatchable = true;
 };
 
 class CodeGenerator {
 public:
     explicit CodeGenerator(const PS1Executable& exe, const CodeGenConfig& config = CodeGenConfig());
+
+    // Set the BIOS address model the game codegen folds shell/kernel RAM
+    // aliases through (jump tables inside relocated BIOS code windows).
+    // Resolved from the game's [recompiler] bios_config profile (default:
+    // the SCPH1001 profile) in main_psx.cpp; there is no built-in window.
+    // Must outlive code generation.
+    static void set_bios_address_model(const PSXRecompV4::BiosAddressModel* m);
 
     // Generate C code for a single function.
     // fallthrough_name: if non-empty and the last block has no explicit control
@@ -183,6 +307,27 @@ public:
         const std::vector<Function>& functions,
         const std::map<uint32_t, ControlFlowGraph>& cfgs);
 
+    // The generated functions from the most recent generate_file() call
+    // (post mid-function-split pass). Consumed by main_psx to write the
+    // split full.c shards + shared decls header. Not populated until
+    // generate_file() has run.
+    const std::vector<GeneratedFunction>& last_gen_funcs() const { return last_gen_funcs_; }
+
+    // Build the shared-declarations header shared by every full.c shard:
+    // the runtime extern prologue, the unaligned-access helpers (as static
+    // inline, since this header is included by multiple translation units),
+    // and forward declarations for every recompiled function plus every
+    // overlapping-alias shared body. Byte-for-byte the same declaration set
+    // the monolith emits inline, just hoisted into a header.
+    // `extra_decls` adds the alias-body prototypes of other generators whose
+    // functions share these shards (segment variants, §5.4).
+    std::string build_shared_decls_header(const std::vector<GeneratedFunction>& gen_funcs,
+                                          const std::vector<std::string>& extra_decls = {}) const;
+
+    // Prototypes of the psx_alias_body_XXXXXXXX() bodies the most recent
+    // generate_all_functions() emitted.
+    const std::vector<std::string>& alias_body_decls() const { return alias_body_decls_; }
+
     // Generate the per-function code-range manifest consumed by the overlay
     // loader's per-entry validity hash (design §8). For each function, emits its
     // compiled code byte-ranges (union of basic-block extents), coalesced;
@@ -198,6 +343,12 @@ public:
     // generate_file() call, including functions synthesized by its split pass.
     const std::string& last_ranges_manifest() const { return last_ranges_manifest_; }
 
+    // The final function set and CFGs the most recent generate_file() call
+    // emitted, after its split pass: what a segment variant's direct-edge
+    // closure is planned over (docs/SEGMENT_AWARE_CODE.md §5.4).
+    const std::vector<Function>& last_functions() const { return last_functions_; }
+    const std::map<uint32_t, ControlFlowGraph>& last_cfgs() const { return last_cfgs_; }
+
     // Set known functions for this compilation unit (for linking)
     void set_known_functions(const std::set<uint32_t>& functions) {
         known_functions_ = functions;
@@ -206,13 +357,68 @@ public:
     // Set annotation table (optional — no-op if not called)
     void set_annotations(const AnnotationTable* at) { annotations_ = at; }
 
+    // The segment this compile's code executes in (docs/SEGMENT_AWARE_CODE.md
+    // §5.2): KUSEG 0x00000000, KSEG0 0x80000000 or KSEG1 0xA0000000. Every
+    // program counter the emitter bakes into guest-visible state goes through
+    // runtime_pc(): link values, fetch tags (and the uncached-fetch test),
+    // interrupt resume PCs (future EPCs), CPS exit PCs and continuation keys,
+    // store-PC stamps, the reserved-instruction EPC, the slice resume PC and
+    // dispatch rows. Identity keys (func_/block_ names, .ranges, entry-hook
+    // ids) keep the compile address. The default is the segment of the
+    // image's load address, which is the EXE's link segment (§5.3: the parser
+    // keeps a KUSEG header's segment), so runtime_pc(addr) == addr for every
+    // address in the image. Only a compile of the same bytes for another
+    // segment (a variant, §5.4) sets a different code segment.
+    static constexpr uint32_t kSegmentMask = 0xE0000000u;
+    static constexpr uint32_t kPhysMask = 0x1FFFFFFFu;
+    void set_code_segment(uint32_t seg) { code_seg_ = seg & kSegmentMask; }
+    uint32_t code_segment() const { return code_seg_; }
+    uint32_t runtime_pc(uint32_t compile_addr) const {
+        return code_seg_ | (compile_addr & kPhysMask);
+    }
+    // A jump-table case whose value (the PC the jr reaches) names the same
+    // bytes as `image_addr` in another segment than this body's. Such a case
+    // is not a local edge: the body bakes its own segment's PCs, so the value
+    // is dispatched with its full PC instead (§5.4). Never true when the table
+    // holds this body's own segment, which is every title's home compile.
+    bool foreign_segment_case(uint32_t case_value, uint32_t image_addr) const {
+        return (case_value & kPhysMask) == (image_addr & kPhysMask) &&
+               case_value != runtime_pc(image_addr);
+    }
+
 private:
     const PS1Executable& exe_;
     CodeGenConfig config_;
+    uint32_t code_seg_;  // set from the image in the constructor; see set_code_segment()
     std::set<uint32_t> known_functions_;  // Addresses of functions in this compilation unit
     std::string last_ranges_manifest_;
+    std::vector<Function> last_functions_;
+    std::map<uint32_t, ControlFlowGraph> last_cfgs_;
     std::set<uint32_t> extra_labels_;    // Mid-block addresses that need inline labels (jump table targets)
     const AnnotationTable* annotations_ = nullptr;
+
+    // Forward declarations for every psx_alias_body_XXXXXXXX() emitted by
+    // generate_alias_group() during the most recent generate_all_functions()
+    // pass. These bodies are externally linked (split-TU build) so every
+    // shard/header that calls into another shard's alias body needs the
+    // prototype. Cleared at the top of generate_all_functions().
+    std::vector<std::string> alias_body_decls_;
+
+    // The functions emitted by the most recent generate_file() call, stashed
+    // for main_psx's split-shard writer. See last_gen_funcs().
+    std::vector<GeneratedFunction> last_gen_funcs_;
+
+    // Emit the runtime-hook extern prologue (debug_server_log_call_entry ...
+    // g_debug_last_store_pc). Shared verbatim between the monolith path
+    // (generate_file) and the split-shard shared header
+    // (build_shared_decls_header).
+    void emit_runtime_externs(std::ostream& ss) const;
+
+    // Emit the LWL/LWR/SWL/SWR unaligned-access reference helpers.
+    // as_inline selects `static inline` (shared header, included by many
+    // TUs) vs `static` (monolith, single TU) linkage for the 4 helper
+    // function definitions; everything else is identical.
+    void emit_unaligned_helpers(std::ostream& ss, bool as_inline) const;
 
     // RECURSION_BUG.md §25 — continuation-passing call/return (the universal fix
     // for the idle-freeze host-stack leak). When set (gen-time env PSX_CPS),
@@ -284,6 +490,10 @@ private:
 
     // Instruction translation
     std::string translate_instruction(uint32_t addr, uint32_t instr);
+    std::string translate_instruction_core(uint32_t addr, uint32_t instr);
+    // The [[draw_distance.clamp]] statement for (addr, instr), or "".
+    std::string draw_distance_clamp_prefix(uint32_t addr, uint32_t instr) const;
+    std::string mod_instruction_call(uint32_t addr, uint32_t instr) const;
 
     // Register name mapping
     static std::string reg_name(int reg_num);
@@ -301,6 +511,9 @@ private:
         std::map<uint32_t, std::vector<uint32_t>>& out_edges);
 
     // Control flow translation
+    // Main-EXE opcode guard for bltz_sites, bgez_sites and branch_keep_sites
+    // (exits 1 on a mismatch; overlay mode keeps vanilla code).
+    void check_explicit_branch_site(uint32_t addr, uint32_t instr) const;
     std::string generate_branch_condition(uint32_t instr, uint32_t addr);
     std::string translate_branch(const ControlFlowInstr& cf, uint32_t fall_through);
     std::string translate_jump(const ControlFlowInstr& cf);
@@ -342,6 +555,35 @@ private:
     std::string translate_lhu(uint32_t instr);
     std::string translate_lwl(uint32_t instr);
     std::string translate_lwr(uint32_t instr);
+    //
+    // LWL/LWR take their destination register as BOTH input (the merge base)
+    // and output. Unlike every other load, they read that input late enough to
+    // receive the forwarded result of an immediately preceding load, so they
+    // are NOT subject to the load delay: after
+    //
+    //     lw   $t0, 12($a3)
+    //     lwr  $t0, 10($a3)
+    //
+    // the LWR merges into the value the LW just fetched, not the stale $t0.
+    // When the pair emitter defers a load's writeback into psx_ldd_<addr>, it
+    // sets these so the LWL/LWR merge operand names that temporary instead of
+    // cpu->gpr[rt]. Empty temp = no forwarding in effect.
+    //
+    // (The mirror case -- LWL/LWR as the PRODUCER -- needs nothing: those never
+    // defer, so their writeback is already immediate.)
+    void set_lwlr_merge_forward(uint32_t rt, const std::string& temp) {
+        lwlr_merge_reg_ = rt;
+        lwlr_merge_temp_ = temp;
+    }
+    void clear_lwlr_merge_forward() { lwlr_merge_temp_.clear(); }
+    // Name to use for an LWL/LWR merge operand on register rt.
+    std::string lwlr_merge_operand(uint32_t rt) {
+        if (!lwlr_merge_temp_.empty() && rt == lwlr_merge_reg_)
+            return lwlr_merge_temp_;
+        return reg_name(rt);
+    }
+    uint32_t    lwlr_merge_reg_ = 0xFFFFFFFFu;
+    std::string lwlr_merge_temp_;
     std::string translate_swl(uint32_t instr);
     std::string translate_swr(uint32_t instr);
     std::string translate_sb(uint32_t instr);

@@ -203,7 +203,7 @@ cmake --build ../psxrecomp/recompiler/build --target psxrecomp-game psxrecomp-bi
 (cd ../psxrecomp && ./recompiler/build/psxrecomp-bios.exe --config bios/SCPH1001.toml)
 ../psxrecomp/recompiler/build/psxrecomp-game.exe --config tomba_soak_e.toml
 # build:
-cmake -S . -B <build-dir> -G Ninja -DCMAKE_BUILD_TYPE=Release -DPSX_DEBUG_TOOLS=ON -DPSX_LAUNCHER=OFF \
+cmake -S . -B <build-dir> -G Ninja -DCMAKE_BUILD_TYPE=Release -DPSX_DEBUG_TOOLS=ON -DPSX_RECOMP_UI=OFF \
   -DCMAKE_C_COMPILER=C:/msys64/mingw64/bin/gcc.exe -DCMAKE_CXX_COMPILER=C:/msys64/mingw64/bin/g++.exe
 cmake --build <build-dir> --target psx-runtime -j8
 # run (per-instance card; taskkill first):
@@ -1268,6 +1268,10 @@ it decelerates and is unrelated to the (now-fixed) host-stack leak. Run gameplay
 **Validation gate status:** ce_profile FLAT ✅ · 56.9k-frame soak no-freeze ✅ · boots+plays ✅.
 
 ### 25.5 Stage 3 — overlay (sljit + gcc-DLL) CPS parity (2026-06-18)
+
+> Historical session log. The sljit tier was removed in `5b7e69b4` (2026-07-15);
+> the gcc-DLL findings below remain current, and the toolchain-free role sljit
+> filled is now the bundled tcc tier. A gcc miss falls to tcc, then interp.
 
 **sljit JIT (overlay_sljit.c), scoped:** `jr $ra` publishes `cpu->pc`; call-containing
 fragments **decline to the interp** (CPS-safe, depth-1); `jr rX` already tail-transferred.

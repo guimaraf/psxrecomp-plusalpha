@@ -83,12 +83,37 @@ static void memcard_format(uint8_t *data) {
     memcpy(&data[63 * 128], &data[0], 128);
 }
 
+/* mkdir -p: create each path component (guest sandbox is <memcard>/netplay). */
 static void memcard_ensure_dir(const char* dir) {
+    char tmp[512];
+    size_t len;
+    size_t i;
     if (!dir || !dir[0]) return;
+    strncpy(tmp, dir, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    len = strlen(tmp);
+    while (len > 1 && (tmp[len - 1] == '/' || tmp[len - 1] == '\\')) {
+        tmp[--len] = '\0';
+    }
+    for (i = 1; i < len; i++) {
+        if (tmp[i] == '/' || tmp[i] == '\\') {
 #ifdef _WIN32
-    (void)_mkdir(dir);
+            if (i == 2 && tmp[1] == ':')
+                continue;
+#endif
+            tmp[i] = '\0';
+#ifdef _WIN32
+            (void)_mkdir(tmp);
 #else
-    (void)mkdir(dir, 0755);
+            (void)mkdir(tmp, 0755);
+#endif
+            tmp[i] = '/';
+        }
+    }
+#ifdef _WIN32
+    (void)_mkdir(tmp);
+#else
+    (void)mkdir(tmp, 0755);
 #endif
 }
 
@@ -264,4 +289,100 @@ int memcard_debug_read_buffer(int card, uint32_t offset, uint32_t len,
     if (len > avail) len = avail;
     memcpy(dst, cards[card].data + offset, len);
     return (int)len;
+}
+
+int memcard_export_raw(int card, uint8_t *dst) {
+    if (card < 0 || card >= MAX_CARDS || !dst) return -1;
+    if (!cards[card].present) return -1;
+    memcpy(dst, cards[card].data, MEMCARD_SIZE);
+    return 0;
+}
+
+int memcard_import_raw(int card, const uint8_t *src) {
+    if (card < 0 || card >= MAX_CARDS || !src) return -1;
+    if (cards[card].filepath[0] == '\0') return -1;
+    memcpy(cards[card].data, src, MEMCARD_SIZE);
+    cards[card].present = 1;
+    cards[card].dirty = 1;
+    memcard_flush(card);
+    return 0;
+}
+
+int memcard_rebind_dir(const char *dir) {
+    int i;
+    if (!dir || !dir[0]) return -1;
+    memcard_ensure_dir(dir);
+    for (i = 0; i < MAX_CARDS; i++) {
+        if (!cards[i].present && cards[i].filepath[0] == '\0')
+            continue;
+        snprintf(cards[i].filepath, sizeof(cards[i].filepath),
+                 "%s/card%d.mcd", dir, i + 1);
+        /* Force a flush of current RAM into the sandbox path when dirty or
+         * when establishing the guest mirror for the first time. */
+        cards[i].dirty = 1;
+        memcard_flush(i);
+    }
+    return 0;
+}
+
+int memcard_rebind_paths(const char *path0, const char *path1) {
+    if (path0 && path0[0]) {
+        snprintf(cards[0].filepath, sizeof(cards[0].filepath), "%s", path0);
+    }
+    if (path1 && path1[0]) {
+        snprintf(cards[1].filepath, sizeof(cards[1].filepath), "%s", path1);
+    }
+    return 0;
+}
+
+int memcard_rebind_path(int card, const char *path) {
+    if (card < 0 || card >= MAX_CARDS) return -1;
+    if (path && path[0]) {
+        snprintf(cards[card].filepath, sizeof(cards[card].filepath), "%s", path);
+        /* The first flush must not fail on a missing directory (the host's
+         * netplay/ dir does not exist until a guest card is bound there). */
+        {
+            char dir[sizeof(cards[card].filepath)];
+            size_t n;
+            snprintf(dir, sizeof(dir), "%s", path);
+            n = strlen(dir);
+            while (n > 0 && dir[n - 1] != '/' && dir[n - 1] != '\\') --n;
+            if (n > 1) {
+                dir[n - 1] = '\0';
+                memcard_ensure_dir(dir);
+            }
+        }
+    } else {
+        cards[card].filepath[0] = '\0';
+        cards[card].present = 0;
+        cards[card].dirty = 0;
+    }
+    return 0;
+}
+
+int memcard_reload_bound(void) {
+    int i;
+    for (i = 0; i < MAX_CARDS; i++) {
+        FILE *f;
+        if (cards[i].filepath[0] == '\0') {
+            cards[i].present = 0;
+            cards[i].dirty = 0;
+            continue;
+        }
+        f = fopen(cards[i].filepath, "rb");
+        if (!f) {
+            cards[i].present = 0;
+            cards[i].dirty = 0;
+            continue;
+        }
+        if (fread(cards[i].data, 1, MEMCARD_SIZE, f) == MEMCARD_SIZE) {
+            cards[i].present = 1;
+            cards[i].dirty = 0;
+        } else {
+            cards[i].present = 0;
+            cards[i].dirty = 0;
+        }
+        fclose(f);
+    }
+    return 0;
 }

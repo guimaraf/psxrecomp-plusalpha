@@ -2,6 +2,7 @@
  * See text_xlate.h + docs/STRING_TRANSLATION.md. */
 
 #include "text_xlate.h"
+#include "psx_memory.h"
 #include "cpu_state.h"
 
 #include <cstdint>
@@ -36,14 +37,13 @@ namespace {
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------
-// Guest RAM access (little-endian, no swizzle). Main RAM is 2 MB, mirrored
-// across [0,0x800000). Returns 0 / no-op for out-of-range.
+// Guest RAM access (little-endian, no swizzle). The 8 MiB decode window
+// [0,0x800000) folds through the live geometry (retail: 2 MiB mirrored four
+// times). Returns 0 / no-op for out-of-range.
 // ---------------------------------------------------------------------------
-constexpr uint32_t kRamSize = 2u * 1024u * 1024u;
-
 inline bool ram_fold(uint32_t va, uint32_t* pa_out) {
     uint32_t p = va & 0x1FFFFFFFu;
-    if (p < 0x00800000u) { *pa_out = p & (kRamSize - 1u); return true; }
+    if (p < PSX_MAIN_RAM_WINDOW_BYTES) { *pa_out = psx_ram_canonical_offset(p); return true; }
     return false;  // I/O / BIOS / scratchpad — not translatable text storage
 }
 inline uint8_t grb(uint8_t* ram, uint32_t va) {
@@ -210,7 +210,7 @@ void sj_transcode(const std::string& utf8, std::vector<uint8_t>& out) {
         // EXE menu labels are big-endian SJIS; the message-table text is stored
         // little-endian. Selectable per run (PSX_XLATE_LE=1) until confirmed;
         // once known this becomes an EncodingProfile flag.
-        static const bool le = [] { const char* e = ::getenv("PSX_XLATE_LE");
+        static const bool le = [] { const char* e = std::getenv("PSX_XLATE_LE");
                                     return e && e[0] == '1'; }();
         if (le) { out.push_back((uint8_t)(g & 0xFF)); out.push_back((uint8_t)(g >> 8)); }
         else    { out.push_back((uint8_t)(g >> 8));   out.push_back((uint8_t)(g & 0xFF)); }
@@ -417,7 +417,12 @@ std::atomic<int>                         g_msg_sep_pending{0}; // unpatched coun
 std::mutex g_mtx;
 
 std::atomic<bool>     g_apply_armed{false};   // table non-empty AND language enabled
-std::atomic<bool>     g_capture_on{true};     // always-on inventory (default)
+std::atomic<bool>     g_capture_on{false};    // inventory capture DEFAULT OFF:
+    // the always-on Shift-JIS string-inventory scan costs 26-35% of
+    // whole-lane throughput on streaming-heavy titles (measured across
+    // three GT2 race lanes; reproduced fleet-wide). Substitution (table +
+    // language armed) is unaffected; PSX_XLATE_CAPTURE=1 re-enables the
+    // scan for translation authoring.
 std::atomic<uint64_t> g_calls{0};
 std::atomic<uint64_t> g_hits{0};
 std::string           g_lang = "en";
@@ -490,10 +495,11 @@ void load_tables_locked() {
         try { data = toml::parse(de.path().string()); }
         catch (...) { continue; }
         ++files;
-        if (!data.contains("entry")) continue;
-        const auto& arr = toml::find(data, "entry");
-        if (!arr.is_array()) continue;
-        for (const auto& e : arr.as_array()) {
+        /* A fixes-only file (vram_patch / glyph-label / msg blocks, no string
+         * table) is valid: gate each block on its own key, never the file. */
+        const auto arr = data.contains("entry") ? toml::find(data, "entry")
+                                                : toml::value(toml::array{});
+        if (arr.is_array()) for (const auto& e : arr.as_array()) {
             if (!e.contains("src_hex")) continue;
             std::string hex = toml::find_or<std::string>(e, "src_hex", "");
             auto bytes = hex_to_bytes(hex);
@@ -890,7 +896,7 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
             // framed (0xFFFF, always standalone) OR pure clean text (no wild
             // binary params). PSX_XLATE_ALLOW_NUL=1 forces through for debugging.
             static const bool allow_nul = [] {
-                const char* e = ::getenv("PSX_XLATE_ALLOW_NUL"); return e && e[0] == '1'; }();
+                const char* e = std::getenv("PSX_XLATE_ALLOW_NUL"); return e && e[0] == '1'; }();
             if (term != Term::FFFF && !allow_nul && !sj_clean_text(buf, len)) continue;
             if (apply_to_reg(ram, cpu, sp, argregs[a], te, term))
                 g_hits.fetch_add(1, std::memory_order_relaxed);
@@ -907,13 +913,14 @@ extern "C" void text_xlate_vram_upload(int x, int y, int w, int h) {
 }
 
 extern "C" void text_xlate_init(const char* project_root, const char* language) {
-    const char* env = ::getenv("PSX_LANG");
+    const char* env = std::getenv("PSX_LANG");
     if (env && *env) g_lang = env;
     else if (language && *language) g_lang = language;
     if (project_root && *project_root)
         g_dir = (fs::path(project_root) / "translations").string();
-    const char* capenv = ::getenv("PSX_XLATE_CAPTURE");
+    const char* capenv = std::getenv("PSX_XLATE_CAPTURE");
     if (capenv && capenv[0] == '0') g_capture_on.store(false);
+    else if (capenv && capenv[0] == '1') g_capture_on.store(true);
     std::lock_guard<std::mutex> lk(g_mtx);
     load_tables_locked();
 }
@@ -921,7 +928,7 @@ extern "C" void text_xlate_init(const char* project_root, const char* language) 
 extern "C" void text_xlate_set_language(const char* language) {
     // PSX_LANG env is an authoring/testing override — if set it pins the language
     // and the launcher's choice is ignored (matches text_xlate_init precedence).
-    const char* env = ::getenv("PSX_LANG");
+    const char* env = std::getenv("PSX_LANG");
     std::string want = (env && *env) ? env : (language ? language : "");
     std::lock_guard<std::mutex> lk(g_mtx);
     if (want == g_lang) return;      // no change => skip the reload

@@ -1,101 +1,25 @@
 /*
  * audio_trace.c - always-on audio observability rings. See audio_trace.h.
  *
- * Memory: 3 PCM taps x 2^22 stereo frames x 4 bytes = 48 MiB static, plus a
- * 2^19-entry event ring (16 MiB). Static BSS, zero cost until touched; the
- * recording hot path is a memcpy per audio block and is compiled into
- * Release/production builds too (always-on ring-buffer discipline — probes
- * query history, they never arm recording).
+ * Debug-tool builds keep 4 PCM taps x 2^22 stereo frames x 4 bytes = 64 MiB
+ * static history, plus a 2^19-entry event ring (16 MiB). Production
+ * PSX_NO_DEBUG_TOOLS builds retain counters/events but compile out PCM history
+ * storage and WAV dumps.
  */
 #include "audio_trace.h"
 
-#if defined(_MSC_VER)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
-typedef volatile LONG64 AudioAtomicU64;
-typedef volatile LONG AudioAtomicU32;
-
-static uint64_t audio_atomic_u64_load_relaxed(AudioAtomicU64 *value)
-{
-    return (uint64_t)InterlockedCompareExchange64(value, 0, 0);
-}
-
-static uint64_t audio_atomic_u64_load_acquire(AudioAtomicU64 *value)
-{
-    return (uint64_t)InterlockedCompareExchange64(value, 0, 0);
-}
-
-static void audio_atomic_u64_store_relaxed(AudioAtomicU64 *value, uint64_t next)
-{
-    (void)InterlockedExchange64(value, (LONG64)next);
-}
-
-static void audio_atomic_u64_store_release(AudioAtomicU64 *value, uint64_t next)
-{
-    (void)InterlockedExchange64(value, (LONG64)next);
-}
-
-static uint32_t audio_atomic_u32_load_relaxed(AudioAtomicU32 *value)
-{
-    return (uint32_t)InterlockedCompareExchange(value, 0, 0);
-}
-
-static void audio_atomic_u32_store_relaxed(AudioAtomicU32 *value, uint32_t next)
-{
-    (void)InterlockedExchange(value, (LONG)next);
-}
-#else
 #include <stdatomic.h>
-
-typedef _Atomic(uint64_t) AudioAtomicU64;
-typedef _Atomic(uint32_t) AudioAtomicU32;
-
-static uint64_t audio_atomic_u64_load_relaxed(AudioAtomicU64 *value)
-{
-    return atomic_load_explicit(value, memory_order_relaxed);
-}
-
-static uint64_t audio_atomic_u64_load_acquire(AudioAtomicU64 *value)
-{
-    return atomic_load_explicit(value, memory_order_acquire);
-}
-
-static void audio_atomic_u64_store_relaxed(AudioAtomicU64 *value, uint64_t next)
-{
-    atomic_store_explicit(value, next, memory_order_relaxed);
-}
-
-static void audio_atomic_u64_store_release(AudioAtomicU64 *value, uint64_t next)
-{
-    atomic_store_explicit(value, next, memory_order_release);
-}
-
-static uint32_t audio_atomic_u32_load_relaxed(AudioAtomicU32 *value)
-{
-    return atomic_load_explicit(value, memory_order_relaxed);
-}
-
-static void audio_atomic_u32_store_relaxed(AudioAtomicU32 *value, uint32_t next)
-{
-    atomic_store_explicit(value, next, memory_order_relaxed);
-}
-#endif
 #include <stdio.h>
 #include <string.h>
 
-/* Xbox keeps a short post-failure window without reserving 64 MiB for PCM. */
-#if defined(PSX_UWP)
-#define PCM_RING_FRAMES (1u << 17) /* ~3 s per tap at 44.1 kHz. */
-#define EV_RING_CAP     (1u << 14)
-#else
-#define PCM_RING_FRAMES (1u << 22) /* ~95 s per tap at 44.1 kHz. */
-#define EV_RING_CAP     (1u << 19)
-#endif
+/* 2^22 frames @ 44100 ~= 95 s per tap. Power of two so wrap is a mask. */
+#ifndef PSX_NO_DEBUG_TOOLS
+#define PCM_RING_FRAMES (1u << 22)
 #define PCM_RING_MASK   (PCM_RING_FRAMES - 1u)
-#define EV_RING_MASK    (EV_RING_CAP - 1u)
+#endif
+
+#define EV_RING_CAP  (1u << 19)
+#define EV_RING_MASK (EV_RING_CAP - 1u)
 
 /* Audibility threshold shared with snesrecomp's dropped_audible metric:
  * |sample| > 256 ~= -42 dBFS. Below that, gaps/drops are inaudible and must
@@ -103,8 +27,10 @@ static void audio_atomic_u32_store_relaxed(AudioAtomicU32 *value, uint32_t next)
 #define AUDIBLE_ABS 256
 
 typedef struct {
+#ifndef PSX_NO_DEBUG_TOOLS
     int16_t          pcm[PCM_RING_FRAMES * 2];
-    AudioAtomicU64 head;         /* frames ever written; ring pos = head & MASK */
+#endif
+    _Atomic uint64_t head;      /* frames ever written; ring pos = head & MASK */
     uint64_t         nonzero;
     uint64_t         audible;
     int32_t          peak;
@@ -129,9 +55,9 @@ uint32_t audio_trace_tap_rate(int tap)
 }
 
 static AudioTraceEvent  s_events[EV_RING_CAP];
-static AudioAtomicU64 s_event_head;
+static _Atomic uint64_t s_event_head;
 
-static AudioAtomicU32 s_noted_frame;
+static _Atomic uint32_t s_noted_frame;
 
 /* Host pump counters (single writer: the pump/render thread). */
 static uint64_t s_pump_calls;
@@ -145,13 +71,13 @@ static uint64_t s_unmute_events;
 void audio_trace_init(void)
 {
     for (int t = 0; t < AUDIO_TAP_COUNT; t++) {
-        audio_atomic_u64_store_relaxed(&s_taps[t].head, 0);
+        atomic_store(&s_taps[t].head, 0);
         s_taps[t].nonzero = 0;
         s_taps[t].audible = 0;
         s_taps[t].peak = 0;
     }
-    audio_atomic_u64_store_relaxed(&s_event_head, 0);
-    audio_atomic_u32_store_relaxed(&s_noted_frame, 0);
+    atomic_store(&s_event_head, 0);
+    atomic_store(&s_noted_frame, 0);
     s_pump_calls = 0;
     s_pump_skips = 0;
     s_underruns = 0;
@@ -163,21 +89,23 @@ void audio_trace_init(void)
 
 void audio_trace_note_frame(uint32_t frame)
 {
-    audio_atomic_u32_store_relaxed(&s_noted_frame, frame);
+    atomic_store_explicit(&s_noted_frame, frame, memory_order_relaxed);
 }
 
 void audio_trace_pcm(int tap, const int16_t *stereo, int frames)
 {
     if (tap < 0 || tap >= AUDIO_TAP_COUNT || !stereo || frames <= 0) return;
     PcmTap *t = &s_taps[tap];
-    uint64_t head = audio_atomic_u64_load_relaxed(&t->head);
+    uint64_t head = atomic_load_explicit(&t->head, memory_order_relaxed);
 
     for (int f = 0; f < frames; f++) {
         int16_t l = stereo[f * 2 + 0];
         int16_t r = stereo[f * 2 + 1];
+#ifndef PSX_NO_DEBUG_TOOLS
         uint32_t pos = (uint32_t)((head + (uint64_t)f) & PCM_RING_MASK);
         t->pcm[pos * 2 + 0] = l;
         t->pcm[pos * 2 + 1] = r;
+#endif
         int32_t al = l < 0 ? -(int32_t)l : l;
         int32_t ar = r < 0 ? -(int32_t)r : r;
         int32_t a  = al > ar ? al : ar;
@@ -185,21 +113,23 @@ void audio_trace_pcm(int tap, const int16_t *stereo, int frames)
         if (a > AUDIBLE_ABS) t->audible++;
         if (a > t->peak) t->peak = a;
     }
-    audio_atomic_u64_store_release(&t->head, head + (uint64_t)frames);
+    atomic_store_explicit(&t->head, head + (uint64_t)frames,
+                          memory_order_release);
 }
 
 void audio_trace_event(uint16_t kind, uint32_t a, uint32_t b)
 {
-    uint64_t seq = audio_atomic_u64_load_relaxed(&s_event_head);
+    uint64_t seq = atomic_load_explicit(&s_event_head, memory_order_relaxed);
     AudioTraceEvent *e = &s_events[(uint32_t)(seq & EV_RING_MASK)];
     e->seq        = seq;
-    e->sample_idx = audio_atomic_u64_load_relaxed(&s_taps[AUDIO_TAP_SPU_OUT].head);
-    e->frame      = audio_atomic_u32_load_relaxed(&s_noted_frame);
+    e->sample_idx = atomic_load_explicit(&s_taps[AUDIO_TAP_SPU_OUT].head,
+                                         memory_order_relaxed);
+    e->frame      = atomic_load_explicit(&s_noted_frame, memory_order_relaxed);
     e->kind       = kind;
     e->reserved   = 0;
     e->a          = a;
     e->b          = b;
-    audio_atomic_u64_store_release(&s_event_head, seq + 1);
+    atomic_store_explicit(&s_event_head, seq + 1, memory_order_release);
 
     switch (kind) {
     case AUDIO_EV_RENDER:
@@ -220,7 +150,8 @@ void audio_trace_get_stats(AudioTraceStats *out)
     if (!out) return;
     memset(out, 0, sizeof(*out));
     for (int t = 0; t < AUDIO_TAP_COUNT; t++) {
-        out->tap_frames[t]  = audio_atomic_u64_load_acquire(&s_taps[t].head);
+        out->tap_frames[t]  = atomic_load_explicit(&s_taps[t].head,
+                                                   memory_order_acquire);
         out->tap_nonzero[t] = s_taps[t].nonzero;
         out->tap_audible[t] = s_taps[t].audible;
         out->tap_peak[t]    = s_taps[t].peak;
@@ -232,24 +163,25 @@ void audio_trace_get_stats(AudioTraceStats *out)
     out->queue_lowater  = s_queue_lowater == 0xFFFFFFFFu ? 0 : s_queue_lowater;
     out->mute_events    = s_mute_events;
     out->unmute_events  = s_unmute_events;
-    out->events_total   = audio_atomic_u64_load_acquire(&s_event_head);
+    out->events_total   = atomic_load_explicit(&s_event_head,
+                                               memory_order_acquire);
 }
 
 uint64_t audio_trace_tap_total(int tap)
 {
     if (tap < 0 || tap >= AUDIO_TAP_COUNT) return 0;
-    return audio_atomic_u64_load_acquire(&s_taps[tap].head);
+    return atomic_load_explicit(&s_taps[tap].head, memory_order_acquire);
 }
 
 uint64_t audio_trace_events_total(void)
 {
-    return audio_atomic_u64_load_acquire(&s_event_head);
+    return atomic_load_explicit(&s_event_head, memory_order_acquire);
 }
 
 uint32_t audio_trace_events_get(AudioTraceEvent *out, uint32_t max)
 {
     if (!out || max == 0) return 0;
-    uint64_t total = audio_atomic_u64_load_acquire(&s_event_head);
+    uint64_t total = atomic_load_explicit(&s_event_head, memory_order_acquire);
     uint64_t avail = total < (uint64_t)EV_RING_CAP ? total : (uint64_t)EV_RING_CAP;
     if ((uint64_t)max > avail) max = (uint32_t)avail;
     uint64_t first = total - (uint64_t)max;
@@ -260,6 +192,7 @@ uint32_t audio_trace_events_get(AudioTraceEvent *out, uint32_t max)
 
 /* ---- WAV dump --------------------------------------------------------- */
 
+#ifndef PSX_NO_DEBUG_TOOLS
 static void wav_write_header(FILE *fp, uint32_t data_bytes, uint32_t rate)
 {
     uint8_t h[44];
@@ -293,7 +226,7 @@ int64_t audio_trace_dump_wav(int tap, const char *path,
     /* Snapshot the head; everything in [head - avail, head) is stable
      * (append-only, single writer) unless the writer laps us — the ring
      * holds ~95 s, a dump takes well under a second. */
-    uint64_t head  = audio_atomic_u64_load_acquire(&t->head);
+    uint64_t head  = atomic_load_explicit(&t->head, memory_order_acquire);
     uint64_t avail = head < (uint64_t)PCM_RING_FRAMES ? head
                                                       : (uint64_t)PCM_RING_FRAMES;
     if (avail == 0) return -1;
@@ -334,3 +267,14 @@ int64_t audio_trace_dump_wav(int tap, const char *path,
     fclose(fp);
     return (int64_t)count;
 }
+#else
+int64_t audio_trace_dump_wav(int tap, const char *path,
+                             int64_t start, uint64_t count)
+{
+    (void)tap;
+    (void)path;
+    (void)start;
+    (void)count;
+    return -1;
+}
+#endif

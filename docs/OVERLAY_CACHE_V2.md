@@ -45,7 +45,10 @@ provider for every function identity present right now?"
 - **Logical identity = FuncKey** (per function): `{game_id, guest_entry_vaddr,
   extent_start, extent_len, code_hash, recompiler_version, codegen_abi_version}`.
   Guest address is PART of the key (PC-relative branches / delay-slot lowering
-  mean same bytes at a different address are NOT equivalent). code_hash stays
+  mean same bytes at a different address are NOT equivalent). The VA includes
+  the segment: a KUSEG or KSEG1 entry of the same bytes bakes different links,
+  EPCs, fetch tags and store PCs, so it is its own function identity and its
+  own shard (docs/SEGMENT_AWARE_CODE.md §5.7). code_hash stays
   CRC32 for now (matches runtime `crc32_compute`; revisit to xxHash128 later — a
   separate change since the runtime hash must match).
 - **Build/package unit = bundle** of many FuncKeys → one DLL.
@@ -184,8 +187,11 @@ KEYING for interior shards: key/validate by the COVERED block ranges + a hash of
 ONLY the covered instruction bytes (NOT a guessed enclosing host range — that's
 what pulled in volatile/data bytes). The loader validates only those covered
 ranges. Dispatch priority for a PC: full host > recovered host > interior
-fragment > sljit > interp; an interior shard covers only its exact legal entries,
-never claims the whole host.
+fragment > interp; an interior shard covers only its exact legal entries,
+never claims the whole host. (This chain listed an `sljit` tier between the
+interior fragment and the interpreter when written; the sljit tier was removed
+in `5b7e69b4`, 2026-07-15. Shards are produced by gcc or the bundled tcc today,
+and both land in the host/fragment classes above.)
 
 PHASES: P1 separate the build classes (stop poisoning — REGION_TRUSTED only emits
 the all-roots DLL). P2 interior-entry fragment compiler (do this FIRST for the FMV

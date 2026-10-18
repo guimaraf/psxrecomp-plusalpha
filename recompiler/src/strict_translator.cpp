@@ -7,6 +7,8 @@
 // records this substitution explicitly.
 
 #include "strict_translator.h"
+#include "pgxp_hook_emitter.h"   /* shared PGXP hook grammar */
+#include "gte_register_classification.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -62,6 +64,42 @@ TranslateResult unsupported(const PSXRecomp::DecodedInstruction& d, const std::s
 } // namespace
 
 TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction& d) {
+    return translate(d, d.address);
+}
+
+TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction& d,
+                                            uint32_t runtime_pc) {
+    TranslateResult r = translate_impl(d, runtime_pc);
+    if (!r.supported) return r;
+    const uint32_t opcode = (d.raw >> 26) & 0x3F;
+    /* Shared PGXP hook grammar (ENHANCEMENTS.md G1.10). LWC2/SWC2 capture
+     * their raw word inside translate_impl and are skipped here. */
+    if (opcode != 0x32 && opcode != 0x3A && !r.c_code.empty())
+        PSXRecomp::append_pgxp_hooks(d.raw, r.c_code);
+    /* The deferred load-delay variant assigns into the function-scope
+     * psx_ldd_<addr> temp instead of the GPR; hook it with that temp as the
+     * loaded value (the shadow keys on the value, not on where it lands —
+     * the emitter's later writeback makes the GPR match). */
+    if (r.load_dest >= 0 && !r.c_code_deferred.empty()) {
+        const uint32_t rs = (d.raw >> 21) & 0x1F;
+        const int16_t offset = static_cast<int16_t>(d.raw & 0xFFFF);
+        /* Newline, never a space: if the deferred emission ever ends on a
+         * preprocessor directive (the block-cycles annotations already do
+         * elsewhere in this file), a space-joined hook lands on the directive
+         * line and is silently discarded -- the PR #171 defect. Unconditional
+         * "\n" is always valid where the space was, so non-directive
+         * emissions are unaffected apart from whitespace. */
+        r.c_code_deferred = fmt::format(
+            "{{ uint32_t _pgxa = cpu->gpr[{}] + {}; {}\n    "
+            "PGXP_LOAD(0x{:08X}u, _pgxa, psx_ldd_{:08X}); }}",
+            static_cast<int>(rs), static_cast<int>(offset),
+            r.c_code_deferred, d.raw, d.address);
+    }
+    return r;
+}
+
+TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruction& d,
+                                                 uint32_t pc) {
     TranslateResult r;
 
     // NOP (raw == 0, i.e. SLL $zero,$zero,0) — emit as a comment with no semantics.
@@ -223,11 +261,11 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                     // (return 1) set cpu->pc and return to the trampoline.
                     r.c_code = fmt::format(
                         "cpu->pc = 0x{:08X}u; if (psx_syscall(cpu, cpu->gpr[2])) return;",
-                        d.address);
+                        pc);
                 } else {
                     r.c_code = fmt::format(
                         "cpu->pc = 0x{:08X}u; psx_syscall(cpu, cpu->gpr[2]); return;",
-                        d.address);
+                        pc);
                 }
                 r.comment = "syscall";
                 return r;
@@ -238,7 +276,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                 r.supported = true;
                 r.c_code = fmt::format(
                     "psx_break(cpu, 0x{:05X}u, 0x{:08X}u); return;",
-                    code, d.address);
+                    code, pc);
                 r.comment = fmt::format("break 0x{:X}", code);
                 return r;
             }
@@ -272,6 +310,21 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                 r.c_code = fmt::format("cpu->lo = cpu->gpr[{}];",
                                        static_cast<int>(rs));
                 r.comment = fmt::format("mtlo {}", gpr_name(rs));
+                return r;
+            }
+
+            case 0x18: { // MULT rs, rt -- 32x32 -> 64 signed, HI:LO
+                // No MULT was ever reached from the SCPH1001 seed set, so
+                // this case first became reachable with OpenBIOS (modern GCC
+                // emits MULT freely). Same shape as MULTU below, signed.
+                r.supported = true;
+                r.c_code = fmt::format(
+                    "{{ int64_t psx_p = (int64_t)(int32_t)cpu->gpr[{}] * (int64_t)(int32_t)cpu->gpr[{}]; "
+                    "cpu->lo = (uint32_t)((uint64_t)psx_p & 0xFFFFFFFFu); "
+                    "cpu->hi = (uint32_t)((uint64_t)psx_p >> 32); }}"
+                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, psx_mult_latency_s(cpu->gpr[{}]));\n#endif",
+                    static_cast<int>(rs), static_cast<int>(rt), static_cast<int>(rs));
+                r.comment = fmt::format("mult {}, {}", gpr_name(rs), gpr_name(rt));
                 return r;
             }
 
@@ -863,6 +916,10 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             r.c_code = fmt::format(
                 "cpu->gpr[{}] = (uint32_t)(int32_t)(int8_t)psx_cyc_load_byte(cpu, {}, {}, 0x{:X}u);",
                 static_cast<int>(rt), addr_expr, static_cast<int>(rt), mask);
+            r.load_dest = rt;
+            r.c_code_deferred = fmt::format(
+                "psx_ldd_{:08X} = (uint32_t)(int32_t)(int8_t)psx_cyc_load_byte(cpu, {}, {}, 0x{:X}u);",
+                d.address, addr_expr, static_cast<int>(rt), mask);
         }
         r.comment = fmt::format("lb {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
         return r;
@@ -975,7 +1032,15 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             "{{ uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "if (psx_addr & 1u) {{ psx_unaligned_access(cpu, psx_addr, 0x{:08X}u); return; }} "
             "{} }}",
-            static_cast<int>(rs), simm, d.address, body);
+            static_cast<int>(rs), simm, pc, body);
+        if (rt != 0) {
+            r.load_dest = rt;
+            r.c_code_deferred = fmt::format(
+                "{{ uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+                "if (psx_addr & 1u) {{ psx_unaligned_access(cpu, psx_addr, 0x{:08X}u); return; }} "
+                "psx_ldd_{:08X} = (uint32_t)(int32_t)(int16_t)psx_cyc_load_half(cpu, psx_addr, {}, 0x{:X}u); }}",
+                static_cast<int>(rs), simm, pc, d.address, static_cast<int>(rt), mask);
+        }
         r.comment = fmt::format("lh {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
         return r;
     }
@@ -995,7 +1060,15 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             "{{ uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "if (psx_addr & 3u) {{ psx_unaligned_access(cpu, psx_addr, 0x{:08X}u); return; }} "
             "{} }}",
-            static_cast<int>(rs), simm, d.address, body);
+            static_cast<int>(rs), simm, pc, body);
+        if (rt != 0) {
+            r.load_dest = rt;
+            r.c_code_deferred = fmt::format(
+                "{{ uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+                "if (psx_addr & 3u) {{ psx_unaligned_access(cpu, psx_addr, 0x{:08X}u); return; }} "
+                "psx_ldd_{:08X} = psx_cyc_load_word(cpu, psx_addr, {}, 0x{:X}u); }}",
+                static_cast<int>(rs), simm, pc, d.address, static_cast<int>(rt), mask);
+        }
         r.comment = fmt::format("lw {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
         return r;
     }
@@ -1015,6 +1088,10 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             r.c_code = fmt::format(
                 "cpu->gpr[{}] = (uint32_t)psx_cyc_load_byte(cpu, {}, {}, 0x{:X}u);",
                 static_cast<int>(rt), addr_expr, static_cast<int>(rt), mask);
+            r.load_dest = rt;
+            r.c_code_deferred = fmt::format(
+                "psx_ldd_{:08X} = (uint32_t)psx_cyc_load_byte(cpu, {}, {}, 0x{:X}u);",
+                d.address, addr_expr, static_cast<int>(rt), mask);
         }
         r.comment = fmt::format("lbu {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
         return r;
@@ -1035,7 +1112,15 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             "{{ uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "if (psx_addr & 1u) {{ psx_unaligned_access(cpu, psx_addr, 0x{:08X}u); return; }} "
             "{} }}",
-            static_cast<int>(rs), simm, d.address, body);
+            static_cast<int>(rs), simm, pc, body);
+        if (rt != 0) {
+            r.load_dest = rt;
+            r.c_code_deferred = fmt::format(
+                "{{ uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+                "if (psx_addr & 1u) {{ psx_unaligned_access(cpu, psx_addr, 0x{:08X}u); return; }} "
+                "psx_ldd_{:08X} = (uint32_t)psx_cyc_load_half(cpu, psx_addr, {}, 0x{:X}u); }}",
+                static_cast<int>(rs), simm, pc, d.address, static_cast<int>(rt), mask);
+        }
         r.comment = fmt::format("lhu {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
         return r;
     }
@@ -1078,9 +1163,9 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         const int32_t simm = static_cast<int32_t>(static_cast<int16_t>(d.raw & 0xFFFF));
         r.supported = true;
         r.c_code = fmt::format(
-            "g_debug_last_store_pc = 0x{:08X}u; "
+            "psx_store_cycle_barrier(); g_debug_last_store_pc = 0x{:08X}u; "
             "cpu->write_byte((uint32_t)((int32_t)cpu->gpr[{}] + ({})), (uint8_t)(cpu->gpr[{}] & 0xFFu));",
-            d.address, static_cast<int>(rs), simm, static_cast<int>(rt));
+            pc, static_cast<int>(rs), simm, static_cast<int>(rt));
         r.comment = fmt::format("sb {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
         return r;
     }
@@ -1092,11 +1177,11 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         const int32_t simm = static_cast<int32_t>(static_cast<int16_t>(d.raw & 0xFFFF));
         r.supported = true;
         r.c_code = fmt::format(
-            "{{ uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+            "{{ psx_store_cycle_barrier(); uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "if (psx_addr & 1u) {{ psx_unaligned_access(cpu, psx_addr, 0x{:08X}u); return; }} "
             "g_debug_last_store_pc = 0x{:08X}u; "
             "cpu->write_half(psx_addr, (uint16_t)(cpu->gpr[{}] & 0xFFFFu)); }}",
-            static_cast<int>(rs), simm, d.address, d.address, static_cast<int>(rt));
+            static_cast<int>(rs), simm, pc, pc, static_cast<int>(rt));
         r.comment = fmt::format("sh {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
         return r;
     }
@@ -1130,7 +1215,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         // design — it is the instruction PS1 code uses precisely
         // when the address is not 4-aligned.
         r.c_code = fmt::format(
-            "{{ uint32_t psx_addr  = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+            "{{ psx_store_cycle_barrier(); uint32_t psx_addr  = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "uint32_t psx_aligned = psx_addr & ~3u; "
             "uint32_t psx_shift_bytes = psx_addr & 3u; "
             "uint32_t psx_shift_bits  = (3u - psx_shift_bytes) * 8u; "
@@ -1139,7 +1224,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             "uint32_t psx_new = (psx_mem & psx_keep_mask) | (cpu->gpr[{}] >> psx_shift_bits); "
             "g_debug_last_store_pc = 0x{:08X}u; "
             "cpu->write_word(psx_aligned, psx_new); }}",
-            static_cast<int>(rs), simm, static_cast<int>(rt), d.address);
+            static_cast<int>(rs), simm, static_cast<int>(rt), pc);
         r.comment = fmt::format("swl {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
         return r;
     }
@@ -1151,11 +1236,11 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         const int32_t simm = static_cast<int32_t>(static_cast<int16_t>(d.raw & 0xFFFF));
         r.supported = true;
         r.c_code = fmt::format(
-            "{{ uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+            "{{ psx_store_cycle_barrier(); uint32_t psx_addr = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "if (psx_addr & 3u) {{ psx_unaligned_access(cpu, psx_addr, 0x{:08X}u); return; }} "
             "g_debug_last_store_pc = 0x{:08X}u; "
             "cpu->write_word(psx_addr, cpu->gpr[{}]); }}",
-            static_cast<int>(rs), simm, d.address, d.address, static_cast<int>(rt));
+            static_cast<int>(rs), simm, pc, pc, static_cast<int>(rt));
         r.comment = fmt::format("sw {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
         return r;
     }
@@ -1182,7 +1267,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         // SWR with addr & 3 == 0 stores the full word at addr.
         // Verified against IDT R3000 manual and PSX-SPX.
         r.c_code = fmt::format(
-            "{{ uint32_t psx_addr  = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
+            "{{ psx_store_cycle_barrier(); uint32_t psx_addr  = (uint32_t)((int32_t)cpu->gpr[{}] + ({})); "
             "uint32_t psx_aligned = psx_addr & ~3u; "
             "uint32_t psx_shift_bytes = psx_addr & 3u; "
             "uint32_t psx_shift_bits  = psx_shift_bytes * 8u; "
@@ -1191,7 +1276,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             "uint32_t psx_new = (psx_mem & psx_keep_mask) | (cpu->gpr[{}] << psx_shift_bits); "
             "g_debug_last_store_pc = 0x{:08X}u; "
             "cpu->write_word(psx_aligned, psx_new); }}",
-            static_cast<int>(rs), simm, static_cast<int>(rt), d.address);
+            static_cast<int>(rs), simm, static_cast<int>(rt), pc);
         r.comment = fmt::format("swr {}, {}({})", gpr_name(rt), simm, gpr_name(rs));
         return r;
     }
@@ -1275,7 +1360,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             r.supported = true;
             // Computed/sign-extended data registers must route through the
             // helper instead of reading the backing array directly.
-            if ((rd >= 8 && rd <= 11) || rd == 15 || rd == 28 || rd == 29 || rd == 31) {
+            if (PSXRecompGTERegisters::data_read_needs_helper(rd)) {
                 r.c_code = gte_read + emit_gpr_write(rt,
                     fmt::format("gte_read_data(cpu, {})", static_cast<int>(rd)));
             } else {
@@ -1287,7 +1372,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x02) { // CFC2 — move from COP2 control register
             r.supported = true;
-            if (rd == 26 || rd == 27 || rd == 29 || rd == 30 || rd == 31) {
+            if (PSXRecompGTERegisters::ctrl_read_needs_helper(rd)) {
                 r.c_code = gte_read + emit_gpr_write(rt,
                     fmt::format("gte_read_ctrl(cpu, {})", static_cast<int>(rd)));
             } else {
@@ -1299,9 +1384,9 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x04) { // MTC2 — move to COP2 data register
             r.supported = true;
-            // Route registers with side effects or canonical masking through
-            // gte_write_data(): OTZ/IR/SXY2/SXYP/IRGB/LZCS.
-            if (rd == 7 || (rd >= 8 && rd <= 11) || rd == 14 || rd == 15 || rd == 28 || rd == 30) {
+            // Masked, aliased, read-only, derived, and precision-shadow data
+            // registers share the runtime helper's exact semantics.
+            if (PSXRecompGTERegisters::data_write_needs_helper(rd)) {
                 r.c_code = gte_stall + fmt::format(
                     "gte_write_data(cpu, {}, cpu->gpr[{}]);",
                     static_cast<int>(rd), static_cast<int>(rt));
@@ -1315,7 +1400,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x06) { // CTC2 — move to COP2 control register
             r.supported = true;
-            if (rd == 26 || rd == 27 || rd == 29 || rd == 30 || rd == 31) {
+            if (PSXRecompGTERegisters::ctrl_write_needs_helper(rd)) {
                 r.c_code = gte_stall + fmt::format(
                     "gte_write_ctrl(cpu, {}, cpu->gpr[{}]);",
                     static_cast<int>(rd), static_cast<int>(rt));
@@ -1356,15 +1441,19 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         std::string addr = offset == 0
             ? fmt::format("cpu->gpr[{}]", static_cast<int>(rs))
             : fmt::format("(uint32_t)((int32_t)cpu->gpr[{}] + ({}))", static_cast<int>(rs), static_cast<int>(offset));
-        bool special = (rt == 7 || (rt >= 8 && rt <= 11) || rt == 14 || rt == 15 || rt == 28 || rt == 30);
+        bool special = PSXRecompGTERegisters::data_write_needs_helper(rt);
+        /* The raw loaded word is captured for the PGXP hook: a masked
+         * register write must validate against the word as loaded. */
         if (special) {
             r.c_code = gte_stall + fmt::format(
-                "gte_write_data(cpu, {}, psx_cyc_lwc2_read(cpu, {}));",
-                static_cast<int>(rt), addr);
+                "{{ uint32_t _pgxa = {}; uint32_t _pgxv = psx_cyc_lwc2_read(cpu, _pgxa); "
+                "gte_write_data(cpu, {}, _pgxv); PGXP_COP2(0x{:08X}u, _pgxv, _pgxa); }}",
+                addr, static_cast<int>(rt), d.raw);
         } else {
             r.c_code = gte_stall + fmt::format(
-                "cpu->gte_data[{}] = psx_cyc_lwc2_read(cpu, {});",
-                static_cast<int>(rt), addr);
+                "{{ uint32_t _pgxa = {}; uint32_t _pgxv = psx_cyc_lwc2_read(cpu, _pgxa); "
+                "cpu->gte_data[{}] = _pgxv; PGXP_COP2(0x{:08X}u, _pgxv, _pgxa); }}",
+                addr, static_cast<int>(rt), d.raw);
         }
         r.comment = fmt::format("lwc2 gte[{}], {}({})",
             rt, static_cast<int>(offset), gpr_name(rs));
@@ -1380,19 +1469,21 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         // Faithful GTE: COP2 reg read stalls to the command deadline.
         const std::string gte_stall =
             "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
-        std::string value = ((rt >= 8 && rt <= 11) || rt == 15 || rt == 28 || rt == 29 || rt == 31)
+        std::string value = PSXRecompGTERegisters::data_read_needs_helper(rt)
             ? fmt::format("gte_read_data(cpu, {})", static_cast<int>(rt))
             : fmt::format("cpu->gte_data[{}]", static_cast<int>(rt));
-        if (offset == 0) {
+        {
+            std::string addr = offset == 0
+                ? fmt::format("cpu->gpr[{}]", static_cast<int>(rs))
+                : fmt::format("(uint32_t)((int32_t)cpu->gpr[{}] + ({}))",
+                              static_cast<int>(rs), static_cast<int>(offset));
             r.c_code = gte_stall + fmt::format(
-                "g_debug_last_store_pc = 0x{:08X}u; "
-                "cpu->write_word(cpu->gpr[{}], {});",
-                d.address, static_cast<int>(rs), value);
-        } else {
-            r.c_code = gte_stall + fmt::format(
-                "g_debug_last_store_pc = 0x{:08X}u; "
-                "cpu->write_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {});",
-                d.address, static_cast<int>(rs), static_cast<int>(offset), value);
+                "psx_store_cycle_barrier(); g_debug_last_store_pc = 0x{:08X}u; "
+                "{{ uint32_t _pgxa = {}; uint32_t _pgxv = {}; "
+                "cpu->write_word(_pgxa, _pgxv); "
+                "gte_precision_store_word(_pgxa, {}); "
+                "PGXP_COP2(0x{:08X}u, _pgxv, _pgxa); }}",
+                pc, addr, value, static_cast<int>(rt), d.raw);
         }
         r.comment = fmt::format("swc2 gte[{}], {}({})",
             rt, static_cast<int>(offset), gpr_name(rs));

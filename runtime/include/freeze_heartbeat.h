@@ -1,4 +1,4 @@
-/* freeze_heartbeat.h — observability infrastructure.
+﻿/* freeze_heartbeat.h — observability infrastructure.
  *
  * Starts a background thread that snapshots runtime state to
  * `psx_freeze_heartbeat.json` every ~100 ms. Survives main-thread
@@ -24,6 +24,12 @@ extern "C" {
  * (e.g. "psx-runtime" or "psx-beetle") so a reader can tell which
  * binary produced the file. */
 void freeze_heartbeat_start(const char *backend_label);
+
+/* Suppress automatic wedge classification while the host intentionally parks
+ * guest execution, such as save-state/rewind overlays or netplay admit waits.
+ * Heartbeat JSON still updates; the detector window is reset while paused so
+ * the first post-resume window is built only from live guest samples. */
+void freeze_heartbeat_set_paused(int paused);
 
 #ifdef __cplusplus
 }

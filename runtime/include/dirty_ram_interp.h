@@ -1,4 +1,4 @@
-/* dirty_ram_interp.h — interpret-on-dispatch for install-at-runtime RAM.
+﻿/* dirty_ram_interp.h — interpret-on-dispatch for install-at-runtime RAM.
  *
  * See CLAUDE.md Rule 18 and docs/dynamic_handler_install.md for the full
  * rationale.  The PS1 BIOS dynamically writes 4-instruction dispatch stubs
@@ -16,6 +16,8 @@
 #define PSXRECOMP_DIRTY_RAM_INTERP_H
 
 #include <stdint.h>
+#include <string.h>
+#include "psx_memory.h"
 #include "cpu_state.h"
 
 #ifdef __cplusplus
@@ -40,6 +42,63 @@ extern "C" {
  * corruption, 2026-06-10). */
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
 
+/* Replay [start_pc, stop_pc) of already-loaded guest code from the CPU state
+ * given: every PC in the range is interpreted from its live RAM bytes, even
+ * where a compiled body or a compiled resume point (the return address of a
+ * call) begins, so a span can start in the middle of a compiled function.
+ * Calls the span makes run on their normal backend and return into it.
+ * Returns 1 when control reaches stop_pc, 0 when it leaves the range any other
+ * way (a return, a jump out, a nested span) or runs past max_insns
+ * interpreted instructions. The range is half-open, CODE identity, one span
+ * at a time. A span is a replay, not a function entry: it fires no
+ * function-entry hooks at its own PCs and stays out of capture, alias seeding
+ * and per-PC entry statistics. Instruction hooks fire as in compiled code.
+ * Mods reach it through psx_mod_run_guest_span (render passes only). */
+int  dirty_ram_run_span(CPUState* cpu, uint32_t start_pc, uint32_t stop_pc,
+                        uint64_t max_insns);
+/* Why the last span that failed stopped: 1 returned (pc 0), 2 left the range,
+ * 3 call-bail unwind, 4 instruction budget, 5 the interpreter declined the PC,
+ * 6 bad arguments or a span already open, 7 a call did not return to the
+ * span (`after`). `pc` is where control was. */
+typedef struct DirtyRamSpanFailure {
+    uint32_t reason, pc, start_pc, stop_pc;
+    uint32_t ra, after;   /* $ra at the exit; pc after a call that did not return */
+    uint64_t insns;
+} DirtyRamSpanFailure;
+void dirty_ram_span_last_failure(DirtyRamSpanFailure *out);
+/* The open span (0,0 = none), for landings that longjmp past its exit. */
+void dirty_ram_span_get(uint32_t *lo, uint32_t *hi);
+void dirty_ram_span_set(uint32_t lo, uint32_t hi);
+
+/* Retire a deferred R3000A load-delay writeback (see dirty_ram_interp.c). The
+ * interpreter defers a load's destination-register write past the delay-slot
+ * instruction, as hardware does; call this anywhere control leaves the
+ * interpreter or an exception is delivered, so no register write is dropped. */
+void dirty_ram_ld_delay_flush(CPUState* cpu);
+
+/* Drop a deferred load-delay writeback WITHOUT applying it. Required on
+ * savestate/RB restore: the snap already has architectural GPRs, and a
+ * host-static pending load from the pre-load timeline must not stomp them
+ * on the next interp step (selfcheck MotK v0=countdown vs v0=1 forks). */
+void dirty_ram_ld_delay_discard(void);
+
+/* Save / put back the deferred load-delay writeback exactly. For a landing
+ * that longjmps out of interpreted code and then resumes the interrupted
+ * code (the render-pass watchdog abort, render_pass.c): the pass's pending
+ * load must not reach the resumed timeline, and the interrupted one's must
+ * survive. */
+typedef struct DirtyRamLoadDelay {
+    uint32_t rt, val, age;
+    int      armed;
+} DirtyRamLoadDelay;
+void dirty_ram_ld_delay_save(DirtyRamLoadDelay *out);
+void dirty_ram_ld_delay_restore(const DirtyRamLoadDelay *in);
+
+/* Re-anchor host-only dirty IRQ pump ambient (entry-poll stride + 4096-insn
+ * gap) after snap restore. Not in boot_state — peers that drifted through FMV
+ * otherwise entered the post-FMV dirty wait on opposite poll phases. */
+void dirty_ram_irq_ambient_resync_after_restore(void);
+
 /* Overlay-cache windows — the address ranges eligible for capture, offline
  * recompilation, and per-entry-validated native execution (Rule 18 code that
  * does not exist in any compile-time image):
@@ -47,7 +106,7 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
  *   Kernel RAM   [0x00000, 0x10000): the BIOS part-2 image relocated to RAM
  *     plus install-at-runtime stubs (e.g. the SIO data-byte stub at 0xCF0).
  *     Dirty-tracked per CPU store (dirty_ram_mark_kernel_write).
- *   Overlay region [OVERLAY_REGION_FLOOR, RAM_SIZE): game overlays loaded by
+ *   Overlay region [OVERLAY_REGION_FLOOR, live RAM end): game overlays loaded by
  *     CD DMA (dirty_ram_mark_executable_range).
  *
  * Main-EXE text [0x10000, OVERLAY_REGION_FLOOR): CLEAN pages are statically
@@ -82,16 +141,37 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
 extern uint32_t g_overlay_region_floor;
 #define OVERLAY_REGION_FLOOR (g_overlay_region_floor)
 
+/* The text-image BASE (phys) = this game's main-EXE load address. The floor
+ * above only bounds the text from ABOVE; on its own it encodes the assumption
+ * that the boot EXE sits at the bottom of usable RAM, so that [KERNEL_END,
+ * FLOOR) is text and [FLOOR, RAM) is overlay. That holds for a load_address of
+ * 0x80010000 (text base == KERNEL_END, so the region below text is empty) but
+ * is FALSE for a boot EXE that loads HIGH and streams its gameplay code into
+ * the RAM BELOW itself: Klonoa loads at 0x80180000 (text 0x180000-0x18B000,
+ * overlays at 0x10000-0x130000), Street Fighter Alpha 3 at 0x80113B00,
+ * Bomberman Fantasy Race at 0x8003004C. For those the sub-text RAM was
+ * misclassified as main-EXE text — clear_image_baseline() wiped its dirty bits
+ * and the dispatch admit-heuristic refused it, so a JALR into an overlay page
+ * the CD DMA'd there fell through to psx_unknown_dispatch and fail-fast
+ * exit(1) (Klonoa, frame 687, target 0x80123D00).
+ *
+ * The overlay region is therefore BOTH sides of the text image, not just above
+ * it. main.cpp pins g_text_image_lo = load_address & 0x1FFFFFFF at game load;
+ * the default equals DIRTY_RAM_KERNEL_WINDOW_END so the below-text clause is
+ * empty for BIOS-only runs and for every bottom-loading game. */
+extern uint32_t g_text_image_lo;
+
+/* 1 iff phys is runtime-loaded overlay RAM rather than main-EXE text — either
+ * side of the text image. Identical to `phys >= FLOOR` whenever the game loads
+ * at the bottom of RAM (g_text_image_lo == KERNEL_WINDOW_END). */
+static inline int phys_is_overlay_region(uint32_t phys) {
+    return phys >= g_overlay_region_floor ||
+           (phys >= DIRTY_RAM_KERNEL_WINDOW_END && phys < g_text_image_lo);
+}
+
 /* Test whether a given physical kernel-RAM address is in a page that was
  * written-to since boot.  Defined in memory.c. */
 int      dirty_ram_is_dirty(uint32_t phys);
-/* CPU-written code can diverge from the registered boot-EXE image without a
- * CD-DMA page mark. Once exact emitted code-range validation proves that a
- * text page differs, it is runtime code just like a DMA-loaded overlay. */
-int      dirty_ram_text_page_diverged(uint32_t phys);
-static inline int dirty_ram_code_is_dynamic(uint32_t phys) {
-    return dirty_ram_is_dirty(phys) || dirty_ram_text_page_diverged(phys);
-}
 
 /* Kernel-image bless (memory.c). A dispatch key in the relocated kernel
  * window (RAM [0x500,0x8500), the BIOS's boot-time copy of ROM 0x1FC10000+)
@@ -101,43 +181,51 @@ static inline int dirty_ram_code_is_dynamic(uint32_t phys) {
  * on writes into the body. Runtime-patched bodies (pad/SIO install stubs)
  * never verify and keep interpreting — faithful either way. */
 int      psx_kernel_bless_dispatchable(uint32_t phys);
+/* True when a declared kernel patch range ENDS at this RAM address. The
+ * emitter registered that PC as a continuation key, so the interpreter hands
+ * straight-line flow back to static dispatch there and only the guest's
+ * patched words interpret (memory.c psx_bios_kernel_patch_ranges). */
+int      psx_kernel_patch_range_ends_at(uint32_t phys);
 void     psx_kernel_bless_note_range(uint32_t phys, uint32_t len);
-void     psx_kernel_bless_stats(uint64_t out[6]);
+void     psx_kernel_bless_stats(uint64_t out[8]);
+void     psx_kernel_bless_resync_after_restore(void);
+/* Soft-return rematch / BIOS switch: drop latched SCPH↔OpenBIOS window +
+ * CLEAN/MISMATCH so the next kbless_on() re-reads psx_bios_image. */
+void     psx_kernel_bless_reset_for_boot(void);
 
 /* Capture/candidate window membership. Kernel window and overlay region are
  * unconditional; main-EXE text [KERNEL_WINDOW_END, FLOOR) is included only
- * when DMA marked it dirty or exact static-range validation proved it diverged
- * after CPU writes. In either case the bytes there are runtime code (see the
- * window model note above). Clean boot text never enters the window: it runs
- * compiled, and capturing it would violate the static-first design. */
+ * when the page is dirty — i.e. a gameplay overlay overwrote the boot text
+ * after the game-start baseline, so the bytes there are runtime overlay code
+ * (see the window model note above). Clean boot text never enters the window
+ * (it runs compiled; capturing it would violate the static-first design). */
 static inline int overlay_cache_window_contains(uint32_t phys) {
     return phys < DIRTY_RAM_KERNEL_WINDOW_END
         || phys >= OVERLAY_REGION_FLOOR
-        || dirty_ram_code_is_dynamic(phys);
+        || dirty_ram_is_dirty(phys);
 }
 uint32_t dirty_ram_get_bitmap(void);
 uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
 uint32_t dirty_ram_get_bitmap_word_count(void);
-uint32_t dirty_ram_text_modified_bitmap_word(uint32_t word_index);
-uint32_t dirty_ram_text_diverged_bitmap_word(uint32_t word_index);
-/* Classify a dispatch PC that lies inside the registered boot-EXE text but
- * has no generated native entry. The classification is deliberately
- * non-destructive: unlike native-range validation it never marks a page
- * diverged. Only PRISTINE is proof of a static discovery/codegen gap;
- * MODIFIED is ambiguous, RUNTIME belongs to the overlay pipeline, and UNKNOWN
- * means there was not enough reference-image evidence. */
-typedef enum {
-    DIRTY_RAM_TEXT_DISPATCH_UNKNOWN  = 0,
-    DIRTY_RAM_TEXT_DISPATCH_PRISTINE = 1,
-    DIRTY_RAM_TEXT_DISPATCH_MODIFIED = 2,
-    DIRTY_RAM_TEXT_DISPATCH_RUNTIME  = 3
-} DirtyRamTextDispatchClass;
-DirtyRamTextDispatchClass dirty_ram_text_dispatch_classify(uint32_t phys);
-
+void     dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count);
+/* Rematch / session_reboot: wipe host dirty tracking so dig0 matches a cold
+ * process (memory_init clears RAM but used to leave these bitmaps sticky). */
+void     dirty_ram_reset_for_boot(void);
+/* After bulk RAM restore (savestate): bump overlay page gens + lazy-miss epoch
+ * so native overlays re-hash against restored bytes; also drop sticky
+ * text_diverged/modified bitmaps (host-only — restored RAM may match ref). */
+void     overlay_watch_invalidate_after_ram_restore(void);
+void     dirty_ram_text_guard_resync_after_restore(void);
 void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 void     dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                        uint32_t len);
 int      dirty_ram_text_native_ok(uint32_t phys);
+/* Exact CFG ranges; exec_pc clips ranges that end before the resume PC. */
+int      dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
+                                             uint32_t count,
+                                             uint32_t exec_pc);
+int      dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
+                                        uint32_t count);
 int      dirty_ram_text_image_registered(void);
 /* Bless an intentional runtime data patch (e.g. text_xlate string/glyph tables)
  * into the text reference image so it is not mistaken for self-modifying code. */
@@ -183,28 +271,96 @@ typedef struct {
                           * below the local-flow floor every taken branch
                           * re-dispatches, so chain blocks dominate. entry_hits
                           * is the evidence stream for interior-alias seeds. */
+    /* Enrichment (2026-09-05, BoF3): make a bare interpreted PC explainable
+     * from a session-long per_pc snapshot alone, with no offline join and no
+     * live-ring window. Stamped only on EXTERNAL entries (arrived from native
+     * dispatch, addr != chain target), which is where the value is. */
+    uint32_t occ_crc;    /* tier 1: psx_overlay_resident_crc_at(pc) at the last
+                          * external entry -- the manifest CRC of the static
+                          * variant whose code ranges span this PC (DLL path:
+                          * last hash taken). Disambiguates a mixed band
+                          * (0x801D0C00 carries BATTLE/ETC/SCENARIO/WORLD
+                          * occupants) to the one actually loaded, which the
+                          * offline enrich_pcs join cannot. 0 = nothing compiled
+                          * spans this PC (BIOS / kernel / boot EXE). */
+    uint8_t  occ_ok;     /* 1 = that variant validated at the time (interior
+                          * gap inside live native code: an Axis B seed);
+                          * 0 = it is resident but CRC-missing (data inside the
+                          * code range rewritten, or a different section than
+                          * the one compiled) -- the whole band runs
+                          * interpreted and no seed will fix it. */
+    uint32_t last_ext_ra;/* tier 2: gpr[31] (caller RA) at the most recent
+                          * external entry — names the call site that reaches a
+                          * function-pointer-table interior. This is the §9 (LOGO
+                          * effect-handler tables) diagnosis made durable and
+                          * session-long instead of ring-bounded; the full
+                          * call/jalr/jr transfer split stays in the fp-log ring. */
 } DirtyRamPcEntry;
 extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
-/* Companion table: every PC the interpreter actually executes (not just block
- * entries). overlay_capture uses both to report execution-verified seeds. */
-extern DirtyRamPcEntry g_dirty_ram_exec_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
+/* Every aligned main-RAM word is a possible instruction PC.  Execution
+ * coverage only needs presence, not a hit count, so record it in a direct
+ * bitmap instead of probing a large hash table for every retired instruction.
+ * This covers every word of the host RAM backing (the old 262K-entry hash
+ * could saturate) -- retail 2 MiB and the opt-in 8 MiB map alike -- and is
+ * also the execution-verified seed source used by overlay_capture. */
+#define DIRTY_RAM_EXEC_WORD_COUNT   (PSX_MAIN_RAM_BACKING_BYTES / 4u)
+#define DIRTY_RAM_EXEC_BITMAP_WORDS ((DIRTY_RAM_EXEC_WORD_COUNT + 31u) / 32u)
+extern uint32_t g_dirty_ram_exec_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
+/* One bit per 4 KiB page. RAM writes use this as a one-test stale-evidence
+ * guard; they clear that page's capture bits rather than serializing from the
+ * universal store hot path. */
+#define DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS \
+    (((PSX_MAIN_RAM_BACKING_BYTES / 4096u) + 31u) / 32u)
+extern uint32_t g_dirty_ram_exec_page_bitmap[DIRTY_RAM_EXEC_PAGE_BITMAP_WORDS];
+/* Presence-only companion for interpreted block/dispatch entries. The richer
+ * counter table remains for telemetry, while capture can snapshot/reset this
+ * compact evidence independently at overlay-generation boundaries. */
+extern uint32_t g_dirty_ram_dispatch_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS];
 
-/* Game-text dispatch PCs that lack a generated entry, classified by evidence.
- * Keep this separate from the two large DirtyRamPcEntry tables: adding fields
- * there would bloat both the live working set and every asynchronous overlay-
- * capture snapshot even though executed-PC records never need this evidence.
- * `misses` contains only proven pristine static-text gaps. The other counters
- * prevent a zero-result query from hiding modified or runtime-written code. */
-#define STATIC_TEXT_MISS_TABLE_SIZE 32768
-typedef struct {
-    uint32_t pc;          /* physical entry PC, 0 = empty slot */
-    uint64_t misses;      /* pristine original-text observations */
-    uint64_t modified;    /* page changed, entry word still matches reference */
-    uint64_t runtime;     /* DMA/runtime page or changed entry instruction */
-    uint64_t unknown;     /* reference/alignment evidence unavailable */
-} StaticTextMissEntry;
-extern StaticTextMissEntry g_static_text_miss_table[STATIC_TEXT_MISS_TABLE_SIZE];
-extern uint64_t g_static_text_miss_dropped;
+/* The segment each interpreted dispatch entered through
+ * (docs/SEGMENT_AWARE_CODE.md §5.7). The bytes are segment-free, but a PC is
+ * not: a KUSEG, KSEG0 or KSEG1 entry of the same word links, traps and fetches
+ * in its own segment, so each needs its own compiled shard. The bitmap above
+ * keeps its meaning (dispatched in any segment); these siblings record which
+ * segments, one bit per word per segment, set at the same interpreted
+ * dispatch. The execution bitmap needs no segment: direct edges keep the
+ * entry's segment. Only the three segments that map physical memory have a
+ * sibling; a PC elsewhere (0x20000000-0x7FFFFFFF, KSEG2) addresses no RAM in
+ * Beetle and is never recorded. */
+#define PSX_CODE_SEGMENT_COUNT 3
+static inline int psx_code_segment_index(uint32_t pc) {
+    switch (pc & 0xE0000000u) {
+    case 0x00000000u: return 0;   /* KUSEG */
+    case 0x80000000u: return 1;   /* KSEG0 */
+    case 0xA0000000u: return 2;   /* KSEG1 */
+    default:          return -1;
+    }
+}
+static inline uint32_t psx_code_segment_base(int index) {
+    return index == 0 ? 0x00000000u : index == 1 ? 0x80000000u : 0xA0000000u;
+}
+/* The names the capture JSON and the per-segment cache directories use. */
+static inline const char *psx_code_segment_name(int index) {
+    return index == 0 ? "kuseg" : index == 1 ? "kseg0" : "kseg1";
+}
+extern uint32_t g_dirty_ram_dispatch_seg_bitmap[PSX_CODE_SEGMENT_COUNT]
+                                               [DIRTY_RAM_EXEC_BITMAP_WORDS];
+
+/* Clear dispatch evidence (the any-segment bitmap and its segment siblings)
+ * for `nwords` bitmap words from `first_word`. Every site that drops dispatch
+ * evidence goes through this, so a stale segment bit can never outlive its
+ * any-segment bit. */
+static inline void dirty_ram_dispatch_evidence_clear(uint32_t first_word,
+                                                     uint32_t nwords) {
+    if (first_word >= DIRTY_RAM_EXEC_BITMAP_WORDS) return;
+    if (nwords > DIRTY_RAM_EXEC_BITMAP_WORDS - first_word)
+        nwords = DIRTY_RAM_EXEC_BITMAP_WORDS - first_word;
+    memset(&g_dirty_ram_dispatch_pc_bitmap[first_word], 0,
+           (size_t)nwords * sizeof(uint32_t));
+    for (int s = 0; s < PSX_CODE_SEGMENT_COUNT; s++)
+        memset(&g_dirty_ram_dispatch_seg_bitmap[s][first_word], 0,
+               (size_t)nwords * sizeof(uint32_t));
+}
 
 /* Block-entry ring buffer. Records every dispatch into dirty RAM with the
  * caller's RA at entry, plus argument context — answers
@@ -220,10 +376,12 @@ extern uint64_t g_static_text_miss_dropped;
  * `ra` is cpu->gpr[31] at dispatch time. For normal JAL-style calls,
  * (ra - 8) gives the caller's PC. For J/JR/tail-calls it's only a
  * heuristic — treat ra as "ra_callsite_guess", not authoritative. */
-#if defined(PSX_UWP)
-#define DIRTY_RAM_BLOCK_LOG_CAP (1u << 18) /* ~0.45 s at the measured boot peak. */
+#ifdef PSX_NO_DEBUG_TOOLS
+/* Keep ABI-visible one-element sentinels so crash/debug stubs still link, while
+ * Release does not reserve the diagnostic rings' ~227 MiB of address space. */
+#define DIRTY_RAM_BLOCK_LOG_CAP 1u
 #else
-#define DIRTY_RAM_BLOCK_LOG_CAP (1u << 22) /* 4M entries (~128 MB).
+#define DIRTY_RAM_BLOCK_LOG_CAP (1u << 22) /* 4M entries (~224 MiB at 56 B each).
  * At ~580K dispatches/s during boot, this retains ~7s of history; at
  * ~10K/s during modal idle, ~400s. Sized for retroactive press-window
  * analysis without the prior 16K ring's 28-ms eviction problem. */
@@ -245,8 +403,8 @@ typedef struct {
 extern DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP];
 extern uint64_t              g_dirty_ram_block_log_seq;
 
-#if defined(PSX_UWP)
-#define DIRTY_RAM_FLOW_LOG_CAP (1u << 13)
+#ifdef PSX_NO_DEBUG_TOOLS
+#define DIRTY_RAM_FLOW_LOG_CAP 1u
 #else
 #define DIRTY_RAM_FLOW_LOG_CAP (1u << 16)
 #endif
@@ -265,8 +423,8 @@ typedef struct {
 extern DirtyRamFlowLogEntry g_dirty_ram_flow_log[DIRTY_RAM_FLOW_LOG_CAP];
 extern uint64_t             g_dirty_ram_flow_log_seq;
 
-#if defined(PSX_UWP)
-#define DIRTY_RAM_INSN_LOG_CAP (1u << 13)
+#ifdef PSX_NO_DEBUG_TOOLS
+#define DIRTY_RAM_INSN_LOG_CAP 1u
 #else
 #define DIRTY_RAM_INSN_LOG_CAP (1u << 16)
 #endif
@@ -289,6 +447,14 @@ typedef struct {
     uint32_t t0;
     uint32_t t1;
     uint32_t t2;
+    /* Kernel scratch registers. $at is the assembler-temp that hand-written
+     * kernel asm uses to stash a base across a load-delay slot, and $k0/$k1
+     * are the exception handlers' only free registers — i.e. exactly the state
+     * that matters when debugging BIOS exception/handler code, which is what
+     * this interpreter mostly runs. */
+    uint32_t at;
+    uint32_t k0;
+    uint32_t k1;
     uint32_t current_tcb;
     uint32_t task_ptr;
     uint32_t task_mode;

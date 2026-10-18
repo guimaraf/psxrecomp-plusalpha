@@ -1,7 +1,11 @@
 #include <cstdio>
+#include <exception>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <algorithm>
@@ -13,10 +17,13 @@
 #include "function_analysis.h"
 #include "control_flow.h"
 #include "code_generator.h"
+#include "game_dispatch_emitter.h"
+#include "segment_variants.h"
 #include "annotations.hpp"
 #include "config_loader.h"
 #include "rabbitizer.hpp"
 #include "fmt/format.h"
+#include "write_if_changed.h"
 
 /* Baked emitter-source hash (recompiler/CMakeLists.txt custom command; same
  * hash_codegen.cmake + canonical source list as the runtime's overlay cache
@@ -48,6 +55,15 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
         by_host[ae.host_start].push_back(&ae);
     }
     for (const auto& [host_start, group] : by_host) {
+        uint32_t producer_lo = 0;
+        uint32_t producer_hi = 0;
+        for (const auto& function : result.functions) {
+            if (function.start_addr == host_start) {
+                producer_lo = function.producer_lo;
+                producer_hi = function.producer_hi;
+                break;
+            }
+        }
         std::vector<uint32_t> entries;
         for (const AliasEntry* ae : group) entries.push_back(ae->addr);
         for (const AliasEntry* ae : group) {
@@ -62,6 +78,8 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
             af.is_data_section = false;
             af.alias_walk_lo = ae->host_start;
             af.alias_group_entries = entries;
+            af.producer_lo = producer_lo;
+            af.producer_hi = producer_hi;
             result.functions.push_back(af);
         }
     }
@@ -69,7 +87,49 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
 
 } // namespace
 
+static int psxrecomp_game_main(int argc, char** argv);
+
+// Configuration and generation errors are reported by throwing: a malformed
+// game.toml (a bad hex address, an out-of-range value, a wrong TOML type),
+// or an input the emitter must refuse (an overlay whose mandatory delay slot
+// lies outside the image). Left uncaught, the exception terminates through
+// abort(): the process dies by SIGABRT and macOS files a crash report instead
+// of the caller seeing a diagnostic. Every caller already treats any non-zero
+// status as failure, so print the message and exit with status 1.
 int main(int argc, char** argv) {
+    try {
+        return psxrecomp_game_main(argc, argv);
+    } catch (const std::exception& e) {
+        std::fflush(stdout);
+        fmt::print(stderr, "ERROR: {}\n", e.what());
+        return 1;
+    }
+}
+
+static int psxrecomp_game_main(int argc, char** argv) {
+    const auto print_usage = [&]() {
+        fmt::print("Usage: {} --config <game.toml>\n", argv[0]);
+        fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
+        fmt::print("Example: {} SCUS_942.36 --seeds seeds/functions.txt --out-dir generated --strict\n", argv[0]);
+        fmt::print("\n");
+        fmt::print("  --project-root <dir>  Resolve the BIOS profile (bios/SCPH1001.toml, or\n");
+        fmt::print("                        <framework>/bios/SCPH1001.toml one level down) against\n");
+        fmt::print("                        <dir> instead of the CWD. Required whenever the caller\n");
+        fmt::print("                        cannot choose its own CWD — e.g. compile_overlays.py,\n");
+        fmt::print("                        which runs us with cwd = dirname(game.toml).\n");
+    };
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 0;
+        }
+    }
+    if (argc < 2) {
+        print_usage();
+        return 0;
+    }
+
     /* --codegen-hash: print the baked emitter-source hash and exit. Handled
      * before the banner so the output is machine-parseable (one hex line).
      * compile_overlays.py compares this to the hash from --runtime-include and
@@ -78,6 +138,17 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "--codegen-hash") {
             fmt::print("{:08x}\n", (unsigned)PSX_OVERLAY_CODEGEN_HASH);
             return 0;
+        }
+        if (std::string(argv[i]) == "--overlay-config-hash" && i + 1 < argc) {
+            try {
+                const auto cfg = PSXRecompV4::load_game_config(argv[i + 1]);
+                fmt::print("{:08x}\n",
+                           (unsigned)PSXRecompV4::overlay_codegen_config_hash(cfg));
+                return 0;
+            } catch (const std::exception& e) {
+                fmt::print(stderr, "overlay config hash failed: {}\n", e.what());
+                return 2;
+            }
         }
     }
 
@@ -94,6 +165,15 @@ int main(int argc, char** argv) {
     // backdrop) whose addresses live in overlay code — the overlay path is
     // positional (no --config), so this is the channel for those sites.
     std::filesystem::path ws_config_path;
+    // --project-root <dir>: the directory to resolve the BIOS profile against
+    // when no explicit [recompiler] bios_config is in play. Without it the
+    // probe below uses the process CWD, which is wrong for every caller that
+    // cannot choose its own CWD — notably compile_overlays.py, which spawns us
+    // with cwd = dirname(game.toml). For a PACKAGED config (packaging/release/
+    // game.toml) that directory holds neither bios/SCPH1001.toml nor a vendored
+    // framework, so every shard died with "no BIOS profile found" and the whole
+    // overlay cache silently failed to build (issue #72).
+    std::filesystem::path project_root;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--config" && i + 1 < argc) {
@@ -113,6 +193,23 @@ int main(int argc, char** argv) {
             break;
         }
     }
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--project-root" && i + 1 < argc) { project_root = argv[i + 1]; break; }
+        if (a.rfind("--project-root=", 0) == 0) {
+            project_root = a.substr(std::string("--project-root=").size());
+            break;
+        }
+    }
+    if (!project_root.empty()) {
+        std::error_code prec;
+        if (!std::filesystem::is_directory(project_root, prec)) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: --project-root '{}' is not a directory\n",
+                project_root.string());
+            return 1;
+        }
+    }
 
     std::filesystem::path exe_path;
     std::string           extra_funcs_storage;  // lifetime anchor for the .c_str() below
@@ -121,16 +218,49 @@ int main(int argc, char** argv) {
     bool                  overlay_mode = false;
     bool                  reachable_discovery = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
+    std::set<uint32_t>    ds_funcs;             // [data_shards] funcs
+    std::set<uint32_t>    mod_instruction_sites;
+    std::set<uint32_t>    mod_entry_funcs;      // trusted game-mod entry hooks
+    std::vector<PSXRecompV4::WidescreenMaskedRejectSite> ws_cull_masked_reject;
+    std::set<uint32_t>    hot_funcs;            // [recompiler] hot_funcs
+    std::set<uint32_t>    load_charge_batch_funcs; // [recompiler] load_charge_batch*
+    std::map<uint32_t, std::array<uint32_t, 4>> vsync_query_hle_funcs;
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
+    std::set<uint32_t>    ws_cull_bias_lower;
     std::set<uint32_t>    ws_cull_screen_x;    // [widescreen.cull] screen_x_sites
     std::set<uint32_t>    ws_cull_slti;         // [widescreen.cull] slti_sites
+    std::set<uint32_t>    ws_cull_slti_lower;   // [widescreen.cull] slti_lower_sites
+    std::set<uint32_t>    ws_cull_bltz;         // [widescreen.cull] bltz_sites
+    std::set<uint32_t>    ws_cull_negsub;       // [widescreen.cull] negsub_sites
+    std::set<uint32_t>    ws_cull_vxrange;      // [widescreen.cull] vxrange_sites
+    std::set<uint32_t>    ws_cull_depth;        // [widescreen.cull] depth_sites
+    std::set<uint32_t>    netplay_local_viewport_width_sites;
+    std::set<uint32_t>    ws_cull_plane_nx;     // [widescreen.cull] plane_nx_sites
+    std::set<uint32_t>    ws_cull_xclip_load;   // [widescreen.cull] xclip_load_sites
+    std::set<uint32_t>    ws_cull_nclip_keep;   // [widescreen.cull] nclip_keep_sites
+    std::set<uint32_t>    ws_cull_nclip_exact;  // [widescreen.cull] nclip_exact_sites
+    std::set<uint32_t>    ws_cull_branch_keep;  // [widescreen.cull] branch_keep_sites
+    std::set<uint32_t>    ws_cull_bgez;         // [widescreen.cull] bgez_sites
+    std::set<uint32_t>    ws_cull_clip_edge_x_load; // [widescreen.cull] clip_edge_x_load_sites
+    uint32_t              ws_cull_clip_edge_width = 0; // [widescreen.cull] clip_edge_width
+    std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep;
+    std::vector<PSXRecompV4::WidescreenCullScaleSite> ws_cull_scale;
+    std::vector<PSXRecompV4::WidescreenAngleSite> ws_cull_angle;
+    std::vector<PSXRecompV4::DrawDistanceClampSite> draw_distance_clamps; // [[draw_distance.clamp]]
+    PSXRecompV4::WidescreenAspectConeConfig ws_aspect_cone;
+    int                   ws_cull_activation_guard_pixels = 0;
     std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 }; // [widescreen.cull] screen_w_imms
     std::vector<uint32_t> ws_cull_h_imms = { 0xE0, 0xF1 };   // [widescreen.cull] screen_h_imms
     std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
     std::set<uint32_t>    ws_backdrop_unsquash; // [widescreen.backdrop] unsquash_funcs
     bool                  ws_auto_screen_x_cull = false; // [widescreen.cull] auto_screen_x
     std::set<uint32_t>    persist_init_sites;   // [persist_options] init-store hooks (game_options.toml)
+    // [load_accel.vsync_query] event_horizon[_extra]_sites: return PCs the
+    // runtime compares exactly with $ra (load_accel.c). Not emitted; read here
+    // only for the segment check below.
+    std::vector<uint32_t> vsync_horizon_sites, vsync_horizon_extra_sites;
     std::vector<PSXRecompV4::RecompilerPatch> instruction_patches;
+    std::vector<PSXRecompV4::WidescreenSignedBoundSite> ws_signed_x_bound_sites;
     bool                  ws_auto_backdrop_preload = false; // [widescreen.cull] auto_backdrop
     uint32_t              ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0,
                           ws_bg2d_startx_site = 0,
@@ -141,6 +271,7 @@ int main(int argc, char** argv) {
                           ws_bg2d_init_func = 0; // [widescreen.bg2d]
     std::filesystem::path out_dir = "generated";
     uint32_t              configured_text_size = 0;
+    std::filesystem::path bios_profile_path;   // [recompiler] bios_config
 
     if (!config_path.empty()) {
         const auto cfg = PSXRecompV4::load_game_config(config_path);
@@ -149,15 +280,55 @@ int main(int argc, char** argv) {
         reachable_discovery  = cfg.discovery == "reachable";
         extra_funcs_storage  = cfg.seeds_path.string();
         extra_funcs_path     = extra_funcs_storage.c_str();
+        bios_profile_path    = cfg.bios_config_path;
         out_dir              = cfg.out_dir;
         instruction_patches  = cfg.recompiler_patches;
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
+        ds_funcs.insert(cfg.data_shard_funcs.begin(), cfg.data_shard_funcs.end());
+        mod_entry_funcs.insert(cfg.mod_function_entry_funcs.begin(),
+                               cfg.mod_function_entry_funcs.end());
+        mod_instruction_sites.insert(cfg.mod_instruction_sites.begin(), cfg.mod_instruction_sites.end());
+        hot_funcs.insert(cfg.hot_funcs.begin(), cfg.hot_funcs.end());
+        if (cfg.load_charge_batch) {
+            load_charge_batch_funcs.insert(cfg.load_charge_batch_funcs.begin(),
+                                           cfg.load_charge_batch_funcs.end());
+        }
+        if (cfg.vsync_query_func)
+            vsync_query_hle_funcs[cfg.vsync_query_func] = {
+                cfg.vsync_counter_addr, cfg.vsync_gpustat_ptr_addr,
+                cfg.vsync_timer1_ptr_addr, cfg.vsync_timer1_cache_addr };
         ws_cull_bias.insert(cfg.ws_cull_bias_sites.begin(), cfg.ws_cull_bias_sites.end());
+        ws_cull_bias_lower.insert(cfg.ws_cull_bias_lower_sites.begin(), cfg.ws_cull_bias_lower_sites.end());
         ws_cull_range.insert(cfg.ws_cull_range_sites.begin(), cfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
         ws_cull_screen_x.insert(cfg.ws_cull_screen_x_sites.begin(), cfg.ws_cull_screen_x_sites.end());
         ws_cull_slti.insert(cfg.ws_cull_slti_sites.begin(), cfg.ws_cull_slti_sites.end());
+        ws_cull_slti_lower.insert(cfg.ws_cull_slti_lower_sites.begin(),
+                                  cfg.ws_cull_slti_lower_sites.end());
+        ws_cull_bltz.insert(cfg.ws_cull_bltz_sites.begin(), cfg.ws_cull_bltz_sites.end());
+        ws_cull_negsub.insert(cfg.ws_cull_negsub_sites.begin(), cfg.ws_cull_negsub_sites.end());
+        ws_cull_vxrange.insert(cfg.ws_cull_vxrange_sites.begin(), cfg.ws_cull_vxrange_sites.end());
+        ws_cull_depth.insert(cfg.ws_cull_depth_sites.begin(), cfg.ws_cull_depth_sites.end());
+        ws_cull_plane_nx.insert(cfg.ws_cull_plane_nx_sites.begin(), cfg.ws_cull_plane_nx_sites.end());
+        netplay_local_viewport_width_sites.insert(cfg.netplay_local_viewport_width_sites.begin(), cfg.netplay_local_viewport_width_sites.end());
+        ws_cull_xclip_load.insert(cfg.ws_cull_xclip_load_sites.begin(), cfg.ws_cull_xclip_load_sites.end());
+        ws_cull_nclip_keep.insert(cfg.ws_cull_nclip_keep_sites.begin(), cfg.ws_cull_nclip_keep_sites.end());
+        ws_cull_nclip_exact.insert(cfg.ws_cull_nclip_exact_sites.begin(), cfg.ws_cull_nclip_exact_sites.end());
+        ws_cull_branch_keep.insert(cfg.ws_cull_branch_keep_sites.begin(), cfg.ws_cull_branch_keep_sites.end());
+        ws_cull_bgez.insert(cfg.ws_cull_bgez_sites.begin(), cfg.ws_cull_bgez_sites.end());
+        ws_cull_clip_edge_x_load.insert(cfg.ws_cull_clip_edge_x_load_sites.begin(),
+                                        cfg.ws_cull_clip_edge_x_load_sites.end());
+        if (!cfg.ws_cull_clip_edge_x_load_sites.empty())
+            ws_cull_clip_edge_width = PSXRecompV4::ws_cull_clip_edge_width(cfg);
+        ws_cull_keep = cfg.ws_cull_keep_sites;
+        ws_cull_masked_reject = cfg.ws_cull_masked_reject_sites;
+        ws_cull_scale = cfg.ws_cull_scale_sites;
+        ws_cull_angle = cfg.ws_cull_angle_sites;
+        draw_distance_clamps = cfg.draw_distance_clamp_sites;
+        ws_aspect_cone = cfg.ws_aspect_cone;
+        ws_cull_activation_guard_pixels =
+            cfg.ws_cull_activation_guard_pixels;
         ws_cull_w_imms = cfg.ws_cull_w_imms;
         ws_cull_h_imms = cfg.ws_cull_h_imms;
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
@@ -172,6 +343,9 @@ int main(int argc, char** argv) {
         if (cfg.ws_bg2d_bufbase_site) ws_bg2d_bufbase_site = cfg.ws_bg2d_bufbase_site;
         if (cfg.ws_bg2d_cap_site)     ws_bg2d_cap_site     = cfg.ws_bg2d_cap_site;
         if (cfg.ws_bg2d_init_func)    ws_bg2d_init_func    = cfg.ws_bg2d_init_func;
+        ws_signed_x_bound_sites = cfg.ws_signed_x_bound_sites;
+        vsync_horizon_sites = cfg.vsync_event_horizon_sites;
+        vsync_horizon_extra_sites = cfg.vsync_event_horizon_extra_sites;
         // [persist_options] init-store hook sites live in a dedicated
         // game_options.toml next to game.toml (the game's own native OPTION
         // settings, kept separate from game.toml/settings.toml). Best-effort:
@@ -193,13 +367,6 @@ int main(int argc, char** argv) {
             fmt::print("  ws_tag_funcs= {}\n", ws_tag_funcs.size());
         fmt::print("\n");
     } else {
-        if (argc < 2) {
-            fmt::print("Usage: {} --config <game.toml>                  # going-forward\n", argv[0]);
-            fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
-            fmt::print("Example: {} SCUS_942.36 --seeds seeds/ghidra_funcs.txt --out-dir generated --strict\n\n", argv[0]);
-            return 0;
-        }
-
         exe_path = argv[1];
         for (int i = 2; i < argc; i++) {
             std::string arg = argv[i];
@@ -212,6 +379,11 @@ int main(int argc, char** argv) {
                  * with psxrecomp-bios and project scripts. */
             } else if (arg == "--inspect") {
                 inspect_mode = true;
+            } else if (arg == "--project-root" && i + 1 < argc) {
+                /* Already parsed in the pre-scan above (the BIOS-profile probe
+                 * needs it before this loop runs). Consume the value here so it
+                 * is never mistaken for another flag's argument. */
+                ++i;
             } else if (arg == "--overlay") {
                 /* Overlay-compilation contract: this input is a runtime-captured
                  * overlay with execution evidence, so discovery is evidence-scoped
@@ -232,11 +404,40 @@ int main(int argc, char** argv) {
     if (!ws_config_path.empty()) {
         const auto wscfg = PSXRecompV4::load_game_config(ws_config_path);
         ws_tag_funcs.insert(wscfg.ws_sprite_tag_funcs.begin(), wscfg.ws_sprite_tag_funcs.end());
+        mod_entry_funcs.insert(wscfg.mod_function_entry_funcs.begin(),
+                               wscfg.mod_function_entry_funcs.end());
+        mod_instruction_sites.insert(wscfg.mod_instruction_sites.begin(), wscfg.mod_instruction_sites.end());
         ws_cull_bias.insert(wscfg.ws_cull_bias_sites.begin(), wscfg.ws_cull_bias_sites.end());
+        ws_cull_bias_lower.insert(wscfg.ws_cull_bias_lower_sites.begin(), wscfg.ws_cull_bias_lower_sites.end());
         ws_cull_range.insert(wscfg.ws_cull_range_sites.begin(), wscfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(wscfg.ws_cull_a1_sites.begin(), wscfg.ws_cull_a1_sites.end());
         ws_cull_screen_x.insert(wscfg.ws_cull_screen_x_sites.begin(), wscfg.ws_cull_screen_x_sites.end());
         ws_cull_slti.insert(wscfg.ws_cull_slti_sites.begin(), wscfg.ws_cull_slti_sites.end());
+        ws_cull_slti_lower.insert(wscfg.ws_cull_slti_lower_sites.begin(),
+                                  wscfg.ws_cull_slti_lower_sites.end());
+        ws_cull_bltz.insert(wscfg.ws_cull_bltz_sites.begin(), wscfg.ws_cull_bltz_sites.end());
+        ws_cull_negsub.insert(wscfg.ws_cull_negsub_sites.begin(), wscfg.ws_cull_negsub_sites.end());
+        ws_cull_vxrange.insert(wscfg.ws_cull_vxrange_sites.begin(), wscfg.ws_cull_vxrange_sites.end());
+        ws_cull_depth.insert(wscfg.ws_cull_depth_sites.begin(), wscfg.ws_cull_depth_sites.end());
+        ws_cull_plane_nx.insert(wscfg.ws_cull_plane_nx_sites.begin(), wscfg.ws_cull_plane_nx_sites.end());
+        netplay_local_viewport_width_sites.insert(wscfg.netplay_local_viewport_width_sites.begin(), wscfg.netplay_local_viewport_width_sites.end());
+        ws_cull_xclip_load.insert(wscfg.ws_cull_xclip_load_sites.begin(), wscfg.ws_cull_xclip_load_sites.end());
+        ws_cull_nclip_keep.insert(wscfg.ws_cull_nclip_keep_sites.begin(), wscfg.ws_cull_nclip_keep_sites.end());
+        ws_cull_nclip_exact.insert(wscfg.ws_cull_nclip_exact_sites.begin(), wscfg.ws_cull_nclip_exact_sites.end());
+        ws_cull_branch_keep.insert(wscfg.ws_cull_branch_keep_sites.begin(), wscfg.ws_cull_branch_keep_sites.end());
+        ws_cull_bgez.insert(wscfg.ws_cull_bgez_sites.begin(), wscfg.ws_cull_bgez_sites.end());
+        ws_cull_clip_edge_x_load.insert(wscfg.ws_cull_clip_edge_x_load_sites.begin(),
+                                        wscfg.ws_cull_clip_edge_x_load_sites.end());
+        if (!wscfg.ws_cull_clip_edge_x_load_sites.empty() && !ws_cull_clip_edge_width)
+            ws_cull_clip_edge_width = PSXRecompV4::ws_cull_clip_edge_width(wscfg);
+        if (ws_cull_keep.empty()) ws_cull_keep = wscfg.ws_cull_keep_sites;
+        if (ws_cull_masked_reject.empty()) ws_cull_masked_reject = wscfg.ws_cull_masked_reject_sites;
+        if (ws_cull_scale.empty()) ws_cull_scale = wscfg.ws_cull_scale_sites;
+        if (ws_cull_angle.empty()) ws_cull_angle = wscfg.ws_cull_angle_sites;
+        if (ws_aspect_cone.sites.empty())
+            ws_aspect_cone = wscfg.ws_aspect_cone;
+        ws_cull_activation_guard_pixels =
+            wscfg.ws_cull_activation_guard_pixels;
         ws_cull_w_imms = wscfg.ws_cull_w_imms;
         ws_cull_h_imms = wscfg.ws_cull_h_imms;
         ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
@@ -245,9 +446,89 @@ int main(int argc, char** argv) {
         ws_auto_backdrop_preload = ws_auto_backdrop_preload || wscfg.ws_auto_backdrop_preload;
         PSXRecompV4::merge_recompiler_patches(
             instruction_patches, wscfg.recompiler_patches);
+        ws_signed_x_bound_sites.insert(ws_signed_x_bound_sites.end(),
+                                       wscfg.ws_signed_x_bound_sites.begin(),
+                                       wscfg.ws_signed_x_bound_sites.end());
         if (wscfg.ws_bg2d_init_func) ws_bg2d_init_func = wscfg.ws_bg2d_init_func;
         fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
                    ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
+    }
+
+    /* Resolve the BIOS profile this game builds against and activate its
+     * address model for codegen (jump tables inside relocated BIOS code
+     * windows fold through it — see code_generator.cpp ram_to_rom). Order:
+     * explicit [recompiler] bios_config; else the SCPH1001 profile in-repo
+     * (framework checkout) or under the psxrecomp/ submodule (game repo).
+     * No profile -> fatal: there are no built-in windows. */
+    static PSXRecompV4::BiosAddressModel s_bios_model;
+    {
+        /* The directory the profile probe walks. --project-root when given,
+         * else the CWD (unchanged legacy behaviour). Named in every failure
+         * below, because "no BIOS profile found" without the directory it
+         * searched sends you looking for an unset key that is in fact set —
+         * or, worse, reads as a config error when it is a CWD error. */
+        const std::filesystem::path search_root =
+            project_root.empty() ? std::filesystem::path(".") : project_root;
+
+        std::filesystem::path prof = bios_profile_path;
+        /* An explicit bios_config that does not resolve is a different failure
+         * from having none at all — say which, or the message sends you looking
+         * for an unset key that is in fact set. A relative bios_config is
+         * documented as relative to the game project root, so resolve it there
+         * first when we were told what the root is; fall back to the bare path
+         * so callers that already relied on CWD keep working. */
+        if (!prof.empty() && !std::filesystem::exists(prof)) {
+            std::filesystem::path rooted;
+            if (!project_root.empty() && prof.is_relative()) {
+                rooted = project_root / prof;
+            }
+            if (!rooted.empty() && std::filesystem::exists(rooted)) {
+                prof = rooted;
+            } else {
+                fmt::print(stderr,
+                    "psxrecomp-game: FATAL: [recompiler] bios_config = '{}' does "
+                    "not exist (path is relative to the game project root; "
+                    "searched '{}')\n",
+                    prof.string(),
+                    std::filesystem::absolute(search_root).string());
+                return 1;
+            }
+        }
+        if (prof.empty()) {
+            if (std::filesystem::exists(search_root / "bios/SCPH1001.toml")) {
+                prof = search_root / "bios/SCPH1001.toml"; /* framework checkout */
+            } else {
+                /* Game repo vendoring the framework. Do NOT assume the
+                 * directory is named "psxrecomp": ApeEscapeRecomp vendors it as
+                 * "psxrecomp-v4", and hardcoding the name made regeneration
+                 * fail outright there. Probe one level for any vendored
+                 * framework, sorted so the pick is deterministic. */
+                std::vector<std::filesystem::path> found;
+                std::error_code ec;
+                for (const auto& de :
+                         std::filesystem::directory_iterator(search_root, ec)) {
+                    if (ec) break;
+                    if (!de.is_directory(ec) || ec) continue;
+                    auto cand = de.path() / "bios" / "SCPH1001.toml";
+                    if (std::filesystem::exists(cand)) found.push_back(cand);
+                }
+                std::sort(found.begin(), found.end());
+                if (!found.empty()) prof = found.front();
+            }
+        }
+        if (prof.empty()) {
+            fmt::print(stderr,
+                "psxrecomp-game: FATAL: no BIOS profile found. Searched '{}' "
+                "for bios/SCPH1001.toml and <framework>/bios/SCPH1001.toml. "
+                "Fix by setting [recompiler] bios_config in game.toml, passing "
+                "--project-root <dir> (the framework or game-project root), or "
+                "running from a root that contains one of those paths.\n",
+                std::filesystem::absolute(search_root).string());
+            return 1;
+        }
+        const auto bios_cfg = PSXRecompV4::load_bios_config(prof);
+        s_bios_model = PSXRecompV4::BiosAddressModel::from_config(bios_cfg);
+        PSXRecomp::CodeGenerator::set_bios_address_model(&s_bios_model);
     }
 
     // Parse the PS1-EXE file
@@ -293,6 +574,13 @@ int main(int argc, char** argv) {
     fmt::print("  Code Size:      {} bytes ({} KB)\n",
                exe->header.file_size, exe->header.file_size / 1024);
     fmt::print("  End Address:    0x{:08X}\n", exe->end_address());
+    if (exe->has_analysis_guard()) {
+        // Only printed for a producer-tagged capture, so a non-overlay image's
+        // log stays byte-identical to the untagged build.
+        fmt::print("  Analysis End:   0x{:08X}  ({} trailing delay-slot guard "
+                   "byte(s), readable but not discoverable)\n",
+                   exe->analysis_end_address(), exe->analysis_guard_bytes);
+    }
     fmt::print("  Global Pointer: 0x{:08X}\n", exe->header.initial_gp);
     fmt::print("  Stack Pointer:  0x{:08X}\n\n", exe->header.initial_sp);
 
@@ -300,6 +588,88 @@ int main(int argc, char** argv) {
     if (!exe->header.entry_in_range()) {
         fmt::print(stderr, "⚠ Warning: Entry point 0x{:08X} is outside loaded code range!\n\n",
                    exe->header.initial_pc);
+    }
+
+    // Config code sites are code identities, and code identity is the full
+    // virtual address in the image's link segment (docs/SEGMENT_AWARE_CODE.md
+    // §5.1, §5.3). The kinds checked below are matched exactly (by the
+    // emitter, or by the runtime against a PC or $ra), so a site that names
+    // this image's bytes in another segment would silently match nothing (the
+    // EXE parser no longer folds a KUSEG header to KSEG0): refuse it and name
+    // the spelling that matches. Not checked, because they are matched by
+    // physical address and a foreign spelling already reaches the same bytes:
+    // [[recompiler.patches]] (byte patches), [widescreen.cull] keep, angle and
+    // aspect_cone sites, [[widescreen.signed_x_bound]] (the emitter's
+    // full-word-guarded substitutions) and [widescreen.dome] call_sites (the
+    // runtime masks them). Overlay compiles are not checked: a capture view is
+    // wrapped at `segment | phys` in whichever segment it ran (§5.7), and the
+    // game config, passed as --ws-config, names overlay code by its bytes, so
+    // overlay_codegen_config() below moves each exact-match site that lies in
+    // the image into the view's segment.
+    if (!overlay_mode) {
+        std::vector<std::pair<const char*, uint32_t>> foreign;
+        auto check = [&](const char* what, uint32_t addr) {
+            if (addr != 0 && exe->contains_phys(addr) &&
+                (addr & PSXRecomp::kSegmentMask) != exe->link_segment())
+                foreign.emplace_back(what, addr);
+        };
+        auto check_set = [&](const char* what, const std::set<uint32_t>& set) {
+            for (uint32_t a : set) check(what, a);
+        };
+        check_set("widescreen.sprite_tag_funcs", ws_tag_funcs);
+        check_set("data_shards.funcs", ds_funcs);
+        check_set("recompiler.mod_function_entry_funcs", mod_entry_funcs);
+        check_set("recompiler.hot_funcs", hot_funcs);
+        check_set("recompiler.load_charge_batch_funcs", load_charge_batch_funcs);
+        for (const auto& [func, addrs] : vsync_query_hle_funcs) {
+            (void)addrs;
+            check("load_accel.vsync_query.func", func);
+        }
+        for (uint32_t site : vsync_horizon_sites)
+            check("load_accel.vsync_query.event_horizon_sites", site);
+        for (uint32_t site : vsync_horizon_extra_sites)
+            check("load_accel.vsync_query.event_horizon_extra_sites", site);
+        check_set("widescreen.cull.bias_sites", ws_cull_bias);
+        check_set("widescreen.cull.range_sites", ws_cull_range);
+        check_set("widescreen.cull.a1_sites", ws_cull_a1);
+        check_set("widescreen.cull.screen_x_sites", ws_cull_screen_x);
+        check_set("widescreen.cull.slti_sites", ws_cull_slti);
+        check_set("widescreen.cull.slti_lower_sites", ws_cull_slti_lower);
+        check_set("widescreen.cull.bltz_sites", ws_cull_bltz);
+        check_set("widescreen.cull.negsub_sites", ws_cull_negsub);
+        check_set("widescreen.cull.vxrange_sites", ws_cull_vxrange);
+        check_set("widescreen.cull.depth_sites", ws_cull_depth);
+        check_set("widescreen.cull.plane_nx_sites", ws_cull_plane_nx);
+        check_set("widescreen.cull.xclip_load_sites", ws_cull_xclip_load);
+        check_set("widescreen.cull.nclip_keep_sites", ws_cull_nclip_keep);
+        check_set("widescreen.cull.nclip_exact_sites", ws_cull_nclip_exact);
+        check_set("widescreen.cull.branch_keep_sites", ws_cull_branch_keep);
+        check_set("widescreen.cull.bgez_sites", ws_cull_bgez);
+        check_set("widescreen.cull.clip_edge_x_load_sites", ws_cull_clip_edge_x_load);
+        check_set("widescreen.backdrop.x_sites", ws_backdrop_x);
+        check_set("widescreen.backdrop.unsquash_funcs", ws_backdrop_unsquash);
+        check_set("persist_options.init_store_pc", persist_init_sites);
+        for (const auto& site : draw_distance_clamps)
+            check("draw_distance.clamp.address", site.address);
+        check("widescreen.bg2d.count_site", ws_bg2d_count_site);
+        check("widescreen.bg2d.startcol_site", ws_bg2d_startcol_site);
+        check("widescreen.bg2d.startx_site", ws_bg2d_startx_site);
+        check("widescreen.bg2d.stream_left_site", ws_bg2d_stream_left_site);
+        check("widescreen.bg2d.stream_right_site", ws_bg2d_stream_right_site);
+        check("widescreen.bg2d.bufbase_site", ws_bg2d_bufbase_site);
+        check("widescreen.bg2d.cap_site", ws_bg2d_cap_site);
+        check("widescreen.bg2d.init_func", ws_bg2d_init_func);
+        if (!foreign.empty()) {
+            fmt::print(stderr,
+                "ERROR: {} config code site(s) name this image's bytes in another "
+                "segment than its link segment 0x{:08X}. Code identity is the full "
+                "PC (docs/SEGMENT_AWARE_CODE.md §5.1), so write each in the link "
+                "segment:\n", foreign.size(), exe->link_segment());
+            for (const auto& [what, addr] : foreign)
+                fmt::print(stderr, "  {}: 0x{:08X} -> 0x{:08X}\n", what, addr,
+                           exe->link_segment() | (addr & PSXRecomp::kPhysMask));
+            return 1;
+        }
     }
 
     if (inspect_mode) {
@@ -402,31 +772,183 @@ int main(int argc, char** argv) {
 
     /* Load extra function addresses from a file (one hex address per line).
      * Lines of the form `interior 0xXXXXXXXX` mark dispatch-proven interior
-     * addresses: alias candidates, never walk roots. Lines of the form
+     * addresses: alias candidates, never walk roots. `hosted_interior TARGET
+     * HOST` is a narrow cross-variant identity assertion: TARGET may alias only
+     * the explicitly rooted HOST, and only when TARGET is a syntactic block
+     * leader in HOST's current-byte range. The shard publisher additionally
+     * requires both emitted identities to match a previously CRC-validated host
+     * exactly before the result can reach the runtime. Lines of the form
      * `dispatch_root 0xXXXXXXXX` mark classifier-proven dispatch roots
      * WITHOUT a callable boundary (the kernel install-slot class, e.g. RAM
      * 0xCF0): the static recompiler's install-slot hooks tail-dispatch into
      * exactly these PCs, so they are real execution roots even though no
      * prologue / preceding jr $ra exists. They are trusted walk roots and
-     * exempt from the overlay-mode boundary re-check below.
+         * exempt from the overlay-mode boundary re-check below.  Lines of the
+         * form `call_root 0xXXXXXXXX` carry the same mechanical trust for a
+         * statically proven direct or constant-register call/tail-call target.
      *
      * Seeds are accepted within the loaded image's own bounds — overlay mode
      * wraps arbitrary regions (kernel RAM at 0x80000000, overlays at
      * 0x800E7000, ...), so a hardcoded game-RAM window would silently drop
-     * valid seeds. */
+     * valid seeds.
+     *
+     * A seed is a PC, so it carries a segment (docs/SEGMENT_AWARE_CODE.md
+     * §5.3, §5.4). The bounds are checked by physical address: a seed in the
+     * image's link segment (0x000100E4 for a KUSEG-linked EXE, 0x800100E4
+     * for a KSEG0 one) is an entry of the image. A seed for the same bytes in
+     * another segment asks for a segment variant (§5.4): it is never folded
+     * into the home body; after the home compile, the home functions it
+     * reaches through direct edges are compiled again in its segment (see
+     * plan_segment_variants below). Seeds outside the image are counted. */
     std::vector<uint32_t> file_seeds;
+    std::vector<std::pair<uint32_t, std::string>> variant_seeds;  // PC, line kind
+    size_t outside_seeds = 0;
     std::vector<uint32_t> interior_seeds;
+    std::map<uint32_t, uint32_t> hosted_interior_seeds;
+    std::set<uint32_t> hosted_interior_hosts;
+    constexpr size_t kHostedInteriorTargetCap = 4096;
+    constexpr size_t kHostedInteriorHostCap = 512;
     std::set<uint32_t>    trusted_root_seeds;
+    std::set<uint32_t>    trusted_call_root_seeds;
+    std::vector<std::pair<uint32_t, uint32_t>> producer_ranges;
+    std::set<uint32_t> cross_call_allow;
     if (extra_funcs_path) {
         std::ifstream ef(extra_funcs_path);
         if (ef.is_open()) {
             const uint32_t seed_lo = exe->header.load_address;
-            const uint32_t seed_hi = exe->end_address();
+            const uint32_t seed_hi = exe->analysis_end_address();
+            // The directive lines below name code by PC too, so they follow
+            // the seed rule (§5.3): an address that names this image's bytes
+            // in another segment is refused with its link-segment spelling,
+            // instead of failing the raw bounds check with no hint. (A
+            // variant request is a plain seed line; directives have none.)
+            // `end_exclusive`: the last address is a range end, which names
+            // the image when its last byte does.
+            auto foreign_directive = [&](const std::string& text,
+                                         std::initializer_list<uint32_t> addrs,
+                                         bool end_exclusive = false) {
+                auto in_image = [&](uint32_t a, bool is_end) {
+                    return is_end ? a != 0 && exe->contains_phys(a - 1u)
+                                  : exe->contains_phys(a);
+                };
+                bool foreign = false;
+                size_t i = 0;
+                for (uint32_t a : addrs) {
+                    const bool is_end = end_exclusive && ++i == addrs.size();
+                    foreign |= in_image(a, is_end) &&
+                               (a & PSXRecomp::kSegmentMask) != exe->link_segment();
+                }
+                if (!foreign) return false;
+                std::string fixed;
+                i = 0;
+                for (uint32_t a : addrs) {
+                    const bool is_end = end_exclusive && ++i == addrs.size();
+                    fixed += fmt::format(" 0x{:08X}", in_image(a, is_end)
+                        ? exe->link_segment() | (a & PSXRecomp::kPhysMask) : a);
+                }
+                fmt::print(stderr,
+                    "ERROR: seeds directive names this image's bytes in another "
+                    "segment than its link segment 0x{:08X} "
+                    "(docs/SEGMENT_AWARE_CODE.md §5.3): {}\n  write its "
+                    "addresses as:{}\n", exe->link_segment(), text, fixed);
+                return true;
+            };
             std::string line;
             while (std::getline(ef, line)) {
                 if (line.empty() || line[0] == '#') continue;
+                if (line.rfind("producer_range", 0) == 0) {
+                    std::istringstream in(line);
+                    std::string tag, lo_text, hi_text;
+                    in >> tag >> lo_text >> hi_text;
+                    uint32_t lo = static_cast<uint32_t>(
+                        std::strtoul(lo_text.c_str(), nullptr, 16));
+                    uint32_t hi = static_cast<uint32_t>(
+                        std::strtoul(hi_text.c_str(), nullptr, 16));
+                    if (!lo_text.empty() && !hi_text.empty() &&
+                        foreign_directive(line, {lo, hi}, /*end_exclusive=*/true))
+                        return 1;
+                    if (lo_text.empty() || hi_text.empty() ||
+                        lo < seed_lo || lo >= hi || hi > seed_hi) {
+                        fmt::print(stderr, "ERROR: invalid producer_range: {}\n", line);
+                        return 1;
+                    }
+                    producer_ranges.emplace_back(lo, hi);
+                    continue;
+                }
+                if (line.rfind("cross_call_allow", 0) == 0) {
+                    const char* p = line.c_str() + 16;
+                    uint32_t addr = static_cast<uint32_t>(
+                        std::strtoul(p, nullptr, 16));
+                    if (foreign_directive(line, {addr})) return 1;
+                    if (addr < seed_lo || addr >= seed_hi) {
+                        fmt::print(stderr, "ERROR: invalid cross_call_allow: {}\n", line);
+                        return 1;
+                    }
+                    cross_call_allow.insert(addr);
+                    continue;
+                }
+                if (line.rfind("retained_alias", 0) == 0) {
+                    fmt::print("  ignoring legacy retained_alias; old host "
+                               "ranges are never reused: {}\n", line);
+                    continue;
+                }
+                if (line.rfind("hosted_interior", 0) == 0) {
+                    std::istringstream in(line);
+                    std::string tag, target_text, host_text, trailing;
+                    in >> tag >> target_text >> host_text >> trailing;
+                    auto parse_hex_u32 = [](const std::string& text,
+                                            uint32_t& value) -> bool {
+                        if (text.empty()) return false;
+                        char* end = nullptr;
+                        errno = 0;
+                        unsigned long long parsed =
+                            std::strtoull(text.c_str(), &end, 16);
+                        if (errno != 0 || end == text.c_str() || *end != '\0' ||
+                            parsed > 0xFFFFFFFFull) return false;
+                        value = static_cast<uint32_t>(parsed);
+                        return true;
+                    };
+                    uint32_t target = 0, host = 0;
+                    if (tag == "hosted_interior" && trailing.empty() &&
+                        parse_hex_u32(target_text, target) &&
+                        parse_hex_u32(host_text, host) &&
+                        foreign_directive(line, {target, host}))
+                        return 1;
+                    if (tag != "hosted_interior" || !trailing.empty() ||
+                        !parse_hex_u32(target_text, target) ||
+                        !parse_hex_u32(host_text, host) ||
+                        (target & 3u) != 0u || (host & 3u) != 0u ||
+                        target < seed_lo || target >= seed_hi ||
+                        host < seed_lo || host >= seed_hi || target == host) {
+                        fmt::print(stderr, "ERROR: invalid hosted_interior: {}\n", line);
+                        return 1;
+                    }
+                    auto prior = hosted_interior_seeds.find(target);
+                    if (prior != hosted_interior_seeds.end() &&
+                        prior->second != host) {
+                        fmt::print(stderr, "ERROR: conflicting hosted_interior "
+                                   "hosts for 0x{:08X}\n", target);
+                        return 1;
+                    }
+                    hosted_interior_seeds.emplace(target, host);
+                    hosted_interior_hosts.insert(host);
+                    if (hosted_interior_seeds.size() >
+                            kHostedInteriorTargetCap ||
+                        hosted_interior_hosts.size() >
+                            kHostedInteriorHostCap) {
+                        fmt::print(stderr, "ERROR: hosted_interior capacity "
+                                   "exceeded (targets {} / {}, hosts {} / {})\n",
+                                   hosted_interior_seeds.size(),
+                                   kHostedInteriorTargetCap,
+                                   hosted_interior_hosts.size(),
+                                   kHostedInteriorHostCap);
+                        return 1;
+                    }
+                    continue;
+                }
                 bool interior = false;
                 bool trusted_root = false;
+                bool trusted_call_root = false;
                 const char* p = line.c_str();
                 if (line.rfind("interior", 0) == 0) {
                     interior = true;
@@ -434,23 +956,105 @@ int main(int argc, char** argv) {
                 } else if (line.rfind("dispatch_root", 0) == 0) {
                     trusted_root = true;
                     p += 13;
+                } else if (line.rfind("call_root", 0) == 0) {
+                    trusted_call_root = true;
+                    p += 9;
                 }
                 uint32_t addr = (uint32_t)std::strtoul(p, nullptr, 16);
-                if (addr >= seed_lo && addr < seed_hi) {
-                    if (interior) {
-                        interior_seeds.push_back(addr);
-                    } else {
-                        if (trusted_root) trusted_root_seeds.insert(addr);
-                        file_seeds.push_back(addr);
-                        exact_entries.push_back(addr);
+                const uint32_t phys = addr & PSXRecomp::kPhysMask;
+                if (phys < (seed_lo & PSXRecomp::kPhysMask) ||
+                    phys >= (seed_lo & PSXRecomp::kPhysMask) + (seed_hi - seed_lo)) {
+                    ++outside_seeds;
+                } else if (!PSXRecomp::maps_physical(addr)) {
+                    // Only KUSEG below 0x20000000, KSEG0 and KSEG1 alias the
+                    // image's bytes; a variant in any other segment would
+                    // give dispatch rows to PCs hardware cannot fetch as RAM.
+                    fmt::print(stderr,
+                        "ERROR: seed 0x{:08X} is in segment 0x{:08X}, which does not "
+                        "map physical memory (only KUSEG below 0x20000000, KSEG0 and "
+                        "KSEG1 do), so it names no code of this image and cannot ask "
+                        "for a segment variant "
+                        "(docs/SEGMENT_AWARE_CODE.md §5.4). The image's bytes at that "
+                        "physical address are 0x{:08X} in its link segment.\n",
+                        addr, addr & PSXRecomp::kSegmentMask,
+                        exe->link_segment() | phys);
+                    return 1;
+                } else if ((addr & PSXRecomp::kSegmentMask) != exe->link_segment()) {
+                    variant_seeds.emplace_back(
+                        addr, interior ? "interior" : trusted_root ? "dispatch_root"
+                                  : trusted_call_root ? "call_root" : "entry");
+                } else if (interior) {
+                    interior_seeds.push_back(addr);
+                } else {
+                    if (trusted_root) trusted_root_seeds.insert(addr);
+                    if (trusted_call_root) trusted_call_root_seeds.insert(addr);
+                    file_seeds.push_back(addr);
+                    exact_entries.push_back(addr);
+                }
+            }
+            std::sort(producer_ranges.begin(), producer_ranges.end());
+            for (size_t i = 1; i < producer_ranges.size(); i++) {
+                if (producer_ranges[i - 1].second > producer_ranges[i].first) {
+                    fmt::print(stderr, "ERROR: overlapping producer_range entries\n");
+                    return 1;
+                }
+            }
+            for (uint32_t addr : cross_call_allow) {
+                bool contained = false;
+                for (const auto& range : producer_ranges) {
+                    if (addr >= range.first && addr < range.second) {
+                        contained = true;
+                        break;
                     }
+                }
+                if (!contained) {
+                    fmt::print(stderr,
+                               "ERROR: cross_call_allow 0x{:08X} is outside "
+                               "producer ranges\n", addr);
+                    return 1;
                 }
             }
             fmt::print("Loaded {} extra function addresses ({} interior, "
-                       "{} dispatch-root) from {}\n",
-                       file_seeds.size() + interior_seeds.size(),
-                       interior_seeds.size(), trusted_root_seeds.size(),
+                       "{} hosted-interior, {} dispatch-root, {} call-root, {} producer ranges, "
+                       "{} cross-call allows) from {}\n",
+                       file_seeds.size() + interior_seeds.size() +
+                           hosted_interior_seeds.size(),
+                       interior_seeds.size(), hosted_interior_seeds.size(),
+                       trusted_root_seeds.size(),
+                       trusted_call_root_seeds.size(),
+                       producer_ranges.size(), cross_call_allow.size(),
                        extra_funcs_path);
+            if (outside_seeds) {
+                fmt::print("  {} seed(s) lie outside this image (0x{:08X}-0x{:08X}) "
+                           "and were not used\n",
+                           outside_seeds, seed_lo, seed_hi);
+            }
+            if (!variant_seeds.empty()) {
+                auto seg_name = [](uint32_t seg) {
+                    return seg == PSXRecomp::kSegKUSEG ? "KUSEG"
+                         : seg == PSXRecomp::kSegKSEG0 ? "KSEG0"
+                         : seg == PSXRecomp::kSegKSEG1 ? "KSEG1" : "an unmapped segment";
+                };
+                if (overlay_mode) {
+                    fmt::print("WARNING: {} seed(s) name this image's bytes in another "
+                               "segment than its link segment {}. Overlay compiles have "
+                               "no segment variants yet (docs/SEGMENT_AWARE_CODE.md §5.7): "
+                               "nothing is compiled for them.\n",
+                               variant_seeds.size(), seg_name(exe->link_segment()));
+                } else {
+                    fmt::print("{} seed(s) name this image's bytes in another segment than "
+                               "its link segment {}. Each asks for a segment variant "
+                               "(docs/SEGMENT_AWARE_CODE.md §5.4), compiled after the home "
+                               "compile. A seed for the image's own code is written in {}.\n",
+                               variant_seeds.size(), seg_name(exe->link_segment()),
+                               seg_name(exe->link_segment()));
+                }
+                for (const auto& [addr, kind] : variant_seeds) {
+                    fmt::print("  variant seed 0x{:08X} ({}, {}): home PC would be 0x{:08X}\n",
+                               addr, kind, seg_name(addr & PSXRecomp::kSegmentMask),
+                               exe->link_segment() | (addr & PSXRecomp::kPhysMask));
+                }
+            }
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
         }
@@ -465,14 +1069,57 @@ int main(int argc, char** argv) {
         // a root inside a host function hard-caps (truncates) it, the
         // mid-function-seed softlock class. Unmarked seeds are re-verified
         // against the same boundary rule as defense in depth.
+        const uint32_t exe_lo = exe->header.load_address;
+        auto read_w = [&](uint32_t a) -> uint32_t {
+            auto w = exe->read_word(a);
+            return w.has_value() ? *w : 0u;
+        };
+        auto dense_local_pointer_table = [&](uint32_t a) -> bool {
+            for (uint32_t i = 0; i < 3u; i++) {
+                auto value = exe->read_word(a + i * 4u);
+                if (!value.has_value() || (*value & 3u) != 0u ||
+                    *value < exe_lo || *value >= exe->analysis_end_address()) {
+                    return false;
+                }
+            }
+            return true;
+        };
         auto callable_boundary = [&](uint32_t a) -> bool {
-            return PSXRecomp::FunctionAnalyzer::has_callable_boundary(*exe, a);
+            uint32_t w = read_w(a);
+            if (!PSXRecomp::FunctionAnalyzer::is_valid_mips_word(w)) return false;
+            if (a == exe_lo) return true;
+            if (a >= exe_lo + 8 && read_w(a - 8) == 0x03E00008u) return true;
+            // Normal-mode discovery already skips alignment padding after a
+            // return when it infers a frameless function start. Preserve that
+            // evidence here. Requiring the next entry to be exactly jr-ra+8
+            // demoted legitimate Psy-Q leaf routines separated by one to six
+            // padding NOPs to orphan interiors, so exact-entry analysis emitted
+            // no function at all. The delay slot (jr+4) may be non-NOP; only
+            // words after it and before the proposed entry must be padding.
+            bool padding_only = true;
+            for (uint32_t back = 12; back <= 32 && a >= exe_lo + back;
+                 back += 4) {
+                if (read_w(a - back + 8) != 0u) padding_only = false;
+                if (!padding_only) break;
+                if (read_w(a - back) == 0x03E00008u) return true;
+            }
+            int32_t frame = 0;
+            return PSXRecomp::FunctionAnalyzer::is_prologue(w, frame) &&
+                   !(a >= exe_lo + 4 &&
+                     PSXRecomp::FunctionAnalyzer::is_branch_or_jump(read_w(a - 4)));
         };
 
         std::set<uint32_t> roots;
         std::set<uint32_t> interior;
+        std::set<uint32_t> hosted_targets;
+        for (const auto& seed : hosted_interior_seeds)
+            hosted_targets.insert(seed.first);
         for (uint32_t a : exact_entries) {
-            if (reachable_discovery && a == exe->header.initial_pc) {
+            if (hosted_targets.count(a)) {
+                // A fragment PS-X header needs one initial PC, but a trusted
+                // hosted interior must never become a walk root through it.
+                continue;
+            } else if (reachable_discovery && a == exe->header.initial_pc) {
                 // The PS-X EXE header is direct execution evidence for the
                 // main entry even when it uses a nonstandard prologue.
                 roots.insert(a);
@@ -482,6 +1129,11 @@ int main(int argc, char** argv) {
                  * execution root despite having no callable boundary. */
                 fmt::print("  seed 0x{:08X} accepted as dispatch root "
                            "(install-slot class, no boundary evidence)\n", a);
+                roots.insert(a);
+            } else if (trusted_call_root_seeds.count(a) &&
+                       !dense_local_pointer_table(a)) {
+                fmt::print("  seed 0x{:08X} accepted as static call root "
+                           "(direct/constant-register target)\n", a);
                 roots.insert(a);
             } else if (callable_boundary(a)) {
                 roots.insert(a);
@@ -506,53 +1158,19 @@ int main(int argc, char** argv) {
         // prologue/jr-ra in embedded data mints a root that decodes data as
         // code (audit-fatal). Orphans stay with the interpreter — it
         // self-heals via recapture once real call evidence appears.
-        /* Reachable direct calls are stronger evidence than a conventional
-         * prologue. A callee can legitimately be a leaf or packed BIOS thunk
-         * (load vector; jr vector; load call index) and therefore fail the
-         * boundary heuristic. Analyze to a fixed point: targets already owned
-         * by a function remain interior-alias candidates; only targets in an
-         * uncovered gap become new roots. Re-running after each promotion
-         * prevents a mid-function target from hard-capping its host. */
-        size_t jal_gap_roots_added = 0;
-        for (;;) {
+        {
             PSXRecomp::FunctionAnalyzer analyzer(*exe);
             std::vector<uint32_t> roots_vec(roots.begin(), roots.end());
-            analysis_result = analyzer.analyze_exact_entries(roots_vec);
-
-            uint32_t promoted = 0;
-            bool have_promotion = false;
-            for (uint32_t target : analysis_result.reachable_direct_jal_targets) {
-                if (roots.count(target) || containing(target)) continue;
-                auto word = exe->read_word(target);
-                if (!word.has_value() ||
-                    !PSXRecomp::FunctionAnalyzer::is_valid_mips_word(*word)) {
-                    continue;
-                }
-                /* Evidence is address-sorted. Promote only the lowest gap and
-                 * recalculate ownership before considering a later address:
-                 * the new function may legitimately own that later target as
-                 * an interior alias. Batch promotion would hard-cap it. */
-                promoted = target;
-                have_promotion = true;
-                break;
-            }
-            if (!have_promotion) break;
-            if (roots.insert(promoted).second) {
-                jal_gap_roots_added++;
-                fmt::print("  direct jal target 0x{:08X} promoted as "
-                           "an uncovered exact root\n", promoted);
-            }
+            analysis_result = analyzer.analyze_exact_entries(
+                roots_vec, producer_ranges, cross_call_allow);
         }
-        if (jal_gap_roots_added)
-            fmt::print("  +{} prologue-free direct-jal gap roots "
-                       "(reachable-call completeness)\n", jal_gap_roots_added);
 
         std::vector<AliasEntry> alias_entries;
         std::set<uint32_t> alias_seen;
         for (uint32_t a : interior) {
             const PSXRecomp::Function* host = containing(a);
             if (host && a == host->start_addr) continue;  // became a real entry
-            if (host) {
+            if (host && analysis_result.exact_reachable_pcs.count(a)) {
                 if (alias_seen.insert(a).second)
                     alias_entries.push_back({a, host->start_addr, host->end_addr});
             } else {
@@ -561,37 +1179,63 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Range-ownership completeness (B): a DIRECT CALL (jal) whose target
-        // lands strictly INSIDE an already-discovered function is a separate
-        // routine the host's discovered range absorbed (e.g. via a break/trap
-        // fall-through in discovery — the crt0 `jal main; break` that swallowed
-        // the next function, the Tomba 2 FMV-freeze root cause). Register every
-        // such target as an ALIAS entry so the host's entry-switch routes a
-        // dispatch of that PC to the correct interior block (running the absorbed
-        // routine natively) instead of failing closed to the interpreter. This is
-        // derived purely from static jal evidence in the discovered code, so it
-        // does not depend on the PC having been captured/executed. jal encodes a
-        // code target, so this never mints code from data.
-        size_t jal_alias_added = 0;
-        {
-            std::set<uint32_t> known_starts;
-            for (const auto& f : analysis_result.functions)
-                known_starts.insert(f.start_addr);
-            for (uint32_t t : analysis_result.reachable_direct_jal_targets) {
-                if (known_starts.count(t)) continue;          // already a real entry
-                if (!alias_seen.count(t)) {
-                    const PSXRecomp::Function* host = containing(t);
-                    if (host && t != host->start_addr) {
-                        alias_seen.insert(t);
-                        alias_entries.push_back({t, host->start_addr, host->end_addr});
-                        jal_alias_added++;
-                    }
+        // Cross-variant propagation never guesses a new walk. The caller names
+        // a current-byte host that was already CRC-valid in the cache, and the
+        // recompiler requires that exact root plus a syntactic block boundary
+        // in the host's current-byte range. This block test alone is NOT proof
+        // of reachability: the publisher must compare the emitted host+alias
+        // CRC/range identities with the preselected cached owner before use.
+        PSXRecomp::ControlFlowAnalyzer hosted_cfg_analyzer(*exe);
+        std::map<uint32_t, PSXRecomp::ControlFlowGraph> hosted_cfgs;
+        for (const auto& seed : hosted_interior_seeds) {
+            uint32_t target = seed.first;
+            uint32_t requested_host = seed.second;
+            const PSXRecomp::Function* host = nullptr;
+            for (const auto& function : analysis_result.functions) {
+                if (function.start_addr == requested_host) {
+                    host = &function;
+                    break;
                 }
             }
+            bool explicitly_rooted = roots.count(requested_host) != 0;
+            bool producer_ok = host &&
+                (host->producer_lo == 0 ||
+                 (target >= host->producer_lo && target < host->producer_hi));
+            bool block_ok = false;
+            if (host && producer_ok && target > host->start_addr &&
+                target < host->end_addr) {
+                auto inserted = hosted_cfgs.emplace(
+                    host->start_addr, PSXRecomp::ControlFlowGraph{});
+                if (inserted.second)
+                    inserted.first->second = hosted_cfg_analyzer.analyze_function(*host);
+                block_ok = inserted.first->second.blocks.count(target) != 0;
+            }
+            if (host && explicitly_rooted && producer_ok && block_ok) {
+                if (alias_seen.insert(target).second)
+                    alias_entries.push_back(
+                        {target, host->start_addr, host->end_addr});
+            } else {
+                fmt::print("  WARNING: hosted interior 0x{:08X} rejected for "
+                           "host 0x{:08X} (host={}, rooted={}, producer={}, block={})\n",
+                           target, requested_host, host ? "yes" : "no",
+                           explicitly_rooted ? "yes" : "no",
+                           producer_ok ? "yes" : "no", block_ok ? "yes" : "no");
+            }
         }
-        if (jal_alias_added)
-            fmt::print("  +{} in-function jal-target alias entries "
-                       "(range-ownership completeness)\n", jal_alias_added);
+
+        // Range-ownership completeness uses only analyzer-proven transfers from
+        // reachable instructions. The analyzer also revalidates each target's
+        // host against the final root partition and producer boundaries.
+        size_t proven_alias_added = 0;
+        for (const auto& absorbed : analysis_result.absorbed_entries) {
+            if (!alias_seen.insert(absorbed.addr).second) continue;
+            alias_entries.push_back(
+                {absorbed.addr, absorbed.host_start, absorbed.host_end});
+            proven_alias_added++;
+        }
+        if (proven_alias_added)
+            fmt::print("  +{} analyzer-proven absorbed alias entries "
+                       "(final range ownership)\n", proven_alias_added);
 
         materialize_alias_groups(analysis_result, alias_entries);
         fmt::print("Exact-entry alias entries emitted: {}\n\n", alias_entries.size());
@@ -618,7 +1262,7 @@ int main(int argc, char** argv) {
         std::set<uint32_t> forced;
         forced.insert(exe->header.initial_pc);
         const uint32_t exe_lo = exe->header.load_address;
-        const uint32_t exe_hi = exe->end_address();
+        const uint32_t exe_hi = exe->analysis_end_address();
         auto read_w = [&](uint32_t a) -> uint32_t {
             auto w = exe->read_word(a);
             return w.has_value() ? *w : 0u;
@@ -824,13 +1468,46 @@ int main(int argc, char** argv) {
     codegen_config.emit_line_numbers = true;
     codegen_config.split_mid_function_targets = !overlay_mode;
     codegen_config.overlay_mode = overlay_mode;
+    codegen_config.ws_signed_x_bound_sites = ws_signed_x_bound_sites;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
+    codegen_config.data_shard_funcs = ds_funcs;
+    codegen_config.mod_function_entry_funcs = mod_entry_funcs;
+    codegen_config.ws_cull_masked_reject_sites = ws_cull_masked_reject;
+    codegen_config.mod_instruction_sites = mod_instruction_sites;
+    codegen_config.hot_funcs = hot_funcs;
+    codegen_config.load_charge_batch_funcs = load_charge_batch_funcs;
+    codegen_config.vsync_query_hle_funcs = vsync_query_hle_funcs;
     codegen_config.ws_bg2d_init_func = ws_bg2d_init_func;
     codegen_config.ws_cull_bias_sites  = ws_cull_bias;
+    codegen_config.ws_cull_bias_lower_sites = ws_cull_bias_lower;
     codegen_config.ws_cull_range_sites = ws_cull_range;
     codegen_config.ws_cull_a1_sites    = ws_cull_a1;
     codegen_config.ws_cull_screen_x_sites = ws_cull_screen_x;
+    codegen_config.ws_cull_activation_guard_pixels =
+        ws_cull_activation_guard_pixels;
     codegen_config.ws_cull_slti_sites  = ws_cull_slti;
+    codegen_config.ws_cull_slti_lower_sites = ws_cull_slti_lower;
+    codegen_config.ws_cull_bltz_sites  = ws_cull_bltz;
+    codegen_config.ws_cull_negsub_sites = ws_cull_negsub;
+    codegen_config.ws_cull_vxrange_sites = ws_cull_vxrange;
+    codegen_config.ws_cull_depth_sites = ws_cull_depth;
+    codegen_config.ws_cull_plane_nx_sites = ws_cull_plane_nx;
+    codegen_config.netplay_local_viewport_width_sites = netplay_local_viewport_width_sites;
+    codegen_config.ws_cull_xclip_load_sites = ws_cull_xclip_load;
+    codegen_config.ws_cull_nclip_keep_sites = ws_cull_nclip_keep;
+    codegen_config.ws_cull_nclip_exact_sites = ws_cull_nclip_exact;
+    codegen_config.ws_cull_branch_keep_sites = ws_cull_branch_keep;
+    codegen_config.ws_cull_bgez_sites = ws_cull_bgez;
+    codegen_config.ws_cull_clip_edge_x_load_sites = ws_cull_clip_edge_x_load;
+    if (ws_cull_clip_edge_width)
+        codegen_config.ws_cull_clip_edge_width = ws_cull_clip_edge_width;
+    else if (!ws_cull_w_imms.empty())
+        codegen_config.ws_cull_clip_edge_width = ws_cull_w_imms.front();
+    codegen_config.ws_cull_keep_sites = ws_cull_keep;
+    codegen_config.ws_cull_scale_sites = ws_cull_scale;
+    codegen_config.ws_cull_angle_sites = ws_cull_angle;
+    codegen_config.draw_distance_clamp_sites = draw_distance_clamps;
+    codegen_config.ws_aspect_cone = ws_aspect_cone;
     codegen_config.ws_cull_w_imms      = ws_cull_w_imms;
     codegen_config.ws_cull_h_imms      = ws_cull_h_imms;
     codegen_config.ws_backdrop_x_sites = ws_backdrop_x;
@@ -866,6 +1543,12 @@ int main(int argc, char** argv) {
         else
             fmt::print("  (No annotations file found at {})\n\n", ann_path);
     }
+
+    // Overlay capture views (docs/SEGMENT_AWARE_CODE.md §5.7): every view of
+    // the same bytes gets the same hooks and substitutions, whatever segment
+    // it runs in and however the config spells the site.
+    if (overlay_mode)
+        codegen_config = PSXRecomp::overlay_codegen_config(codegen_config, *exe);
 
     PSXRecomp::CodeGenerator codegen(*exe, codegen_config);
     codegen.set_annotations(&annotations);
@@ -912,36 +1595,193 @@ int main(int argc, char** argv) {
             pos = hex_pos + 8;
         }
     }
-    if (dispatch_addrs.empty()) {
+    // Data/untranslatable entries are emitted as fail-closed
+    // psx_unknown_dispatch stubs. Do not put those stubs in the callable game
+    // dispatch table: a runtime overlay can legitimately replace the same EXE
+    // address, and a tiny stub range (especially a single NOP) can
+    // coincidentally byte-match the live overlay continuation. Advertising the
+    // stub as native-safe then turns valid dynamic code into a false fail-fast.
+    for (const auto& gen_func : codegen.last_gen_funcs()) {
+        if (gen_func.dispatchable) continue;
+        const std::string prefix = "func_";
+        if (gen_func.function_name.rfind(prefix, 0) != 0 ||
+            gen_func.function_name.size() < prefix.size() + 8) {
+            continue;
+        }
+        const std::string hex =
+            gen_func.function_name.substr(prefix.size(), 8);
+        dispatch_addrs.erase(
+            (uint32_t)std::strtoul(hex.c_str(), nullptr, 16));
+    }
+    if (dispatch_addrs.empty() && codegen.last_gen_funcs().empty()) {
         for (const auto& func : analysis_result.functions) {
             dispatch_addrs.insert(func.start_addr);
         }
     }
 
-    std::ofstream out_file(output_filename);
-    if (out_file.is_open()) {
-        out_file << full_c_code;
-        out_file.close();
-        fmt::print("✓ Saved {} lines to {}\n\n",
-                  std::count(full_c_code.begin(), full_c_code.end(), '\n'),
-                  output_filename.string());
+    // Segment variants (docs/SEGMENT_AWARE_CODE.md §5.4). Each segment named
+    // by a variant seed gets the direct-edge closure of the home functions
+    // its seeds reach, compiled again through a view of the image in that
+    // segment: its names, rows and every PC it bakes are that segment's, and
+    // a KSEG1 variant charges a fetch per instruction (§5.6). The bodies join
+    // the home shards, and their rows join the home dispatch table. Overlay
+    // compiles have none yet (§5.7).
+    std::vector<PSXRecomp::GeneratedFunction> all_gen_funcs = codegen.last_gen_funcs();
+    std::vector<std::string> variant_alias_decls;
+    std::string all_ranges_manifest = codegen.last_ranges_manifest().empty()
+        ? codegen.generate_ranges_manifest(analysis_result.functions, all_cfgs)
+        : codegen.last_ranges_manifest();
+    std::vector<PSXRecomp::GameDispatchUnit> dispatch_units{{&codegen, dispatch_addrs}};
+    std::vector<std::unique_ptr<PSXRecomp::PS1Executable>> variant_views;
+    std::vector<std::unique_ptr<PSXRecomp::CodeGenerator>> variant_codegens;
+    if (!overlay_mode && !variant_seeds.empty()) {
+        std::vector<uint32_t> requested;
+        for (const auto& [addr, kind] : variant_seeds) {
+            (void)kind;
+            requested.push_back(addr);
+        }
+        const auto plans = PSXRecomp::plan_segment_variants(
+            *exe, codegen.last_functions(), codegen.last_cfgs(),
+            codegen.cps_continuations(), requested);
+        for (const auto& plan : plans) {
+            fmt::print("\n=== Segment variant 0x{:08X} (docs/SEGMENT_AWARE_CODE.md §5.4) ===\n",
+                       plan.segment);
+            for (const auto& [pc, why] : plan.unplaced) {
+                fmt::print(stderr,
+                    "ERROR: variant seed 0x{:08X} cannot be compiled: {}. Seed the home "
+                    "PC first, or drop the variant seed.\n", pc, why);
+            }
+            if (!plan.unplaced.empty()) return 1;
+            fmt::print("  {} seed(s), direct-edge closure of {} function(s)\n",
+                       plan.seeds.size(), plan.functions.size());
+            variant_views.push_back(std::make_unique<PSXRecomp::PS1Executable>(
+                PSXRecomp::segment_view(*exe, plan.segment)));
+            const PSXRecomp::PS1Executable& view = *variant_views.back();
+            PSXRecomp::ControlFlowAnalyzer view_cfg(view);
+            const auto variant_cfgs = view_cfg.analyze_all_functions(plan.functions);
+            variant_codegens.push_back(std::make_unique<PSXRecomp::CodeGenerator>(
+                view, PSXRecomp::rebase_codegen_config(codegen_config, *exe, plan.segment)));
+            PSXRecomp::CodeGenerator& vgen = *variant_codegens.back();
+            (void)vgen.generate_file(plan.functions, variant_cfgs);
+            std::set<uint32_t> variant_addrs;
+            for (const auto& gf : vgen.last_gen_funcs()) {
+                all_gen_funcs.push_back(gf);
+                if (gf.dispatchable && gf.function_name.rfind("func_", 0) == 0 &&
+                    gf.function_name.size() == 13)
+                    variant_addrs.insert(static_cast<uint32_t>(
+                        std::strtoul(gf.function_name.c_str() + 5, nullptr, 16)));
+            }
+            for (const auto& decl : vgen.alias_body_decls()) variant_alias_decls.push_back(decl);
+            // The variant's F/R records, without the manifest's header comment.
+            std::istringstream vr(vgen.last_ranges_manifest());
+            for (std::string line; std::getline(vr, line);) {
+                if (!line.empty() && line[0] != '#') all_ranges_manifest += line + "\n";
+            }
+            dispatch_units.push_back({&vgen, variant_addrs});
+            fmt::print("  {} bodies, {} dispatch entries\n",
+                       vgen.last_gen_funcs().size(), variant_addrs.size());
+        }
+    }
+
+    // Split-TU output: instead of one monolithic <exe_stem>_full.c, write a
+    // shared declarations header plus N shards bucketed by cumulative line
+    // count, so the game build can compile the shards in parallel. The
+    // in-memory full_c_code / dispatch_addrs scan above is unaffected — only
+    // the on-disk representation changes. Function bodies are byte-identical
+    // to what full_c_code would have contained; see
+    // CodeGenerator::last_gen_funcs() / build_shared_decls_header().
+    if (overlay_mode) {
+        // Overlays are single small TUs consumed by compile_overlays.py, which
+        // reads <stem>_full.c directly. Emit the monolith; the split path below
+        // would delete _full.c and leave only shards, breaking overlay compile
+        // (no_output). Splitting a small overlay TU has no parallel-compile
+        // benefit anyway.
+        std::filesystem::path full_path(output_filename);
+        if (write_file_if_changed(full_path, full_c_code)) {
+            fmt::print("✓ Saved overlay monolith to {}\n", output_filename.string());
+        } else {
+            fmt::print("✓ Overlay monolith unchanged ({})\n", output_filename.string());
+        }
     } else {
-        fmt::print(stderr, "⚠ Failed to write output file\n\n");
+        // 1. Shared declarations header (write-if-changed preserves Ninja mtimes).
+        std::filesystem::path decls_filename = out_dir / (exe_stem + "_decls.h");
+        {
+            const std::string decls =
+                codegen.build_shared_decls_header(all_gen_funcs, variant_alias_decls);
+            if (write_file_if_changed(decls_filename, decls)) {
+                fmt::print("✓ Saved shared decls header to {}\n", decls_filename.string());
+            } else {
+                fmt::print("✓ Shared decls header unchanged ({})\n", decls_filename.string());
+            }
+        }
+
+        // 2. Bucket generated functions into shards by cumulative line count.
+        const int SHARD_LINE_BUDGET = 40000;
+        const std::vector<PSXRecomp::GeneratedFunction>& gen_funcs_for_shards = all_gen_funcs;
+        std::string decls_basename = exe_stem + "_decls.h";
+
+        int shard_index = 0;
+        int shard_lines = 0;
+        int total_shard_lines = 0;
+        int shards_written = 0;
+        std::stringstream shard_buf;
+        auto flush_shard = [&]() {
+            if (shard_buf.tellp() == std::streampos(0)) return;
+            std::filesystem::path shard_filename =
+                out_dir / fmt::format("{}_full_{:02d}.c", exe_stem, shard_index);
+            std::string body = fmt::format(
+                "/* Generated by PSXRecomp - full.c shard {}. DO NOT EDIT. */\n"
+                "#include \"{}\"\n\n{}",
+                shard_index, decls_basename, shard_buf.str());
+            if (write_file_if_changed(shard_filename, body)) {
+                fmt::print("✓ Saved shard {} ({} lines) to {}\n",
+                           shard_index, shard_lines, shard_filename.string());
+                ++shards_written;
+            } else {
+                fmt::print("✓ Shard {} unchanged ({} lines)\n", shard_index, shard_lines);
+            }
+            total_shard_lines += shard_lines;
+            shard_index++;
+            shard_lines = 0;
+            shard_buf.str(std::string());
+            shard_buf.clear();
+        };
+
+        for (const auto& gf : gen_funcs_for_shards) {
+            if (shard_lines > 0 && shard_lines + gf.line_count > SHARD_LINE_BUDGET) {
+                flush_shard();
+            }
+            shard_buf << gf.full_code << "\n";
+            shard_lines += gf.line_count;
+        }
+        flush_shard();
+
+        // 3. Drop orphan shards / monolith after emit (shrink must not leave stale TUs).
+        {
+            std::error_code rm_ec;
+            std::filesystem::remove(output_filename, rm_ec);
+            for (int stale = shard_index; stale < 256; stale++) {
+                std::filesystem::path stale_shard =
+                    out_dir / fmt::format("{}_full_{:02d}.c", exe_stem, stale);
+                std::filesystem::remove(stale_shard, rm_ec);
+            }
+        }
+
+        fmt::print("✓ Wrote {} shards ({} total lines, {} updated) for {}\n\n",
+                   shard_index, total_shard_lines, shards_written, exe_stem);
     }
 
     // Per-function code-range manifest (design §8): consumed by the overlay
     // loader's per-entry validity hash. Emitted alongside _full.c for every
     // build; only the overlay path actually loads it.
-    const std::string ranges_manifest = codegen.last_ranges_manifest().empty()
-        ? codegen.generate_ranges_manifest(analysis_result.functions, all_cfgs)
-        : codegen.last_ranges_manifest();
+    const std::string& ranges_manifest = all_ranges_manifest;
     {
         std::filesystem::path ranges_filename = out_dir / (exe_stem + "_full.ranges");
-        std::ofstream rf(ranges_filename);
-        if (rf.is_open()) {
-            rf << ranges_manifest;
-            rf.close();
+        if (write_file_if_changed(ranges_filename, ranges_manifest)) {
             fmt::print("✓ Saved code-range manifest to {}\n\n",
+                      ranges_filename.string());
+        } else {
+            fmt::print("✓ Code-range manifest unchanged ({})\n\n",
                       ranges_filename.string());
         }
     }
@@ -953,208 +1793,25 @@ int main(int argc, char** argv) {
         std::filesystem::path dispatch_filename = out_dir / (exe_stem + "_dispatch.c");
         fmt::print("Generating dispatch table: {}\n", dispatch_filename.string());
 
-        std::ostringstream ds;
-        ds << "/* Generated by PSXRecomp - dynamic dispatch table */\n";
-        ds << "#include \"psx_runtime.h\"\n\n";
-        ds << "extern void psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc);\n\n";
-        ds << "extern int dirty_ram_text_native_ok_ranges(const uint32_t* lo_len_pairs, uint32_t count);\n\n";
-
-        // Forward declarations
-        ds << "/* Forward declarations for all recompiled functions */\n";
-        for (uint32_t addr : dispatch_addrs) {
-            ds << fmt::format("extern void func_{:08X}(CPUState* cpu);\n", addr);
+        std::string dispatch_source, dispatch_error;
+        if (!PSXRecomp::emit_game_dispatch(dispatch_units, *exe,
+                                           ranges_manifest, dispatch_source,
+                                           dispatch_error)) {
+            fmt::print(stderr, "ERROR: {}\n", dispatch_error);
+            return 1;
         }
-        ds << "\n";
-
-        // Dispatch function
-        uint32_t game_text_start = exe->load_address() & 0x1FFFFFFFu;
-        uint32_t game_text_end = game_text_start + exe->code_size();
-        ds << "int psx_game_address_in_text(uint32_t addr) {\n";
-        ds << "    uint32_t phys = addr & 0x1FFFFFFFu;\n";
-        ds << fmt::format("    return phys >= 0x{:08X}u && phys < 0x{:08X}u;\n",
-                          game_text_start, game_text_end);
-        ds << "}\n\n";
-
-        // Materialize one sorted data table for dispatch and entry probes. A
-        // giant sparse switch is catastrophically slow in Debug/-O0 builds:
-        // GCC lowers X4's roughly 60K cases to a multi-megabyte linear compare
-        // chain. Binary search stays O(log N) at every optimizer level and
-        // avoids emitting the same case set twice.
-        struct DispatchRecord {
-            uint32_t addr;
-            uint32_t resume;
-            uint32_t owner;
-            uint32_t range_index;
-            uint32_t range_count;
-        };
-        std::vector<DispatchRecord> records;
-        records.reserve(dispatch_addrs.size() +
-                        (codegen.cps_enabled() ? codegen.cps_continuations().size() : 0));
-        for (uint32_t addr : dispatch_addrs)
-            records.push_back({addr, 0, addr, 0, 0});
-        if (codegen.cps_enabled()) {
-            const auto& conts = codegen.cps_continuations();
-            for (const auto& [cont, owner] : conts) {
-                if (dispatch_addrs.count(cont)) continue;
-                records.push_back({cont, cont, owner, 0, 0});
-            }
-        }
-        std::sort(records.begin(), records.end(),
-                  [](const DispatchRecord& a, const DispatchRecord& b) {
-                      return a.addr < b.addr;
-                  });
-
-        // Attach the exact CFG instruction ranges from the manifest to every
-        // dispatch owner. Mid-function alias wrappers have no separate F record,
-        // so resolve them to the containing host range. Mutable data and
-        // jump-table gaps sharing a page remain deliberately excluded.
-        using CodeRange = std::pair<uint32_t, uint32_t>;  // virtual lo, byte len
-        std::map<uint32_t, std::vector<CodeRange>> function_ranges;
-        {
-            std::istringstream input(ranges_manifest);
-            std::string line;
-            uint32_t current_owner = 0;
-            while (std::getline(input, line)) {
-                std::istringstream fields(line);
-                char kind = 0;
-                fields >> kind;
-                if (kind == 'F') {
-                    fields >> std::hex >> current_owner;
-                    function_ranges[current_owner];
-                } else if (kind == 'R' && current_owner != 0) {
-                    uint32_t lo = 0, len = 0;
-                    fields >> std::hex >> lo >> len;
-                    if (len != 0)
-                        function_ranges[current_owner].push_back({lo, len});
-                }
-            }
-        }
-        std::vector<CodeRange> flat_ranges;
-        std::map<uint32_t, std::pair<uint32_t, uint32_t>> owner_spans;
-        auto resolve_owner_ranges = [&](uint32_t owner)
-            -> const std::vector<CodeRange>* {
-            auto exact = function_ranges.find(owner);
-            if (exact != function_ranges.end() && !exact->second.empty())
-                return &exact->second;
-            for (const auto& [entry, ranges] : function_ranges) {
-                (void)entry;
-                for (const auto& [lo, len] : ranges) {
-                    const uint64_t hi = (uint64_t)lo + len;
-                    if (owner >= lo && (uint64_t)owner < hi) return &ranges;
-                }
-            }
-            return nullptr;
-        };
-        for (auto& rec : records) {
-            auto cached = owner_spans.find(rec.owner);
-            if (cached == owner_spans.end()) {
-                const uint32_t first = (uint32_t)flat_ranges.size();
-                const auto* ranges = resolve_owner_ranges(rec.owner);
-                if (ranges)
-                    flat_ranges.insert(flat_ranges.end(), ranges->begin(), ranges->end());
-                const uint32_t count = (uint32_t)flat_ranges.size() - first;
-                cached = owner_spans.emplace(rec.owner,
-                                             std::make_pair(first, count)).first;
-            }
-            rec.range_index = cached->second.first;
-            rec.range_count = cached->second.second;
-        }
-
-        ds << "typedef struct { uint32_t lo; uint32_t len; } PsxGameCodeRange;\n";
-        ds << "static const PsxGameCodeRange k_psx_game_code_ranges[] = {\n";
-        if (flat_ranges.empty()) ds << "    {0u, 0u},\n";
-        for (const auto& [lo, len] : flat_ranges)
-            ds << fmt::format("    {{0x{:08X}u, 0x{:X}u}},\n", lo, len);
-        ds << "};\n\n";
-
-        ds << "typedef void (*PsxGameDispatchFn)(CPUState* cpu);\n";
-        ds << "typedef struct {\n";
-        ds << "    uint32_t addr;\n";
-        ds << "    uint32_t resume_pc;\n";
-        ds << "    uint32_t range_index;\n";
-        ds << "    uint32_t range_count;\n";
-        ds << "    PsxGameDispatchFn fn;\n";
-        ds << "} PsxGameDispatchEntry;\n\n";
-        ds << "static const PsxGameDispatchEntry k_psx_game_dispatch[] = {\n";
-        for (const auto& rec : records) {
-            ds << fmt::format("    {{0x{:08X}u, 0x{:08X}u, {}u, {}u, func_{:08X}}},\n",
-                              rec.addr, rec.resume, rec.range_index,
-                              rec.range_count, rec.owner);
-        }
-        ds << "};\n";
-        ds << fmt::format("#define PSX_GAME_DISPATCH_COUNT {}u\n\n", records.size());
-        ds << "static const PsxGameDispatchEntry* psx_game_find_entry(uint32_t addr) {\n";
-        ds << "    uint32_t lo = 0, hi = PSX_GAME_DISPATCH_COUNT;\n";
-        ds << "    while (lo < hi) {\n";
-        ds << "        uint32_t mid = lo + (hi - lo) / 2;\n";
-        ds << "        uint32_t key = k_psx_game_dispatch[mid].addr;\n";
-        ds << "        if (addr < key) hi = mid;\n";
-        ds << "        else if (addr > key) lo = mid + 1;\n";
-        ds << "        else return &k_psx_game_dispatch[mid];\n";
-        ds << "    }\n";
-        ds << "    return 0;\n";
-        ds << "}\n\n";
-
-        ds << "/* Exact static-code validity for this entry's emitted CFG ranges. */\n";
-        ds << "int psx_game_text_native_ok(uint32_t addr) {\n";
-        ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
-        ds << "    if (!entry || entry->range_count == 0) return 0;\n";
-        ds << "    return dirty_ram_text_native_ok_ranges(\n";
-        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count);\n";
-        ds << "}\n\n";
-
-        ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
-        ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
-        ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
-        ds << "    if (!entry) return 0;\n";
-        ds << "    if (entry->range_count == 0 || !dirty_ram_text_native_ok_ranges(\n";
-        ds << "            &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count)) return 0;\n";
-        ds << "    psx_check_interrupts_dispatch_entry(cpu, addr);\n";
-        if (codegen.cps_enabled())
-            ds << "    cpu->pc = entry->resume_pc;\n";
-        ds << "    entry->fn(cpu);\n";
-        ds << "    return 1;\n";
-        ds << "}\n";
-
-        // Non-destructive companion to psx_dispatch_game_compiled: is `addr` a PC
-        // the top-level dispatch can re-enter (a compiled function entry, or a CPS
-        // continuation resume-point)? The precise event slicer (dirty_ram_interp.c)
-        // needs this to know when it may hand a resume PC back to the dispatcher:
-        // a MID-function clean-text PC is NOT re-enterable (the switch falls to
-        // `default: return 0` and the dirty path returns 0 -> top-level PC=0 exit),
-        // so the slicer must keep interpreting until cpu->pc lands on a true entry.
-        // Same precise address set as dispatch, without executing the entry.
-        ds << "\n/* 1 iff addr is a re-enterable compiled entry/continuation (no exec). */\n";
-        ds << "int psx_game_is_function_entry(uint32_t addr) {\n";
-        ds << "    return psx_game_find_entry(addr) != 0;\n";
-        ds << "}\n";
-
-        if (codegen.cps_enabled()) {
-            // RECURSION_BUG.md §25 — mark CPS mode at startup so the overlay sljit
-            // JIT (overlay_sljit.c) emits the CPS contract. Static ctor: no clash
-            // with the BIOS dispatch's marker.
-            ds << "\n/* CPS runtime-mode marker (overlay sljit JIT reads g_psx_cps_mode). */\n";
-            ds << "static void psx_cps_mark_game(void) {\n";
-            ds << "    extern int g_psx_cps_mode; g_psx_cps_mode = 1;\n";
-            ds << "}\n";
-            // Run psx_cps_mark_game before main(). __attribute__((constructor)) is
-            // GCC/Clang-only; MSVC uses a static initializer pointer in .CRT$XCU.
-            ds << "#if defined(_MSC_VER)\n";
-            ds << "#pragma section(\".CRT$XCU\", read)\n";
-            ds << "__declspec(allocate(\".CRT$XCU\")) static void (*psx_cps_mark_game_ctor)(void) = psx_cps_mark_game;\n";
-            ds << "#else\n";
-            ds << "__attribute__((constructor)) static void psx_cps_mark_game_ctor(void) { psx_cps_mark_game(); }\n";
-            ds << "#endif\n";
-        }
-
-        std::ofstream dispatch_file(dispatch_filename);
-        if (dispatch_file.is_open()) {
-            dispatch_file << ds.str();
-            dispatch_file.close();
-            fmt::print("✓ Dispatch table written ({} entries)\n\n",
-                       dispatch_addrs.size());
+        // Entries of the home compile, plus those of its segment variants.
+        size_t variant_entries = 0;
+        for (size_t u = 1; u < dispatch_units.size(); ++u)
+            variant_entries += dispatch_units[u].dispatch_addrs.size();
+        const std::string variant_note = variant_entries
+            ? fmt::format(", plus {} in segment variants", variant_entries) : std::string();
+        if (write_file_if_changed(dispatch_filename, dispatch_source)) {
+            fmt::print("✓ Dispatch table written ({} entries{})\n\n",
+                       dispatch_addrs.size(), variant_note);
         } else {
-            fmt::print(stderr, "⚠ Failed to write dispatch file\n\n");
+            fmt::print("✓ Dispatch table unchanged ({} entries{})\n\n",
+                       dispatch_addrs.size(), variant_note);
         }
     }
 

@@ -335,6 +335,8 @@ std::string display(const std::filesystem::path& path, const std::string& game_i
     return result;
 }
 
+void stop() { finish(); }
+
 void start(const std::filesystem::path& path, const std::string& game_id) {
     auto& state = session();
     if (state.active || path.empty() || sodium_init() < 0) return;

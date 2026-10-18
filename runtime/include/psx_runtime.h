@@ -1,7 +1,8 @@
-#ifndef PSXRECOMP_PSX_RUNTIME_H
+﻿#ifndef PSXRECOMP_PSX_RUNTIME_H
 #define PSXRECOMP_PSX_RUNTIME_H
 
 #include "cpu_state.h"
+#include "debug_server.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
 

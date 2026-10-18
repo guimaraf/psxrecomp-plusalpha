@@ -1,4 +1,4 @@
-/*
+﻿/*
  * starvation_ring.h — Always-on diagnostic ring for capturing SIO/MMIO
  * state immediately before a TCP-starvation hang.
  *
@@ -20,7 +20,11 @@ extern "C" {
 #endif
 
 #ifndef STARVATION_RING_ENABLED
-#define STARVATION_RING_ENABLED 1
+#  ifdef PSX_NO_DEBUG_TOOLS
+#    define STARVATION_RING_ENABLED 0
+#  else
+#    define STARVATION_RING_ENABLED 1
+#  endif
 #endif
 
 #define STARVATION_RING_CAP (1 << 14)  /* 16K entries */
@@ -95,11 +99,42 @@ void starvation_watchdog_heartbeat(void);
 /* Run watchdog check from a hot path (e.g. psx_advance_cycles). */
 void starvation_watchdog_check(void);
 
+/* Pure staleness decision behind starvation_watchdog_check(), exposed so a
+ * unit test can pin it without linking the ring.
+ *
+ * The heartbeat is stamped from two threads (emu thread per vblank, and the
+ * debug-server IO thread on every send() chunk), while the check runs on the
+ * emu thread. A stamp landing between the check's clock sample and its
+ * heartbeat load makes `last > now`; the old open-coded `now - last` wrapped
+ * to ~1.8e19, beat any threshold, and exited a healthy runtime (BoF3
+ * 2026-09-02: 402 us of real staleness tripped a 4 s watchdog). Callers must
+ * therefore load `last` BEFORE sampling `now`, and this function refuses a
+ * negative gap by construction. Returns 1 when the watchdog should fire.
+ * `timeout == 0` disables it; `last == 0` means "no heartbeat yet". */
+static inline int starvation_watchdog_stale(uint64_t last, uint64_t now,
+                                            uint64_t timeout) {
+    if (last == 0 || timeout == 0) return 0;
+    if (now <= last) return 0;
+    return (now - last) > timeout;
+}
+
 /* Manual dump-to-file (for testing / TCP probe). Filename can be NULL. */
 void starvation_ring_dump(const char *path);
 
+/* Rematch / session_reboot: clear ring + watchdog so a prior match cannot
+ * poison the next dump or leave s_dump_done set. */
+void starvation_ring_reset(void);
+
 /* Periodic PC sample. Caller responsible for throttling. */
 void starvation_ring_pc_sample(void);
+
+/* Ring query (TCP `starv_ring`): total events recorded so far, and a copy
+ * of the entry with sequence number `seq` (0 = first ever). Returns 1 and
+ * fills *out when `seq` is still resident in the ring; 0 when evicted or
+ * not yet written. Same-thread with the writers (emu/main thread), so the
+ * copy is tear-free. */
+uint64_t starvation_ring_total(void);
+int      starvation_ring_get(uint64_t seq, StarvationEntry *out);
 
 #ifdef __cplusplus
 }

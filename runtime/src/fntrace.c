@@ -1,8 +1,11 @@
 /* fntrace.c — runtime side of psx_dispatch call ring. See fntrace.h. */
 
 #include "fntrace.h"
+#include "psx_bss.h"
 #include "text_xlate.h"     /* on-the-fly string translation hook (framework) */
 #include "parity_trace.h"   /* general control-flow parity ring (native producer) */
+#include "mod_runtime.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -15,8 +18,9 @@ static uint32_t parity_rw_cb(void* ctx, uint32_t addr) {
 uint32_t parity_host_frame(void) { extern uint64_t s_frame_count; return (uint32_t)s_frame_count; }
 uint64_t parity_host_cycle(void) { extern uint64_t psx_get_cycle_count(void); return psx_get_cycle_count(); }
 
-FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
-uint64_t     g_fntrace_seq = 0;
+/* Explicit .bss: without this, MinGW+LTO can emit ~144MiB of zeros into .rdata. */
+PSX_BSS FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
+uint64_t             g_fntrace_seq = 0;
 
 /* Frame counter shared with debug_server.c / dirty_ram_interp.c. */
 extern uint64_t s_frame_count;
@@ -42,6 +46,47 @@ void fntrace_set_game_range(uint32_t lo, uint32_t hi) {
 }
 
 int fntrace_is_game_started(void) { return s_game_started; }
+void fntrace_restore_game_started(int started) { s_game_started = started != 0; }
+
+/* Centralised game-start transition.  Idempotent — safe to call from both
+ * the dispatcher (fntrace_record) and the generated entry-point function.
+ * Performs the complete handoff side effects: dirty-image baseline clear,
+ * low-boot scratch clear, CD speed switch, and boot-state capture. */
+void fntrace_mark_game_started(CPUState* cpu) {
+    if (s_game_started) return;
+    s_game_started = 1;
+    extern void dirty_ram_clear_image_baseline(void);
+    extern void memory_clear_low_boot_scratch(void);
+    dirty_ram_clear_image_baseline();
+    memory_clear_low_boot_scratch();
+    cdrom_notify_game_started();
+    boot_state_trigger_capture(cpu);
+}
+
+/* Range-guarded latch for the dirty-RAM interpreter path.  Mirrors the
+ * native path's semantics: latch ONLY on the exact game entry PC set via
+ * fntrace_set_game_range().  Never latch on a broad address heuristic —
+ * the BIOS shell/kernel execute relocated RAM code well above the game
+ * load address during boot, and a premature handoff (baseline/scratch
+ * clears, CD speed switch) corrupts the boot sequence. */
+void fntrace_maybe_mark_game_started(CPUState* cpu, uint32_t addr) {
+    if (s_game_started) return;
+    if (s_game_entry_phys == 0) return;   /* no game range armed */
+    /* The dirty-RAM interpreter path may miss the exact PS-X EXE entry when
+     * the BIOS or loader enters game text through already-interpreted flow.
+     * Mirror fntrace_record's safe fallback: only latch on other game-text
+     * addresses when a reference image exists and live RAM already matches it.
+     * Without that guard, relocated BIOS shell RAM can look like game RAM and
+     * a premature handoff corrupts boot. */
+    extern int psx_game_address_in_text(uint32_t addr);
+    extern int psx_game_text_native_ok(uint32_t addr);
+    extern int dirty_ram_text_image_registered(void);
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys == s_game_entry_phys ||
+        (dirty_ram_text_image_registered() &&
+         psx_game_address_in_text(addr) && psx_game_text_native_ok(addr)))
+        fntrace_mark_game_started(cpu);
+}
 
 static inline int armed_match(uint32_t target) {
     /* PSX_FNTRACE_ALL=1 records every dispatch from power-on — the ring
@@ -63,7 +108,63 @@ static inline int armed_match(uint32_t target) {
     return 0;
 }
 
+/* ── Stack-domain transition ring (ALWAYS-ON, every build) ─────────────────
+ * Records every dispatch where the guest SP crossed a 64 KB domain since the
+ * previous dispatch. Ordinary call nesting never moves SP that far, so the
+ * ring stays quiet except at genuine stack switches: game green-thread /
+ * coroutine context restores, longjmps, kernel thread changes, and crt0
+ * stack (re)initialization. Those transitions are exactly the provenance
+ * question in stack-corruption deaths (Tomba 2 splash→title reload: the
+ * guest resumed on a stack pointing INTO freshly loaded module code, and
+ * nothing recorded who installed that SP). Cost: two loads + xor + branch
+ * per dispatch; entries only on domain edges. Dumped via `sp_ring`. */
+SpDomainEntry g_spdom_ring[SPDOM_RING_CAP];
+uint64_t      g_spdom_seq = 0;
+static uint32_t s_spdom_prev_sp = 0;
+
+/* Always-on dispatch tail ring: the last DISP_TAIL_CAP dispatches with
+ * target/ra/sp/cycle. Unlike the armed fntrace ring this is unconditional —
+ * sized tiny so the post-mortem question "what was the exact dispatch
+ * sequence in the final iterations" is always answerable (the Tomba 2
+ * splash reload loop was invisible without it). Dumped via `disp_ring`. */
+DispTailEntry g_disp_tail[DISP_TAIL_CAP];
+uint64_t      g_disp_tail_seq = 0;
+
 void fntrace_record(CPUState* cpu, uint32_t target) {
+    /* The BIOS has completed the PS-X EXE load by the time it dispatches the
+     * entry point. Apply the validated plan before the first guest instruction. */
+    mod_runtime_on_dispatch(target);
+    {
+        extern uint64_t psx_get_cycle_count(void);
+        DispTailEntry *t = &g_disp_tail[g_disp_tail_seq % DISP_TAIL_CAP];
+        t->target = target;
+        t->ra     = cpu->gpr[31];
+        t->sp     = cpu->gpr[29];
+        t->cycle  = psx_get_cycle_count();
+        g_disp_tail_seq++;
+    }
+    {
+        uint32_t sp_now = cpu->gpr[29];
+        if (((sp_now ^ s_spdom_prev_sp) & 0xFFFF0000u) != 0u) {
+            if (s_spdom_prev_sp != 0u) {
+                extern uint64_t psx_get_cycle_count(void);
+                extern uint32_t psx_read_word(uint32_t addr);
+                SpDomainEntry *e = &g_spdom_ring[g_spdom_seq % SPDOM_RING_CAP];
+                uint32_t pcb = psx_read_word(0x108u);
+                e->seq     = g_spdom_seq;
+                e->cycle   = psx_get_cycle_count();
+                e->prev_sp = s_spdom_prev_sp;
+                e->new_sp  = sp_now;
+                e->target  = target;
+                e->ra      = cpu->gpr[31];
+                e->tcb     = pcb ? psx_read_word(pcb & 0x1FFFFFFFu) : 0u;
+                e->frame   = (uint32_t)s_frame_count;
+                g_spdom_seq++;
+            }
+            s_spdom_prev_sp = sp_now;
+        }
+    }
+
     /* On-the-fly string translation (framework feature — text_xlate.cpp). The
      * generated psx_dispatch_impl calls us at the top of each dispatch iteration
      * with cpu->gpr[4..7] holding THIS call's args, BEFORE the target function
@@ -120,27 +221,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
          * latching game-start before the EXE has loaded and clearing the dirty
          * baseline mid-load (the v0.0.2/v0.0.3 release-install boot crash).
          * Without an image, only the exact entry_pc dispatch may latch. */
-        extern int psx_game_address_in_text(uint32_t addr);
-        extern int psx_game_text_native_ok(uint32_t addr);
-        extern int dirty_ram_text_image_registered(void);
-        uint32_t _tphys = target & 0x1FFFFFFFu;
-        if (_tphys == s_game_entry_phys ||
-            (dirty_ram_text_image_registered() &&
-             psx_game_address_in_text(target) && psx_game_text_native_ok(target))) {
-            s_game_started = 1;
-            /* Establish the clean compiled-image baseline now: the boot EXE is fully
-             * loaded into the game-text region (== compiled image) and no gameplay
-             * overlay has run yet. The EXE load marked the whole text dirty (false
-             * positive); clearing it makes dirty_ram_is_dirty() true ONLY for pages a
-             * later overlay overwrites, so the dispatch runs clean text compiled and
-             * interprets only true overlays (Tomba 2 boot-text loader overlay). */
-            extern void dirty_ram_clear_image_baseline(void);
-            extern void memory_clear_low_boot_scratch(void);
-            dirty_ram_clear_image_baseline();
-            memory_clear_low_boot_scratch();
-            cdrom_notify_game_started();
-            boot_state_trigger_capture(cpu);
-        }
+        fntrace_maybe_mark_game_started(cpu, target);
     }
     /* Honor the one-shot capture freeze (insn_freeze): once latched, the ring
      * preserves the pre-divergence window instead of evicting it. */

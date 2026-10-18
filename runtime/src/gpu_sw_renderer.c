@@ -28,6 +28,8 @@
  */
 
 #include "gpu_sw_renderer.h"
+#include "gpu_vram_dirty.h"
+#include "gpu_sw_edges.h"
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -50,6 +52,11 @@ static uint16_t *g_hr      = NULL;
 static int       g_scale   = 1;
 static int       g_hr_w    = VRAM_WIDTH;
 static int       g_hr_h    = VRAM_HEIGHT;
+static int       g_precise_valid = 0;
+static int32_t   g_precise_x16[3], g_precise_y16[3];
+static int       g_perspective_valid = 0;
+static float     g_perspective_q[3];
+static uint32_t  g_perspective_triangles = 0;
 
 /* ---- Native-wide compositor (separate present surfaces) ------------------
  * Canonical VRAM stays faithful. For an opted-in wide game we ADDITIONALLY
@@ -92,6 +99,9 @@ static int g_raw_texture; /* 1 = skip modulation */
 
 /* Texture filtering: 0 = nearest (native PSX), 1 = bilinear. */
 static int g_texture_filter = 0;
+/* The player's filter request, applied unless faithful authority is on. */
+static int g_texture_filter_req = 0;
+static int g_faithful_authority = 0;   /* see sw_set_faithful_authority */
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -156,19 +166,21 @@ static inline RTarget rt_hires(void) {
  * into the OTHER buffer's band in the shared wide surface and corrupt it
  * (top/bottom edge flicker as the buffers flip). Canonical VRAM never showed
  * this because its draw-area clip already confines it. Scale matches SSAA. */
+static int view_enabled, view_shift, view_pad_left, view_pad_right;
 static inline RTarget rt_wide(void) {
     int s = g_scale;
     RTarget t;
     t.buf = g_wide_cur;
     t.w = g_wide_w * s; t.h = VRAM_HEIGHT * s; t.s = s;
-    t.cx1 = 0;             t.cy1 = g_clip_y1 * s;
-    t.cx2 = g_wide_w * s - 1; t.cy2 = g_clip_y2 * s + (s - 1);
+    t.cx1 = view_pad_left * s; t.cy1 = g_clip_y1 * s;
+    t.cx2 = (g_wide_w - view_pad_right) * s - 1;
+    t.cy2 = g_clip_y2 * s + (s - 1);
     return t;
 }
 
 /* X-translation (native px) from canonical VRAM space into the active wide
  * surface: local_x = vram_x - base_x + OFFSET. */
-static inline int wide_dx(void) { return g_wide_off - g_wide_cur_base; }
+static inline int wide_dx(void) { return g_wide_off + view_shift - g_wide_cur_base; }
 
 /* Native-wide 2D-backdrop X-stretch (SW renderer), mirroring the GL
  * wide_set_bd_scale exactly. The far 2D backdrop (sprite-tagged tile grid: sky
@@ -268,6 +280,9 @@ static inline void put_opaque(const RTarget *t, int x, int y, uint16_t color) {
     if (g_mask_set_bit) color |= 0x8000;
 
     t->buf[idx] = color;
+    /* Canonical VRAM only (hi-res / wide mirrors are present-side). */
+    if (t->buf == g_vram)
+        gpu_vram_dirty_mark_row((uint32_t)y);
 }
 
 /* Write a textured pixel — semi-trans only if texel bit 15 is set */
@@ -310,6 +325,8 @@ static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
     if (g_mask_set_bit) color |= 0x8000;
 
     t->buf[idx] = color;
+    if (t->buf == g_vram)
+        gpu_vram_dirty_mark_row((uint32_t)y);
 }
 
 /* ------------------------------------------------------------------ */
@@ -396,6 +413,7 @@ static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
     if (fy > 128) fy = 128;
 
     uint16_t c00 = bl_fetch(iu, iv, texpage, clut_x, clut_y);
+    if (c00 == 0) return 0x0000;
     uint16_t c10 = bl_fetch(iu + su, iv, texpage, clut_x, clut_y);
     uint16_t c01 = bl_fetch(iu, iv + sv, texpage, clut_x, clut_y);
     uint16_t c11 = bl_fetch(iu + su, iv + sv, texpage, clut_x, clut_y);
@@ -405,7 +423,6 @@ static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
     int w01 = (c01 ? 1 : 0) * (256 - fx) * fy;
     int w11 = (c11 ? 1 : 0) * fx * fy;
     int opac = w00 + w10 + w01 + w11;
-    if (opac < 32768) return 0x0000;    /* opacity < 0.5: transparent */
 
     int r = ((c00 & 0x1F) * w00 + (c10 & 0x1F) * w10
            + (c01 & 0x1F) * w01 + (c11 & 0x1F) * w11) / opac;
@@ -419,6 +436,11 @@ static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
     return (uint16_t)(r | (g << 5) | (b << 10) | (stp ? 0x8000 : 0));
 }
 
+static inline float bilinear_center_shift_for_target(const RTarget *t) {
+    int s = (t && t->s > 0) ? t->s : 1;
+    return 0.5f / (float)s - 1.0f / 64.0f;
+}
+
 /* uv sampling bounds (see g_uv_lim): the shared PS1 uv model in gpu_uv.h.
  * The software DDA truncates exactly like the PS1, so unlike the GL/VK
  * backends NO mirrored-2D compensation is applied here — these bounds only
@@ -427,7 +449,8 @@ static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
 
 static void sw_tri_uv_limits(const int *xs, const int *ys,
                              const int *us, const int *vs) {
-    psx_uv_tri_limits(xs, ys, us, vs, g_uv_lim);
+    if (g_perspective_valid) psx_uv_tri_world_limits(us, vs, g_uv_lim);
+    else psx_uv_tri_limits(xs, ys, us, vs, g_uv_lim);
 }
 
 static void sw_rect_uv_limits(int u0, int v0, int u1, int v1) {
@@ -455,6 +478,13 @@ void sw_renderer_init(uint16_t *vram) {
     g_mod_r = g_mod_g = g_mod_b = 16; /* neutral = 128/8 = 16 (no modulation) */
     g_raw_texture = 0;
     g_texture_filter = 0;
+    g_texture_filter_req = 0;
+}
+
+/* Point the rasterizer at another VRAM array without touching any draw
+ * state (the OpenGL render thread switches its upload source this way). */
+void sw_renderer_rebind_vram(uint16_t *vram) {
+    g_vram = vram;
 }
 
 /* ------------------------------------------------------------------ */
@@ -489,7 +519,74 @@ void sw_renderer_set_scale(int scale) {
 
 int sw_renderer_scale(void) { return g_scale; }
 
-void sw_set_texture_filter(int bilinear) { g_texture_filter = bilinear ? 1 : 0; }
+/* Faithful authority (netplay): while this rasterizer writes the guest's
+ * authoritative VRAM -- the netplay dual-raster SW@1x mirror or the netplay
+ * software GPU -- it draws exactly what hardware draws. The PGXP overrides and
+ * texture filtering are presentation enhancements; here they would put host-
+ * only state (PGXP shadows, which a rollback load drops on one peer only, and
+ * each player's Display filter) into pixels the game can read back with GP0
+ * C0 (V8:2 samples its own frame), forking guest RAM between peers. */
+void sw_set_faithful_authority(int on) {
+    g_faithful_authority = on ? 1 : 0;
+    g_texture_filter = g_faithful_authority ? 0 : g_texture_filter_req;
+    if (g_faithful_authority) {
+        g_precise_valid = 0;
+        g_perspective_valid = 0;
+    }
+}
+
+int sw_faithful_authority(void) { return g_faithful_authority; }
+
+void sw_set_precise_triangle(int enabled,
+                             int32_t x0, int32_t y0,
+                             int32_t x1, int32_t y1,
+                             int32_t x2, int32_t y2) {
+    g_precise_valid = (enabled && !g_faithful_authority) ? 1 : 0;
+    g_precise_x16[0] = x0; g_precise_y16[0] = y0;
+    g_precise_x16[1] = x1; g_precise_y16[1] = y1;
+    g_precise_x16[2] = x2; g_precise_y16[2] = y2;
+}
+
+void sw_set_perspective_triangle(int enabled,
+                                 float q0, float q1, float q2) {
+    const int requested = enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f;
+    g_perspective_valid = requested && !g_faithful_authority;
+    g_perspective_q[0] = q0;
+    g_perspective_q[1] = q1;
+    g_perspective_q[2] = q2;
+    /* Counts requests: under faithful authority the GPU presentation surface
+     * still draws them perspective-correct. */
+    if (requested) g_perspective_triangles++;
+}
+
+uint32_t sw_perspective_triangle_count(void) {
+    return g_perspective_triangles;
+}
+
+static inline int precise_scaled(int axis, int vertex, int fallback, int scale) {
+    if (!g_precise_valid) return fallback * scale;
+    int64_t fixed = axis ? g_precise_y16[vertex] : g_precise_x16[vertex];
+    int64_t scaled = fixed * scale;
+    if (scaled >= 0) return (int)((scaled + 0x8000) >> 16);
+    return -(int)((-scaled + 0x8000) >> 16);
+}
+
+static inline int precise_wide_x(int vertex, int fallback, int scale,
+                                 int dx, const WideBd *bd) {
+    if (g_precise_valid)
+        return precise_scaled(0, vertex, fallback, scale) + dx * scale;
+    return (wide_bd_x(bd, fallback) + dx) * scale;
+}
+
+static inline void precise_consumed(void) {
+    g_precise_valid = 0;
+    g_perspective_valid = 0;
+}
+
+void sw_set_texture_filter(int bilinear) {
+    g_texture_filter_req = bilinear ? 1 : 0;
+    g_texture_filter = g_faithful_authority ? 0 : g_texture_filter_req;
+}
 int  sw_texture_filter(void) { return g_texture_filter; }
 
 /* ------------------------------------------------------------------ */
@@ -577,6 +674,7 @@ void sw_fill_rect(int x, int y, int w, int h, uint16_t color) {
             g_vram[py * VRAM_WIDTH + px] = color;
         }
     }
+    gpu_vram_dirty_mark_rect(x0, y0, w, h);
 
     if (g_hr) hr_fill_block(x, y, w, h, color);
 }
@@ -642,6 +740,7 @@ void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
                 }
             }
         }
+        gpu_vram_dirty_mark_row((uint32_t)dy);
     }
 
     if (hr_rows) free(hr_rows);
@@ -662,30 +761,11 @@ static void raster_flat_triangle(const RTarget *t,
     int dy_total = y2 - y0;
     if (dy_total == 0) return;
 
-    /* PS1 triangle coverage is half-open on the bottom and right edges.
-     * This also makes the diagonal shared by the two triangles of a quad
-     * belong to exactly one primitive, avoiding a second semi-transparent
-     * blend on that edge. */
     for (int y = y0; y < y2; y++) {
         if (y < t->cy1 || y > t->cy2) continue;
 
-        int second_half = (y >= y1);
-        int seg_height = second_half ? (y2 - y1) : (y1 - y0);
-        if (seg_height == 0) seg_height = 1;
-
-        float alpha = (float)(y - y0) / (float)dy_total;
-        float beta;
-        if (second_half)
-            beta = (float)(y - y1) / (float)seg_height;
-        else
-            beta = (float)(y - y0) / (float)seg_height;
-
-        int xa = x0 + (int)((float)(x2 - x0) * alpha);
-        int xb;
-        if (second_half)
-            xb = x1 + (int)((float)(x2 - x1) * beta);
-        else
-            xb = x0 + (int)((float)(x1 - x0) * beta);
+        int xa, xb;
+        psx_triangle_edges_at_y(x0, y0, x1, y1, x2, y2, y, &xa, &xb);
 
         if (xa > xb) { int tt = xa; xa = xb; xb = tt; }
 
@@ -705,14 +785,21 @@ void sw_draw_flat_triangle(int x0, int y0, int x1, int y1,
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
-        raster_flat_triangle(&hr, x0*s, y0*s, x1*s, y1*s, x2*s, y2*s, color);
+        raster_flat_triangle(&hr,
+            precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s),
+            precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s),
+            precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), color);
     }
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
         WideBd bd = wide_bd_get();
-        raster_flat_triangle(&wt, (wide_bd_x(&bd,x0)+dx)*s, y0*s, (wide_bd_x(&bd,x1)+dx)*s, y1*s, (wide_bd_x(&bd,x2)+dx)*s, y2*s, color);
+        raster_flat_triangle(&wt,
+            precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s),
+            precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s),
+            precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), color);
     }
+    precise_consumed();
 }
 
 /* ------------------------------------------------------------------ */
@@ -760,12 +847,8 @@ static void raster_gouraud_triangle(const RTarget *t,
             beta = (float)(y - y0) / (float)seg_height;
 
         /* Interpolate X along edges */
-        int xa = x0 + (int)((float)(x2 - x0) * alpha);
-        int xb;
-        if (second_half)
-            xb = x1 + (int)((float)(x2 - x1) * beta);
-        else
-            xb = x0 + (int)((float)(x1 - x0) * beta);
+        int xa, xb;
+        psx_triangle_edges_at_y(x0, y0, x1, y1, x2, y2, y, &xa, &xb);
 
         /* Interpolate colors along edges (in 5-bit space) */
         int ra = r0 + (int)((float)(r2 - r0) * alpha);
@@ -823,14 +906,21 @@ void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
-        raster_gouraud_triangle(&hr, x0*s, y0*s, c0, x1*s, y1*s, c1, x2*s, y2*s, c2);
+        raster_gouraud_triangle(&hr,
+            precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s), c0,
+            precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s), c1,
+            precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), c2);
     }
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
         WideBd bd = wide_bd_get();
-        raster_gouraud_triangle(&wt, (wide_bd_x(&bd,x0)+dx)*s, y0*s, c0, (wide_bd_x(&bd,x1)+dx)*s, y1*s, c1, (wide_bd_x(&bd,x2)+dx)*s, y2*s, c2);
+        raster_gouraud_triangle(&wt,
+            precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s), c0,
+            precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s), c1,
+            precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), c2);
     }
+    precise_consumed();
 }
 
 /* ------------------------------------------------------------------ */
@@ -842,22 +932,27 @@ static void raster_textured_triangle(const RTarget *t,
                                      int x1, int y1, int u1, int v1,
                                      int x2, int y2, int u2, int v2,
                                      uint16_t clut_x, uint16_t clut_y,
-                                     uint16_t texpage) {
+                                     uint16_t texpage,
+                                     int perspective,
+                                     float q0, float q1, float q2) {
     /* Sort by Y, keeping UV in sync */
     if (y0 > y1) {
         int tt;
         tt=x0; x0=x1; x1=tt; tt=y0; y0=y1; y1=tt;
         tt=u0; u0=u1; u1=tt; tt=v0; v0=v1; v1=tt;
+        float tq=q0; q0=q1; q1=tq;
     }
     if (y0 > y2) {
         int tt;
         tt=x0; x0=x2; x2=tt; tt=y0; y0=y2; y2=tt;
         tt=u0; u0=u2; u2=tt; tt=v0; v0=v2; v2=tt;
+        float tq=q0; q0=q2; q2=tq;
     }
     if (y1 > y2) {
         int tt;
         tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt;
         tt=u1; u1=u2; u2=tt; tt=v1; v1=v2; v2=tt;
+        float tq=q1; q1=q2; q2=tq;
     }
 
     int dy_total = y2 - y0;
@@ -877,22 +972,28 @@ static void raster_textured_triangle(const RTarget *t,
         else
             beta = (float)(y - y0) / (float)seg_height;
 
-        int xa = x0 + (int)((float)(x2 - x0) * alpha);
-        int xb;
-        if (second_half)
-            xb = x1 + (int)((float)(x2 - x1) * beta);
-        else
-            xb = x0 + (int)((float)(x1 - x0) * beta);
+        int xa, xb;
+        psx_triangle_edges_at_y(x0, y0, x1, y1, x2, y2, y, &xa, &xb);
 
         float ua = u0 + (float)(u2 - u0) * alpha;
         float va = v0 + (float)(v2 - v0) * alpha;
+        float qa = q0 + (q2 - q0) * alpha;
+        float uqa = (float)u0 * q0 + ((float)u2 * q2 - (float)u0 * q0) * alpha;
+        float vqa = (float)v0 * q0 + ((float)v2 * q2 - (float)v0 * q0) * alpha;
         float ub, vb;
+        float qb, uqb, vqb;
         if (second_half) {
             ub = u1 + (float)(u2 - u1) * beta;
             vb = v1 + (float)(v2 - v1) * beta;
+            qb = q1 + (q2 - q1) * beta;
+            uqb = (float)u1 * q1 + ((float)u2 * q2 - (float)u1 * q1) * beta;
+            vqb = (float)v1 * q1 + ((float)v2 * q2 - (float)v1 * q1) * beta;
         } else {
             ub = u0 + (float)(u1 - u0) * beta;
             vb = v0 + (float)(v1 - v0) * beta;
+            qb = q0 + (q1 - q0) * beta;
+            uqb = (float)u0 * q0 + ((float)u1 * q1 - (float)u0 * q0) * beta;
+            vqb = (float)v0 * q0 + ((float)v1 * q1 - (float)v0 * q0) * beta;
         }
 
         if (xa > xb) {
@@ -900,6 +1001,9 @@ static void raster_textured_triangle(const RTarget *t,
             float tf;
             tf = ua; ua = ub; ub = tf;
             tf = va; va = vb; vb = tf;
+            tf = qa; qa = qb; qb = tf;
+            tf = uqa; uqa = uqb; uqb = tf;
+            tf = vqa; vqa = vqb; vqb = tf;
         }
 
         int span = xb - xa;
@@ -912,11 +1016,24 @@ static void raster_textured_triangle(const RTarget *t,
             float t_val = (float)(x - xa) / (float)span;
             float fu = ua + (ub - ua) * t_val;
             float fv = va + (vb - va) * t_val;
+            if (perspective) {
+                float q = qa + (qb - qa) * t_val;
+                if (q > 1.0e-12f) {
+                    fu = (uqa + (uqb - uqa) * t_val) / q;
+                    fv = (vqa + (vqb - vqa) * t_val) / q;
+                }
+            }
 
-            uint16_t texel = g_texture_filter
-                ? texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y)
-                : texel_fetch((int)fu & 0xFF, (int)fv & 0xFF, texpage, clut_x, clut_y);
-            put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
+            if (g_texture_filter) {
+                float sh = bilinear_center_shift_for_target(t);
+                uint16_t texel = texel_fetch_bilinear(fu + sh, fv + sh,
+                                                      texpage, clut_x, clut_y);
+                put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
+            } else {
+                uint16_t texel = texel_fetch((int)fu & 0xFF, (int)fv & 0xFF,
+                                             texpage, clut_x, clut_y);
+                put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
+            }
         }
     }
 }
@@ -928,7 +1045,7 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
                                uint16_t texpage) {
     int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
                   - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
-    if (area2 == 0) return;
+    if (area2 == 0) { precise_consumed(); return; }
 
     if (g_texture_filter) {
         int xs[3] = {x0,x1,x2}, ys[3] = {y0,y1,y2};
@@ -938,22 +1055,31 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
 
     RTarget n = rt_native();
     raster_textured_triangle(&n, x0, y0, u0, v0, x1, y1, u1, v1,
-                             x2, y2, u2, v2, clut_x, clut_y, texpage);
+                             x2, y2, u2, v2, clut_x, clut_y, texpage,
+                             g_perspective_valid,
+                             g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
-        raster_textured_triangle(&hr, x0*s, y0*s, u0, v0,
-                                 x1*s, y1*s, u1, v1,
-                                 x2*s, y2*s, u2, v2, clut_x, clut_y, texpage);
+        raster_textured_triangle(&hr,
+                                 precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s), u0, v0,
+                                 precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s), u1, v1,
+                                 precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), u2, v2,
+                                 clut_x, clut_y, texpage, g_perspective_valid,
+                                 g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     }
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
         WideBd bd = wide_bd_get();
-        raster_textured_triangle(&wt, (wide_bd_x(&bd,x0)+dx)*s, y0*s, u0, v0,
-                                 (wide_bd_x(&bd,x1)+dx)*s, y1*s, u1, v1,
-                                 (wide_bd_x(&bd,x2)+dx)*s, y2*s, u2, v2, clut_x, clut_y, texpage);
+        raster_textured_triangle(&wt,
+                                 precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s), u0, v0,
+                                 precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s), u1, v1,
+                                 precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), u2, v2,
+                                 clut_x, clut_y, texpage, g_perspective_valid,
+                                 g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     }
+    precise_consumed();
 }
 
 static inline void color24_to_mod(uint32_t color, int *r, int *g, int *b) {
@@ -970,25 +1096,30 @@ static void raster_shaded_textured_triangle(const RTarget *t,
                                             int x2, int y2, int u2, int v2,
                                             int r2, int g2, int b2,
                                             uint16_t clut_x, uint16_t clut_y,
-                                            uint16_t texpage, int raw_texture) {
+                                            uint16_t texpage, int raw_texture,
+                                            int perspective,
+                                            float q0, float q1, float q2) {
     /* Sort by Y, keeping UV and color modulation in sync */
     if (y0 > y1) {
         int tt;
         tt=x0; x0=x1; x1=tt; tt=y0; y0=y1; y1=tt;
         tt=u0; u0=u1; u1=tt; tt=v0; v0=v1; v1=tt;
         tt=r0; r0=r1; r1=tt; tt=g0; g0=g1; g1=tt; tt=b0; b0=b1; b1=tt;
+        float tq=q0; q0=q1; q1=tq;
     }
     if (y0 > y2) {
         int tt;
         tt=x0; x0=x2; x2=tt; tt=y0; y0=y2; y2=tt;
         tt=u0; u0=u2; u2=tt; tt=v0; v0=v2; v2=tt;
         tt=r0; r0=r2; r2=tt; tt=g0; g0=g2; g2=tt; tt=b0; b0=b2; b2=tt;
+        float tq=q0; q0=q2; q2=tq;
     }
     if (y1 > y2) {
         int tt;
         tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt;
         tt=u1; u1=u2; u2=tt; tt=v1; v1=v2; v2=tt;
         tt=r1; r1=r2; r2=tt; tt=g1; g1=g2; g2=tt; tt=b1; b1=b2; b2=tt;
+        float tq=q1; q1=q2; q2=tq;
     }
 
     int dy_total = y2 - y0;
@@ -1008,29 +1139,34 @@ static void raster_shaded_textured_triangle(const RTarget *t,
         else
             beta = (float)(y - y0) / (float)seg_height;
 
-        int xa = x0 + (int)((float)(x2 - x0) * alpha);
-        int xb;
-        if (second_half)
-            xb = x1 + (int)((float)(x2 - x1) * beta);
-        else
-            xb = x0 + (int)((float)(x1 - x0) * beta);
+        int xa, xb;
+        psx_triangle_edges_at_y(x0, y0, x1, y1, x2, y2, y, &xa, &xb);
 
         float ua = u0 + (float)(u2 - u0) * alpha;
         float va = v0 + (float)(v2 - v0) * alpha;
+        float qa = q0 + (q2 - q0) * alpha;
+        float uqa = (float)u0 * q0 + ((float)u2 * q2 - (float)u0 * q0) * alpha;
+        float vqa = (float)v0 * q0 + ((float)v2 * q2 - (float)v0 * q0) * alpha;
         float ra = r0 + (float)(r2 - r0) * alpha;
         float ga = g0 + (float)(g2 - g0) * alpha;
         float ba = b0 + (float)(b2 - b0) * alpha;
 
-        float ub, vb, rb, gb, bb;
+        float ub, vb, qb, uqb, vqb, rb, gb, bb;
         if (second_half) {
             ub = u1 + (float)(u2 - u1) * beta;
             vb = v1 + (float)(v2 - v1) * beta;
+            qb = q1 + (q2 - q1) * beta;
+            uqb = (float)u1 * q1 + ((float)u2 * q2 - (float)u1 * q1) * beta;
+            vqb = (float)v1 * q1 + ((float)v2 * q2 - (float)v1 * q1) * beta;
             rb = r1 + (float)(r2 - r1) * beta;
             gb = g1 + (float)(g2 - g1) * beta;
             bb = b1 + (float)(b2 - b1) * beta;
         } else {
             ub = u0 + (float)(u1 - u0) * beta;
             vb = v0 + (float)(v1 - v0) * beta;
+            qb = q0 + (q1 - q0) * beta;
+            uqb = (float)u0 * q0 + ((float)u1 * q1 - (float)u0 * q0) * beta;
+            vqb = (float)v0 * q0 + ((float)v1 * q1 - (float)v0 * q0) * beta;
             rb = r0 + (float)(r1 - r0) * beta;
             gb = g0 + (float)(g1 - g0) * beta;
             bb = b0 + (float)(b1 - b0) * beta;
@@ -1041,6 +1177,9 @@ static void raster_shaded_textured_triangle(const RTarget *t,
             float tf;
             tf = ua; ua = ub; ub = tf;
             tf = va; va = vb; vb = tf;
+            tf = qa; qa = qb; qb = tf;
+            tf = uqa; uqa = uqb; uqb = tf;
+            tf = vqa; vqa = vqb; vqb = tf;
             tf = ra; ra = rb; rb = tf;
             tf = ga; ga = gb; gb = tf;
             tf = ba; ba = bb; bb = tf;
@@ -1056,6 +1195,13 @@ static void raster_shaded_textured_triangle(const RTarget *t,
             float t_val = (float)(x - xa) / (float)span;
             float fu = ua + (ub - ua) * t_val;
             float fv = va + (vb - va) * t_val;
+            if (perspective) {
+                float q = qa + (qb - qa) * t_val;
+                if (q > 1.0e-12f) {
+                    fu = (uqa + (uqb - uqa) * t_val) / q;
+                    fv = (vqa + (vqb - vqa) * t_val) / q;
+                }
+            }
             int mr = (int)(ra + (rb - ra) * t_val);
             int mg = (int)(ga + (gb - ga) * t_val);
             int mb = (int)(ba + (bb - ba) * t_val);
@@ -1063,10 +1209,16 @@ static void raster_shaded_textured_triangle(const RTarget *t,
             if (mg < 0) mg = 0; if (mg > 31) mg = 31;
             if (mb < 0) mb = 0; if (mb > 31) mb = 31;
 
-            uint16_t texel = g_texture_filter
-                ? texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y)
-                : texel_fetch((int)fu & 0xFF, (int)fv & 0xFF, texpage, clut_x, clut_y);
-            put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
+            if (g_texture_filter) {
+                float sh = bilinear_center_shift_for_target(t);
+                uint16_t texel = texel_fetch_bilinear(fu + sh, fv + sh,
+                                                      texpage, clut_x, clut_y);
+                put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
+            } else {
+                uint16_t texel = texel_fetch((int)fu & 0xFF, (int)fv & 0xFF,
+                                             texpage, clut_x, clut_y);
+                put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
+            }
         }
     }
 }
@@ -1081,7 +1233,7 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
                                       uint16_t texpage, int raw_texture) {
     int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
                   - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
-    if (area2 == 0) return;
+    if (area2 == 0) { precise_consumed(); return; }
 
     if (g_texture_filter) {
         int xs[3] = {x0,x1,x2}, ys[3] = {y0,y1,y2};
@@ -1099,26 +1251,30 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
         x0, y0, u0, v0, r0, g0, b0,
         x1, y1, u1, v1, r1, g1, b1,
         x2, y2, u2, v2, r2, g2, b2,
-        clut_x, clut_y, texpage, raw_texture);
+        clut_x, clut_y, texpage, raw_texture, g_perspective_valid,
+        g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     if (g_hr) {
         int s = g_scale;
         RTarget hr = rt_hires();
         raster_shaded_textured_triangle(&hr,
-            x0*s, y0*s, u0, v0, r0, g0, b0,
-            x1*s, y1*s, u1, v1, r1, g1, b1,
-            x2*s, y2*s, u2, v2, r2, g2, b2,
-            clut_x, clut_y, texpage, raw_texture);
+            precise_scaled(0,0,x0,s), precise_scaled(1,0,y0,s), u0, v0, r0, g0, b0,
+            precise_scaled(0,1,x1,s), precise_scaled(1,1,y1,s), u1, v1, r1, g1, b1,
+            precise_scaled(0,2,x2,s), precise_scaled(1,2,y2,s), u2, v2, r2, g2, b2,
+            clut_x, clut_y, texpage, raw_texture, g_perspective_valid,
+            g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     }
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
         WideBd bd = wide_bd_get();
         raster_shaded_textured_triangle(&wt,
-            (wide_bd_x(&bd,x0)+dx)*s, y0*s, u0, v0, r0, g0, b0,
-            (wide_bd_x(&bd,x1)+dx)*s, y1*s, u1, v1, r1, g1, b1,
-            (wide_bd_x(&bd,x2)+dx)*s, y2*s, u2, v2, r2, g2, b2,
-            clut_x, clut_y, texpage, raw_texture);
+            precise_wide_x(0,x0,s,dx,&bd), precise_scaled(1,0,y0,s), u0, v0, r0, g0, b0,
+            precise_wide_x(1,x1,s,dx,&bd), precise_scaled(1,1,y1,s), u1, v1, r1, g1, b1,
+            precise_wide_x(2,x2,s,dx,&bd), precise_scaled(1,2,y2,s), u2, v2, r2, g2, b2,
+            clut_x, clut_y, texpage, raw_texture, g_perspective_valid,
+            g_perspective_q[0], g_perspective_q[1], g_perspective_q[2]);
     }
+    precise_consumed();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1198,7 +1354,8 @@ static void raster_textured_rect(const RTarget *t, int x, int y, int w, int h,
             uint16_t texel;
             if (g_texture_filter) {
                 float fu = (float)u + (float)col / (float)s;
-                texel = texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y);
+                float sh = bilinear_center_shift_for_target(t);
+                texel = texel_fetch_bilinear(fu + sh, fv + sh, texpage, clut_x, clut_y);
             } else {
                 int tu = (u + col / s) & 0xFF;
                 texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
@@ -1289,7 +1446,8 @@ static void raster_textured_rect_scaled(const RTarget *t, int x, int y,
             uint16_t texel;
             if (g_texture_filter) {
                 float fu = (float)u0 + (float)du * (float)col / (float)w;
-                texel = texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y);
+                float sh = bilinear_center_shift_for_target(t);
+                texel = texel_fetch_bilinear(fu + sh, fv + sh, texpage, clut_x, clut_y);
             } else {
                 int tu = (int)(u0 + ((int64_t)du * col) / w) & 0xFF;
                 texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
@@ -1420,6 +1578,7 @@ void sw_vram_write(int x, int y, uint16_t pixel) {
     x &= (VRAM_WIDTH - 1);
     y &= (VRAM_HEIGHT - 1);
     g_vram[y * VRAM_WIDTH + x] = pixel;
+    gpu_vram_dirty_mark_row((uint32_t)y);
 
     if (g_hr) {
         int s = g_scale;
@@ -1439,7 +1598,71 @@ uint16_t sw_vram_read(int x, int y) {
 /* Bulk VRAM transfers                                                */
 /* ------------------------------------------------------------------ */
 
+/* Rebuild the supersampled mirror from canonical VRAM after a bulk replace.
+ * Row-wise replication (memcpy) beats the per-texel nested loop used by the
+ * general transfer path — savestate restore hits full 1024×512 often. */
+static void hr_rebuild_from_vram(void) {
+    if (!g_hr || !g_vram) return;
+    const int s = g_scale;
+    if (s <= 1) return;
+    uint16_t *row = (uint16_t *)malloc((size_t)g_hr_w * sizeof(uint16_t));
+    if (!row) {
+        /* Fall back to slow per-pixel replication if OOM (should not happen). */
+        for (int py = 0; py < VRAM_HEIGHT; py++) {
+            for (int px = 0; px < VRAM_WIDTH; px++) {
+                uint16_t pixel = g_vram[py * VRAM_WIDTH + px];
+                int bx = px * s, by = py * s;
+                for (int dy = 0; dy < s; dy++) {
+                    uint16_t *dst = g_hr + (size_t)(by + dy) * (size_t)g_hr_w;
+                    for (int dx = 0; dx < s; dx++)
+                        dst[bx + dx] = pixel;
+                }
+            }
+        }
+        return;
+    }
+    for (int y = 0; y < VRAM_HEIGHT; y++) {
+        const uint16_t *src = g_vram + (size_t)y * VRAM_WIDTH;
+        for (int x = 0; x < VRAM_WIDTH; x++) {
+            uint16_t p = src[x];
+            uint16_t *d = row + (size_t)x * (size_t)s;
+            for (int dx = 0; dx < s; dx++)
+                d[dx] = p;
+        }
+        for (int dy = 0; dy < s; dy++) {
+            memcpy(g_hr + ((size_t)(y * s + dy) * (size_t)g_hr_w),
+                   row, (size_t)g_hr_w * sizeof(uint16_t));
+        }
+    }
+    free(row);
+}
+
 void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
+    if (!data || !g_vram || w <= 0 || h <= 0) return;
+
+    /* Full-VRAM replace (savestate / boot_state): memcpy + one HR rebuild.
+     * The general path is a wrapped per-pixel loop that, with supersampling,
+     * does s² stores per guest texel — multi-second hitches on 2×/4×. */
+    if (x == 0 && y == 0 && w == VRAM_WIDTH && h == VRAM_HEIGHT) {
+        memcpy(g_vram, data, (size_t)VRAM_WIDTH * (size_t)VRAM_HEIGHT * sizeof(uint16_t));
+        gpu_vram_dirty_mark_all();
+        if (g_hr) hr_rebuild_from_vram();
+        return;
+    }
+
+    /* Contiguous non-wrapping rect, no HR: memcpy each row. */
+    x &= (VRAM_WIDTH - 1);
+    y &= (VRAM_HEIGHT - 1);
+    if (!g_hr && x + w <= VRAM_WIDTH && y + h <= VRAM_HEIGHT) {
+        for (int row = 0; row < h; row++) {
+            memcpy(g_vram + (size_t)(y + row) * VRAM_WIDTH + (size_t)x,
+                   data + (size_t)row * (size_t)w,
+                   (size_t)w * sizeof(uint16_t));
+        }
+        gpu_vram_dirty_mark_rect(x, y, w, h);
+        return;
+    }
+
     int idx = 0;
     int s = g_scale;
     for (int row = 0; row < h; row++) {
@@ -1458,10 +1681,29 @@ void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
                 }
             }
         }
+        gpu_vram_dirty_mark_row((uint32_t)py);
     }
 }
 
 void sw_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
+    if (!data || !g_vram || w <= 0 || h <= 0) return;
+
+    if (x == 0 && y == 0 && w == VRAM_WIDTH && h == VRAM_HEIGHT) {
+        memcpy(data, g_vram, (size_t)VRAM_WIDTH * (size_t)VRAM_HEIGHT * sizeof(uint16_t));
+        return;
+    }
+
+    x &= (VRAM_WIDTH - 1);
+    y &= (VRAM_HEIGHT - 1);
+    if (x + w <= VRAM_WIDTH && y + h <= VRAM_HEIGHT) {
+        for (int row = 0; row < h; row++) {
+            memcpy(data + (size_t)row * (size_t)w,
+                   g_vram + (size_t)(y + row) * VRAM_WIDTH + (size_t)x,
+                   (size_t)w * sizeof(uint16_t));
+        }
+        return;
+    }
+
     int idx = 0;
     for (int row = 0; row < h; row++) {
         int py = (y + row) & (VRAM_HEIGHT - 1);
@@ -1563,6 +1805,16 @@ static uint16_t *wide_surf_for(int base_x) {
 
 /* Enable native-wide with a wide width + centering offset (native px), or
  * disable (wide_w <= 0). Re-allocates if the width changed. */
+void sw_wide_set_view(int enabled, int shift, int pad_left, int pad_right) {
+    if (!enabled) shift = pad_left = pad_right = 0;
+    if (view_enabled == enabled && view_shift == shift &&
+        view_pad_left == pad_left && view_pad_right == pad_right) return;
+    view_enabled = enabled;
+    view_shift = shift;
+    view_pad_left = pad_left;
+    view_pad_right = pad_right;
+}
+
 void sw_wide_configure(int wide_w, int offset) {
     if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; return; }
     if (wide_w != g_wide_w) wide_free_all();

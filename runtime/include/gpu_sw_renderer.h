@@ -12,6 +12,8 @@ extern "C" {
 
 /* Initialize software renderer */
 void sw_renderer_init(uint16_t* vram);
+/* Rebind the VRAM array only; draw state is kept. */
+void sw_renderer_rebind_vram(uint16_t* vram);
 
 /* Internal-resolution supersampling (SSAA).
  * scale == 1 : disabled, renderer behaves exactly as native VRAM only.
@@ -22,11 +24,33 @@ void sw_renderer_init(uint16_t* vram);
 void sw_renderer_set_scale(int scale);
 int  sw_renderer_scale(void);
 
+/* Visual-only high-resolution vertex override for the next triangle. Values
+ * are signed 16.16 screen coordinates; native VRAM still uses the integer GP0
+ * positions, while the supersampled mirror consumes these fractions. */
+void sw_set_precise_triangle(int enabled,
+                             int32_t x0, int32_t y0,
+                             int32_t x1, int32_t y1,
+                             int32_t x2, int32_t y2);
+
+/* Perspective-correct UV override for the next triangle. q values are the
+ * homogeneous interpolation weights associated with each screen vertex. */
+void sw_set_perspective_triangle(int enabled,
+                                 float q0, float q1, float q2);
+uint32_t sw_perspective_triangle_count(void);
+
 /* Texture filtering. 0 = nearest (native PSX look, default), 1 = bilinear
  * (smooths textures/2D backgrounds; blends in RGB after the CLUT lookup,
  * transparency-aware). Independent of supersampling. */
 void sw_set_texture_filter(int bilinear);
 int  sw_texture_filter(void);
+
+/* Netplay CPU-authoritative VRAM (dual-raster SW@1x or the software GPU):
+ * on = ignore the precise/perspective overrides and texture filtering, so the
+ * guest-visible VRAM (GP0 C0 readback, savestates) is the hardware image on
+ * every peer. The filter request is remembered and restored when it goes off.
+ * The GPU presentation surface keeps every enhancement. */
+void sw_set_faithful_authority(int on);
+int  sw_faithful_authority(void);
 
 /* Draw state — must be set by gpu.c before each primitive */
 void sw_set_semi_transparency(int enabled, int mode);
@@ -95,6 +119,7 @@ void sw_set_draw_offset(int x, int y);
  * base_x. wide_w<=0 disables. set_target selects/clears the mirror per back
  * buffer; render_wide_display is the present source for the displayed buffer. */
 void sw_wide_configure(int wide_w, int offset);
+void sw_wide_set_view(int enabled, int shift, int pad_left, int pad_right);
 void sw_wide_set_target(int base_x);
 void sw_wide_disable_target(void);
 void sw_wide_clear(int base_x, int y, int h, uint16_t color);

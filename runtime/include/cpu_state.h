@@ -1,4 +1,4 @@
-/* ============================================================================
+﻿/* ============================================================================
  * cpu_state.h  —  Phase 2 runtime version
  * ----------------------------------------------------------------------------
  * This is the RUNTIME version of the CPUState header. It has the same struct
@@ -18,23 +18,7 @@
 extern "C" {
 #endif
 
-/* sljit shard host-helper table — see SLJIT_PERSIST_CACHE.md Stage 1. The sljit
- * JIT routes its host-helper calls through this cpu-relative table (indexed by
- * the enum below) instead of baking absolute function pointers as SLJIT_IMM
- * operands, so a serialized shard's LIR contains zero absolute host addresses —
- * the prerequisite for persisting shards to disk (a reloaded process is at a
- * different ASLR base, so baked pointers would be stale). The ENUM ORDER is part
- * of the on-disk shard format: never reorder, only append, and bump the sljit
- * serialization tag when it changes. gcc codegen does NOT use this table. */
-enum {
-    SLJIT_HLP_MEMX = 0,   /* psx_sljit_memx    — LWL/LWR/SWL/SWR              */
-    SLJIT_HLP_COP2,       /* psx_sljit_cop2    — COP2/GTE, LWC2/SWC2          */
-    SLJIT_HLP_WS_CULL,    /* psx_ws_cull_sltiu — widescreen render-funnel cull */
-    SLJIT_HLP_CALL,       /* psx_sljit_call    — jal/jalr call contract       */
-    SLJIT_HLP_WS_CULL_SLTI, /* psx_ws_cull_slti — signed funnel right edge (appended) */
-    SLJIT_HLP_WS_CULL_BLTZ, /* psx_ws_cull_bltz — signed funnel left edge (appended) */
-    SLJIT_HLP_COUNT
-};
+/* (sljit shard host-helper table removed 2026-07-15 with the sljit tier.) */
 
 typedef struct CPUState {
     uint32_t gpr[32];   /* $0..$31; gpr[0] is hardwired zero, never written */
@@ -51,12 +35,6 @@ typedef struct CPUState {
     void     (*write_half)(uint32_t addr, uint16_t value);
     uint8_t  (*read_byte)(uint32_t addr);
     void     (*write_byte)(uint32_t addr, uint8_t value);
-
-    /* sljit host-helper pointer table (indexed by the SLJIT_HLP_* enum above).
-     * Appended at the END of CPUState so existing field offsets are unchanged —
-     * precompiled gcc overlay DLLs (which bake field offsets) are unaffected;
-     * only the sljit JIT reads it. Populated once at startup. */
-    void *sljit_helpers[SLJIT_HLP_COUNT];
 
     /* Mult/div completion deadline (absolute guest cycle). Set by MULT/MULTU/
      * DIV/DIVU to psx_cycle_count()+latency; a later MFLO/MFHI stalls (advances
@@ -87,6 +65,29 @@ typedef struct CPUState {
     uint8_t  ld_which_t;        /* LDWhich (timing): pending load dest reg, 0x20 = none */
     uint32_t ld_absorb;         /* LDAbsorb: pending load's give-back (region+completion) */
 } CPUState;
+
+/* Overlay DLLs batch per-instruction cycle charges in a DLL-local accumulator.
+ * A guest store is an observation boundary: MMIO handlers must see the cycle
+ * count through the store instruction, and RAM/self-modification/capture hooks
+ * must run after those cycles have been published to the host.  Generated code
+ * calls this immediately before every store (and before SWL/SWR's raw read).
+ * Static recompiled code and the interpreter share host cycle state directly,
+ * so their barrier compiles to nothing. */
+#ifdef PSX_OVERLAY_DLL_BUILD
+/* Kept here rather than in psx_cycles.h because cpu_state.h is the first
+ * generated-code include that declares the store barrier.  The preamble is
+ * inserted after all generated includes, so both declaration and definition
+ * must carry the same export attribute for Clang. */
+#  if defined(_WIN32)
+#    define PSX_OVERLAY_EXPORT __declspec(dllexport)
+#  else
+#    define PSX_OVERLAY_EXPORT __attribute__((visibility("default")))
+#  endif
+PSX_OVERLAY_EXPORT void overlay_flush_cycles(void);
+static inline void psx_store_cycle_barrier(void) { overlay_flush_cycles(); }
+#else
+static inline void psx_store_cycle_barrier(void) { }
+#endif
 
 /* Faithful exception-return (fix B) — defined in runtime/src/interrupts.c. The
  * interrupted-thread resume PC is the REAL guest PC, stored in COP0.EPC and (by the
@@ -140,12 +141,9 @@ extern uint32_t psx_mult_latency_u(uint32_t rs);   /* MULTU (unsigned) */
  * deadline first. Every COP2 register access calls psx_gte_stall, which advances
  * guest cycles to the deadline if the op is still in flight. Faithful only with
  * per-instruction cycle charging. */
-/* R3000A I-cache instruction-FETCH cost (psx_icache.c). Faithful direct-mapped
- * model: HIT +0, KSEG1/uncached +4, cached miss +3 + refill. Shared by interp
- * (per-instruction) and the compiled emitters (per-cache-line leader). */
-extern void     psx_icache_fetch(CPUState* cpu, uint32_t addr);
-extern void     psx_icache_reset(void);
-extern int      psx_icache_enabled(void);   /* opt-in (PSX_ICACHE=1) until both backends charge it */
+/* R3000A I-cache instruction-FETCH cost (psx_icache.h). HIT is inlined;
+ * MISS lives in psx_icache.c. Shared by interp + compiled emitters. */
+#include "psx_icache.h"
 
 extern void     psx_gte_set(CPUState* cpu, uint32_t latency);
 extern void     psx_gte_stall(CPUState* cpu);
@@ -171,8 +169,22 @@ extern void psx_dispatch_call(CPUState* cpu, uint32_t target_addr, uint32_t retu
  * through the per-instruction interpreter (interrupt taken at the exact
  * architectural instruction) and cpu->pc holds a dispatchable resume point, so
  * the caller must `return` without executing its compiled body. See
- * PRECISE_IRQ_SLICE.md. */
-extern int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
+ * PRECISE_IRQ_SLICE.md.
+ *
+ * PARKED default OFF (g_psx_precise_slice=0). The hot inline returns 0 with no
+ * call; PSX_PRECISE_SLICE=1 enables the impl for A/B. Every compiled block
+ * leader hits this — MotK VLC alone issues millions of calls/s. */
+extern int g_psx_precise_slice;
+extern int psx_slice_block_impl(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
+void psx_precise_slice_init_from_env(void);
+#ifdef PSX_OVERLAY_DLL_BUILD
+int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
+#else
+static inline int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
+    if (!g_psx_precise_slice) return 0;
+    return psx_slice_block_impl(cpu, block_addr, bcyc, side_effects);
+}
+#endif
 
 /* Unknown dispatch — defined in runtime/src/traps.c */
 extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);
@@ -189,6 +201,65 @@ extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);
 extern uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg);
 extern void     gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);
 extern void     gte_write_ctrl(CPUState* cpu, uint8_t reg, uint32_t val);
+/* Normalize raw save-state/imported backing arrays to the architectural form
+ * expected by generated direct-register fast paths.  This is not a guest
+ * register write: in particular, it preserves a computed FLAG bit 31. */
+extern void     gte_canonicalize_cpu_state(CPUState* cpu);
+/* Drop host-only projection/geometry provenance after a raw machine-state
+ * rewind or discarded speculative pass. Guest-visible GTE registers are not
+ * changed. */
+extern void     gte_precision_timeline_invalidate(void);
+/* Isolate a speculative native validation pass from host-only projection
+ * caches while preserving the preceding authoritative interpreter result. */
+extern void     gte_precision_speculative_begin(void);
+extern void     gte_precision_speculative_end(void);
+extern void     gte_precision_store_word(uint32_t addr, uint8_t reg);
+extern void     gte_precision_tracking_set(int enabled);
+/* Sub-pixel vertex precision ([video] geometry_correction). Enables the side
+ * cache that retains the 16.16 projection fraction the GTE discards when it
+ * saturates SXY to integer screen pixels. Guest-visible GTE state is
+ * unchanged — this is a visual-only enhancement, default off. */
+extern void     gte_geometry_correction_set(int enabled);
+extern int      gte_geometry_correction_enabled(void);
+/* Frame generation's vertex sources (gte.cpp): 0 = unknown. */
+extern void     gte_fg_source_set(int enabled);
+extern int      gte_fg_source_enabled(void);
+typedef struct GteFgSrc { uint32_t id, ra; int32_t p[3], h; } GteFgSrc;
+extern int      gte_fg_source_lookup(uint32_t packed, GteFgSrc out[2]);
+/* Corrected vertices consumed since the last gte_geometry_correction_set —
+ * the "is this actually doing anything on this title" counter. */
+extern uint32_t gte_geometry_correction_hits(void);
+/* Lookup census: attempted, hit, and the two miss classes. The position table
+ * is exact, so miss_unrecorded counts genuine tracking-coverage gaps. */
+extern void     gte_geometry_correction_stats(uint32_t *lookups, uint32_t *hits,
+                                              uint32_t *miss_unrecorded,
+                                              uint32_t *miss_ambiguous);
+/* Same position-cache lookup without changing geometry-correction counters;
+ * reserved for non-rendering probes that inspect a vertex before drawing. */
+extern int      gte_geometry_correction_lookup_probe(uint32_t packed,
+                                                      int32_t *x16,
+                                                      int32_t *y16);
+
+/* Exact NCLIP audit coverage: precise = all three SXY shadows are coherent and
+ * word-validated; fallback = native integer-only; disagreements counts cases
+ * where sub-pixel and guest-visible integer signs differ. MAC0 stays native. */
+extern void     gte_nclip_precise_stats(uint64_t *hits, uint64_t *fallbacks,
+                                        uint64_t *disagreements);
+extern int      gte_nclip_native_wide_sign(int32_t native_mac0, int* sign);
+extern int      gte_nclip_native_wide_previous_sign(int32_t native_mac0, int* sign);
+extern int psx_ws_nclip_branch(uint32_t pc, uint32_t instr, int32_t mac0, int vanilla);
+/* Title-scoped widescreen cull consumer ([widescreen.cull] nclip_exact_sites).
+ * Returns the sign (-1/0/1) the branch at `pc` should test: the exact tracked
+ * NCLIP sign only when it belongs to the supplied native MAC0, otherwise the
+ * native sign. Counts per-site use (gte_nclip_stats.h). Does not change
+ * guest-visible GTE state. */
+extern int32_t  gte_nclip_exact_sign(int32_t native_mac0, uint32_t pc);
+
+/* PGXP dataflow-shadowing hook macros (PGXP_LOAD/STORE/ALU/MULDIV/COP2).
+ * The emitter writes them unconditionally; they expand to real calls only
+ * under -DPSX_PGXP=1 (the pgxp build variant) and to ((void)0) otherwise.
+ * Pulled in here so every generated translation unit sees them. */
+#include "pgxp_hooks.h"
 
 /* ============================================================================
  * Dispatch call contract (Bug D / wild-return family fix)
@@ -225,6 +296,10 @@ extern uint64_t *g_psx_bail_resolved_p;
 #define g_psx_call_bail     (*g_psx_call_bail_p)
 #define g_psx_bail_first    (*g_psx_bail_first_p)
 #define g_psx_bail_resolved (*g_psx_bail_resolved_p)
+/* The store-PC breadcrumb the emitter writes before every guest store is the
+ * runtime's, not the DLL's (ABI v24, overlay_api.h last_store_pc). */
+extern uint32_t *g_psx_last_store_pc_p;
+#define g_debug_last_store_pc (*g_psx_last_store_pc_p)
 #else
 extern int      g_psx_call_bail;
 extern uint64_t g_psx_bail_first;      /* contract violations detected      */
@@ -243,14 +318,19 @@ extern void psx_bail_record(uint32_t site_ra, uint32_t site_sp,
 /* Validate a direct call site after the callee's C return.
  * Returns 1 if the caller must `return;` immediately (bail in progress),
  * 0 if the continuation is valid.  site_ra = the call's return address,
- * site_sp = guest $sp recorded immediately before the call. */
+ * site_sp = guest $sp recorded immediately before the call.
+ *
+ * The return PC is compared in full, segment included
+ * (docs/SEGMENT_AWARE_CODE.md §5.5): site_ra is the link the call wrote, in
+ * the segment of the body that made it, and a guest returning to another
+ * segment's alias of the call site did not return to that body. The BIOS
+ * dispatch loop (full_function_emitter.cpp) applies the same rule. */
 static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
                                     uint32_t site_sp) {
     if (g_psx_call_bail) {
         /* An inner frame began a bail unwind.  Resolve here iff the guest's
          * arrival state matches this site's contract. */
-        if (((cpu->pc ^ site_ra) & 0x1FFFFFFFu) == 0 &&
-            cpu->gpr[29] == site_sp) {
+        if (cpu->pc == site_ra && cpu->gpr[29] == site_sp) {
             g_psx_call_bail = 0;
             g_psx_bail_resolved++;
             cpu->pc = 0;
@@ -258,8 +338,7 @@ static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
         }
         return 1;
     }
-    if (cpu->gpr[29] != site_sp ||
-        ((cpu->gpr[31] ^ site_ra) & 0x1FFFFFFFu) != 0) {
+    if (cpu->gpr[29] != site_sp || cpu->gpr[31] != site_ra) {
         /* First detection: the callee C-returned but the guest did not
          * return here.  $ra holds the wild jr's true destination (the
          * longjmp-return emission sets cpu->pc = $ra before returning,
@@ -284,5 +363,25 @@ static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
  * This makes the per-instruction timing API visible to EVERY generated file and
  * runtime TU that includes cpu_state.h. */
 #include "psx_cyc.h"
+
+/* Release call-entry stamp — inlined into every generated BIOS/game TU that
+ * includes this header (MotK VLC entry tax). Debug builds use the out-of-line
+ * ring path in debug_server.c. */
+#ifdef PSX_NO_DEBUG_TOOLS
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern volatile uint32_t g_psx_last_fn_entry;
+#ifdef PSX_OVERLAY_DLL_BUILD
+void debug_server_log_call_entry(uint32_t func_addr);
+#else
+static inline void debug_server_log_call_entry(uint32_t func_addr) {
+    g_psx_last_fn_entry = func_addr;
+}
+#endif
+#ifdef __cplusplus
+}
+#endif
+#endif
 
 #endif /* PSXRECOMP_CPU_STATE_H */

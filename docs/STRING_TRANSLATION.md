@@ -1,7 +1,28 @@
 # On-the-Fly String Translation / Localization for psxrecomp
 
-**Status:** SPEC (design only — no implementation yet). Reusable framework
-feature; **Tsumu Light (SLPS-02253)** is the first consumer.
+**Status:** IMPLEMENTED and wired into the runtime. Reusable framework feature;
+**Tsumu Light (SLPS-02253)** is the first consumer.
+
+> This document was left marked "SPEC (design only — no implementation yet)"
+> long after the feature shipped. It now reads as the design rationale behind
+> working code, not a proposal. Where the prose below says "will" or "should",
+> read it as describing what was built.
+
+The implementation lives in `runtime/src/text_xlate.cpp` (~970 lines) behind
+`runtime/include/text_xlate.h`:
+
+| Entry point | Role |
+|---|---|
+| `text_xlate_init(project_root, language)` | Loads `translations/*.toml` under the project root; called from `runtime/src/main.cpp` at startup |
+| `text_xlate_set_language(language)` | Re-applies the resolved language (launcher/settings selection) |
+| `text_xlate_on_dispatch(cpu, target)` | Per-dispatch capture/substitution hook |
+| `text_xlate_vram_upload(x, y, w, h)` | VRAM-upload interception path |
+| `text_xlate_debug_json(subcmd, out, cap)` | TCP debug-server introspection |
+
+Configuration is `[localization].language` (falling back to `[runtime]`), with
+`[localization].languages` driving the launcher's language dropdown; see
+`recompiler/src/config_loader.h`. Setting the language to `jp`, `off`, or empty
+disables substitution while leaving capture running.
 
 **Goal.** Let a Japanese-only PSX title be played in English (or any target
 language) by **capturing the game's source strings from memory and substituting
@@ -292,8 +313,10 @@ and is a Phase-0 deliverable.)
 
 ## 3. Framework design (PSX)
 
-Shared module, proposed location: `runtime/src/text_xlate.c` +
-`runtime/include/text_xlate.h` (peers of `fntrace.*` and `bios_hle.*`).
+Shared module, shipped at `runtime/src/text_xlate.cpp` +
+`runtime/include/text_xlate.h` (peers of `fntrace.*` and `bios_hle.*`). The
+design below was written as a proposal and is described in the future tense in
+places; it is built, so read "will" as "does".
 
 ### 3.1 The hook point — `psx_dispatch`
 
@@ -434,7 +457,7 @@ the top of `psx_dispatch_impl` **after** the BIOS-HLE hook, gated by a lock-free
   of the existing renderer/aspect/FMV/turbo keys; `settings.toml` overrides
   `game.toml`, CLI overrides both — per the project's settings precedence).
   `"jp"`/`"off"` = passthrough (no translation).
-- **RmlUi launcher:** a "Language" dropdown populated from the table's `langs`
+- **Launcher:** a "Language" dropdown populated from the table's `langs`
   list; writes the choice to `game_options.toml`. Runtime switch = reselect →
   the module reloads the active language column (no restart needed; hot-reload
   already covers table edits).
@@ -684,7 +707,11 @@ slots, and screenshot the level-select / HUD.
 - `tools/pms_build_translations.py` — decode/build/todo authoring.
 - `translations.json` — table format.
 
-**psxrecomp hook points** (`F:\Projects\psxrecomp\_wt-tsumu\psxrecomp\`):
+**psxrecomp hook points** (paths relative to this repository; they were captured
+from the since-removed `_wt-tsumu` worktree, but the files live on `master`):
+- `runtime/src/text_xlate.cpp` + `runtime/include/text_xlate.h` — the shipped
+  module: `text_xlate_init` / `_set_language` / `_on_dispatch` /
+  `_vram_upload` / `_debug_json`. Loads every `translations/*.toml`.
 - `runtime/include/fntrace.h` + `runtime/src/fntrace.c:58` — always-on dispatch
   ring (capture analogue).
 - `runtime/include/bios_hle.h:54` (`g_psx_bios_hle_hook`) + `runtime/src/bios_hle.c:297`
@@ -818,10 +845,15 @@ Attempted the LOAD-GAME unblock (skip the name grid) to reach a dynamic HUD:
   from the game's first GP0 write (frame 554), a full 554→3754 capture shows the
   HUD (screen y≈8) is **never** drawn as glyph quads or any top-region primitive;
   steady gameplay frames contain only the animated 3D scene (~8 textured `0x2C`
-  quads at screen y≥31, via BIOS DMA `0xBFC38B1C`). The HUD is composed once at
-  stage-load and thereafter only displayed. In the demo its values are static
+  quads at screen y≥31, attributed to the BIOS store `0xBFC38B1C`). The HUD is
+  composed once at stage-load and thereafter only displayed. In the demo its values are static
   (`0-5` / `∞`), so there is **no dynamic HUD draw to intercept** and no
   discriminator to capture.
+  (Later note: that attribution came from the store-PC stamp before #420, when
+  overlay stores kept a private copy of it, so it may name an older store. The
+  shell's GP0 store at ROM `0xBFC38B1C` executes at `0x80050B1C`, and since
+  segment-aware PR B that runtime PC is the stamp and the `memory.c` key;
+  SEGMENT_AWARE_CODE.md §9.)
 
 **Net:** the drawer + font-tile scheme are cracked (see above), but capturing the
 HUD label's own glyph quads (kana U,Vs + a call-context/screen-region

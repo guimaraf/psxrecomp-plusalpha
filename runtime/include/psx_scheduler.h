@@ -46,6 +46,7 @@ typedef enum {
     PSX_RUN_YIELD_TO_TCB,    /* ChangeThread / cross-thread RFE: switch to g_sched_escape.target_tcb */
     PSX_RUN_RESUME_CURRENT,  /* same-thread RFE: re-dispatch the current thread at resume_pc */
     PSX_RUN_GUEST_EXIT,      /* a guest thread legitimately ended */
+    PSX_RUN_RETURN_TO_LOBBY, /* netplay soft-exit: tear down match, keep lobby WS */
     PSX_RUN_FATAL,           /* invariant violation — fail closed, never silently continue */
 } psx_run_reason_t;
 
@@ -87,10 +88,27 @@ int psx_is_dispatchable(uint32_t pc);
 struct CPUState;
 void psx_scheduler_run(struct CPUState* cpu);
 
+/*
+ * Soft-exit netplay back to the lobby UI. Sets PSX_RUN_RETURN_TO_LOBBY and
+ * longjmps out of the scheduler when inside psx_scheduler_run; otherwise just
+ * latches the flag for the caller to observe. Safe from the netplay barrier.
+ */
+void psx_request_return_to_lobby(void);
+int  psx_return_to_lobby_requested(void);
+void psx_clear_return_to_lobby(void);
+
 /* Save-state restore: unwind to psx_scheduler_run and re-dispatch resume_pc
  * (the restored CPUState's PC). Call on the scheduler fiber at a block-leader
- * boundary, in_exception == 0. Never returns (longjmp). */
+ * boundary, in_exception == 0. Never returns (longjmp). Arms top-level
+ * resume (see below) for the first post-resume frame. */
 void psx_scheduler_resume_at(uint32_t resume_pc);
+
+/* After resume_at, dispatch is top-level — there is no abandoned mid-block
+ * native chain under the resume PC. Sentinel same-thread RFE must not publish
+ * pc=0 / "continue live chain" (that is GUEST_EXIT). Active until the first
+ * finish_frame / explicit clear. Shared by savestate, selfcheck, and RB. */
+int  psx_scheduler_top_level_resume_active(void);
+void psx_scheduler_top_level_resume_clear(void);
 
 /* HLE-tier standing subsystem replacement (CLAUDE.md §0 amendments
  * 2026-06-29 + 2026-07-02). 1 = deterministic TCB scheduler (default, both

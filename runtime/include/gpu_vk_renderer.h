@@ -45,13 +45,14 @@ void vk_renderer_present_blank(void);
  * server, 24-bit present). No-op when the Vulkan path is inactive. */
 void vk_renderer_sync_cpu(void);
 
-/* Set the present mode: 1=FIFO (vsync), 0=IMMEDIATE (lowest latency, may tear),
- * -1=MAILBOX (low-latency, tear-free).  Applied on the next swapchain (re)build;
- * unsupported modes fall back to FIFO (always available). */
-void vk_renderer_set_present_mode(int mode);
+/* After savestate restore: push CPU VRAM into the Vulkan image (see GL twin). */
+void vk_renderer_restage_vram_after_savestate(void);
 
-/* Upload an opaque RGBA8 bezel once; only drawn in 16:9 fullscreen. */
-int vk_renderer_set_bezel(const unsigned char *rgba, int w, int h);
+/* Set the present policy: 1=tear-free, 0=IMMEDIATE (lowest latency, may tear),
+ * -1=MAILBOX. Tear-free prefers MAILBOX because the frontend already paces
+ * frames; unsupported modes fall back to FIFO (always available). */
+void vk_renderer_set_present_mode(int mode);
+void vk_renderer_set_display_aspect(int num, int den);
 
 #ifdef __cplusplus
 }

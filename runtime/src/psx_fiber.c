@@ -3,7 +3,7 @@
  */
 #include "psx_fiber.h"
 
-#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
+#if defined(_WIN32)
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -33,41 +33,6 @@ psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg
 
 void psx_fiber_switch(psx_fiber_t target) { SwitchToFiber((LPVOID)target); }
 void psx_fiber_destroy(psx_fiber_t fiber) { if (fiber) DeleteFiber((LPVOID)fiber); }
-
-#elif defined(_WIN32) && defined(WINAPI_FAMILY) && WINAPI_FAMILY == WINAPI_FAMILY_APP
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
-psx_fiber_t psx_fiber_convert_thread(void)
-{
-    void* fiber = ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
-    if (!fiber && GetLastError() == ERROR_ALREADY_FIBER)
-        fiber = GetCurrentFiber();
-    return (psx_fiber_t)fiber;
-}
-
-psx_fiber_t psx_fiber_current(void)
-{
-    return (psx_fiber_t)GetCurrentFiber();
-}
-
-psx_fiber_t psx_fiber_create(size_t stack_size, psx_fiber_entry entry, void* arg)
-{
-    return (psx_fiber_t)CreateFiberEx((SIZE_T)stack_size, 0,
-                                     FIBER_FLAG_FLOAT_SWITCH,
-                                     (LPFIBER_START_ROUTINE)entry, arg);
-}
-
-void psx_fiber_switch(psx_fiber_t target)
-{
-    if (target) SwitchToFiber((LPVOID)target);
-}
-
-void psx_fiber_destroy(psx_fiber_t fiber)
-{
-    if (fiber) DeleteFiber((LPVOID)fiber);
-}
 
 #else /* POSIX: ucontext */
 

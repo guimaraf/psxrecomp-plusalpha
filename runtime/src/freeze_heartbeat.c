@@ -1,9 +1,13 @@
 /* freeze_heartbeat.c — see header for rationale. */
 
+#include "mdec.h"   /* mdec_recently_active: FMV parks the guest in BIOS MDEC code */
+#include "psx_memory.h"
 #include "freeze_heartbeat.h"
+#include "freeze_dump_policy.h"
 #include "debug_server.h"
 #include "crash_trace.h"   /* g_psx_fatal_reason */
 #include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
+#include "starvation_ring.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -12,9 +16,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#if !defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP
 #include <dbghelp.h>
-#endif
 #endif
 
 /* State accessors. All defined in other compilation units; declared here
@@ -72,6 +74,7 @@ extern int      g_present_vsync_disabled;
  * debug_cpu_ptr (CPUState*) is declared in debug_server.h; CPUState layout
  * (gpr[32], pc) in cpu_state.h — both already included above. */
 extern uint8_t *memory_get_scratchpad_ptr(void);   /* memory.c */
+extern uint8_t *g_psx_ram;                         /* memory.c — 2 MiB DRAM */
 
 static int s_started = 0;
 static char s_backend[32] = "psx-runtime";
@@ -165,18 +168,23 @@ static HbRingEntry s_ring[RING_CAP];
 static uint32_t    s_ring_head = 0;
 static uint32_t    s_ring_count = 0;
 
-/* Wedge detection state.
- *   s_dump_armed - 1 if a wedge dump is allowed to fire; cleared after
- *                  firing, re-armed when the wedge clears (healthy tick). */
-static int      s_dump_armed = 1;
+/* Automatic full dumps are bounded independently from deliberate fatal dumps.
+ * The heartbeat JSON reports both written and suppressed event counts. */
+static FreezeDumpPolicy s_dump_policy = {0};
 static uint32_t s_last_wedge_kind = 0;  /* informational, last detected kind */
+static volatile int s_wedge_classification_paused = 0;
 
-#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
+void freeze_heartbeat_set_paused(int paused) {
+    s_wedge_classification_paused = paused ? 1 : 0;
+}
+
+#ifdef _WIN32
 /* Capture the main thread's call stack at the moment of a hard freeze.
  *
  * Called from the heartbeat thread when wedge_kind==1 (frame_count not
- * advancing). Suspends the main thread, walks its stack via StackWalk64,
- * symbolizes via SymFromAddr, then resumes. Each frame becomes a JSON
+ * advancing). Suspends the main thread, walks its PE unwind tables (x86
+ * falls back to StackWalk64), then
+ * resumes before symbol lookup and JSON output. Each frame becomes a JSON
  * object {addr, symbol?, displacement?, module?}.
  *
  * Best-effort: if DbgHelp init fails, dump an empty array and continue. */
@@ -187,15 +195,13 @@ static void freeze_dump_main_stack_json(FILE *f) {
      * must not walk the main thread — SuspendThread(self) parks forever. */
     if (GetCurrentThreadId() == s_main_thread_id) { fputs("[]", f); return; }
 
+#if !defined(_M_X64) && !defined(__x86_64__)
     if (!s_sym_initialized) {
         SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-        if (SymInitialize(GetCurrentProcess(), NULL, TRUE)) {
-            s_sym_initialized = 1;
-        } else {
-            fputs("[]", f);
-            return;
-        }
+        s_sym_initialized = SymInitialize(GetCurrentProcess(), NULL, TRUE) != FALSE;
+        if (!s_sym_initialized) { fputs("[]", f); return; }
     }
+#endif
 
     DWORD susp_count = SuspendThread(s_main_thread);
     if (susp_count == (DWORD)-1) { fputs("[]", f); return; }
@@ -204,27 +210,70 @@ static void freeze_dump_main_stack_json(FILE *f) {
     memset(&ctx, 0, sizeof(ctx));
     ctx.ContextFlags = CONTEXT_FULL;
     if (!GetThreadContext(s_main_thread, &ctx)) {
+        starvation_watchdog_heartbeat();
         ResumeThread(s_main_thread);
         fputs("[]", f);
         return;
     }
 
+#if !defined(_M_X64) && !defined(__x86_64__)
     STACKFRAME64 frame;
     memset(&frame, 0, sizeof(frame));
-#if defined(_M_X64) || defined(__x86_64__)
-    DWORD machine = IMAGE_FILE_MACHINE_AMD64;
-    frame.AddrPC.Offset = ctx.Rip;
-    frame.AddrFrame.Offset = ctx.Rbp;
-    frame.AddrStack.Offset = ctx.Rsp;
-#else
     DWORD machine = IMAGE_FILE_MACHINE_I386;
     frame.AddrPC.Offset = ctx.Eip;
     frame.AddrFrame.Offset = ctx.Ebp;
     frame.AddrStack.Offset = ctx.Esp;
-#endif
     frame.AddrPC.Mode = AddrModeFlat;
     frame.AddrFrame.Mode = AddrModeFlat;
     frame.AddrStack.Mode = AddrModeFlat;
+#endif
+
+    DWORD64 addresses[128];
+    unsigned count = 0;
+#if defined(_M_X64) || defined(__x86_64__)
+    /* PE unwind tables avoid DbgHelp's deferred symbol loading while the
+     * game is stopped. That loading can take seconds for large AOT builds. */
+    for (; count < 128 && ctx.Rip; count++) {
+        MEMORY_BASIC_INFORMATION stack_page;
+        if (!VirtualQuery((const void *)(uintptr_t)ctx.Rsp, &stack_page,
+                          sizeof(stack_page)) || stack_page.State != MEM_COMMIT ||
+            (stack_page.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+            ctx.Rsp + sizeof(DWORD64) >
+                (DWORD64)(uintptr_t)stack_page.BaseAddress + stack_page.RegionSize)
+            break;
+        addresses[count] = ctx.Rip;
+        DWORD64 base = 0, previous_sp = ctx.Rsp;
+        PRUNTIME_FUNCTION unwind = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+        if (unwind) {
+            void *handler_data = NULL;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, unwind, &ctx,
+                             &handler_data, &establisher, NULL);
+        } else {
+            ctx.Rip = *(const DWORD64 *)(uintptr_t)ctx.Rsp;
+            ctx.Rsp += sizeof(DWORD64);
+        }
+        if (ctx.Rsp <= previous_sp) { count++; break; }
+    }
+#else
+    for (; count < 128; count++) {
+        if (!StackWalk64(machine, GetCurrentProcess(), s_main_thread, &frame,
+                         &ctx, NULL, SymFunctionTableAccess64, SymGetModuleBase64,
+                         NULL) || !frame.AddrPC.Offset) break;
+        addresses[count] = frame.AddrPC.Offset;
+    }
+#endif
+    /* Diagnostic suspension is deliberate host work, not guest starvation.
+     * Refresh before resuming so a slow DbgHelp walk cannot manufacture a
+     * watchdog exit in the first cycle charge after the game wakes. A real
+     * guest stall remains subject to the ordinary deadline after resumption. */
+    starvation_watchdog_heartbeat();
+    ResumeThread(s_main_thread);
+
+    if (!s_sym_initialized) {
+        SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        s_sym_initialized = SymInitialize(GetCurrentProcess(), NULL, TRUE) != FALSE;
+    }
 
     fputc('[', f);
     int first = 1;
@@ -234,27 +283,23 @@ static void freeze_dump_main_stack_json(FILE *f) {
     } sym_storage;
     SYMBOL_INFO *sym = &sym_storage.si;
 
-    for (int depth = 0; depth < 128; depth++) {
-        if (!StackWalk64(machine, GetCurrentProcess(), s_main_thread, &frame,
-                         &ctx, NULL, SymFunctionTableAccess64, SymGetModuleBase64,
-                         NULL)) {
-            break;
-        }
-        DWORD64 addr = frame.AddrPC.Offset;
-        if (!addr) break;
+    for (unsigned depth = 0; depth < count; depth++) {
+        DWORD64 addr = addresses[depth];
 
         memset(sym, 0, sizeof(SYMBOL_INFO));
         sym->SizeOfStruct = sizeof(SYMBOL_INFO);
         sym->MaxNameLen   = 511;
         DWORD64 displacement = 0;
-        BOOL got_sym = SymFromAddr(GetCurrentProcess(), addr, &displacement, sym);
+        BOOL got_sym = s_sym_initialized &&
+            SymFromAddr(GetCurrentProcess(), addr, &displacement, sym);
 
         IMAGEHLP_MODULE64 mod;
         memset(&mod, 0, sizeof(mod));
         mod.SizeOfStruct = sizeof(mod);
-        BOOL got_mod = SymGetModuleInfo64(GetCurrentProcess(), addr, &mod);
+        BOOL got_mod = s_sym_initialized &&
+            SymGetModuleInfo64(GetCurrentProcess(), addr, &mod);
 
-        fprintf(f, "%s{\"depth\":%d,\"addr\":\"0x%016llX\"",
+        fprintf(f, "%s{\"depth\":%u,\"addr\":\"0x%016llX\"",
                 first ? "" : ",", depth, (unsigned long long)addr);
         if (got_sym) {
             /* Escape JSON-special chars in symbol name (best-effort: bracket replace). */
@@ -285,7 +330,6 @@ static void freeze_dump_main_stack_json(FILE *f) {
     }
     fputc(']', f);
 
-    ResumeThread(s_main_thread);
 }
 
 /* Multi-sample stack capture for still-running wedges (wedge_kind 2 and 3).
@@ -315,6 +359,70 @@ static void freeze_dump_main_stack_samples_json(FILE *f, int n) {
  * main thread mid-dump (2026-06-10 chest-freeze postmortem). First dump
  * in wins; the loser skips (same rings either way). */
 static volatile long s_dump_in_progress = 0;
+static uint32_t s_dump_sequence = 0;  /* protected by s_dump_in_progress */
+
+static void freeze_dump_unlock(void) {
+#ifdef _WIN32
+    InterlockedExchange((volatile LONG *)&s_dump_in_progress, 0);
+#else
+    __sync_lock_release(&s_dump_in_progress);
+#endif
+}
+
+/* Guest DRAM or scratchpad bytes at `vaddr`, as a JSON object. No MMIO.
+ * 2 MiB RAM is mirrored across the first 8 MiB of each KSEG. */
+static int hb_append_ram_peek(char *out, int n, size_t cap, uint32_t vaddr, int len) {
+    static const char hexd[] = "0123456789abcdef";
+    uint32_t phys = vaddr & 0x1FFFFFFFu;
+    const uint8_t *src = NULL;
+    int ncopy = len;
+    if (ncopy < 0) ncopy = 0;
+    if (phys >= 0x1F800000u && phys < 0x1F800400u) {
+        uint8_t *sp = memory_get_scratchpad_ptr();
+        if (sp) {
+            uint32_t off = phys - 0x1F800000u;
+            src = sp + off;
+            if (off + (uint32_t)ncopy > 0x400u)
+                ncopy = (int)(0x400u - off);
+        }
+    } else if (phys < 0x00800000u && g_psx_ram) {
+        uint32_t folded = psx_ram_canonical_offset(phys);
+        src = g_psx_ram + folded;
+        if (folded + (uint32_t)ncopy > psx_ram_live_bytes())
+            ncopy = (int)(psx_ram_live_bytes() - folded);
+    }
+    if (!src) ncopy = 0;
+    int m = snprintf(out + n, cap - (size_t)n,
+                     "{\"addr\":\"0x%08X\",\"len\":%d,\"hex\":\"",
+                     vaddr, ncopy);
+    if (m > 0) n += m;
+    for (int i = 0; i < ncopy && (size_t)(n + 3) < cap; i++) {
+        out[n++] = hexd[(src[i] >> 4) & 0xF];
+        out[n++] = hexd[src[i] & 0xF];
+    }
+    if ((size_t)(n + 2) < cap) { out[n++] = '"'; out[n++] = '}'; }
+    return n;
+}
+
+/* If the insn at $ra-8 is j/jal, return its target (live RAM, not AOT). */
+static uint32_t hb_jal_target_from_ra(uint32_t ra) {
+    uint32_t pc, phys, insn, op;
+    const uint8_t *src = NULL;
+    if (ra < 8u) return 0;
+    pc = (ra - 8u) & ~3u;
+    phys = pc & 0x1FFFFFFFu;
+    if (phys >= 0x1F800000u && phys + 4u <= 0x1F800400u) {
+        uint8_t *sp = memory_get_scratchpad_ptr();
+        if (sp) src = sp + (phys - 0x1F800000u);
+    } else if (phys < 0x00800000u && g_psx_ram) {
+        src = g_psx_ram + psx_ram_canonical_offset(phys);
+    }
+    if (!src) return 0;
+    memcpy(&insn, src, 4);
+    op = (insn >> 26) & 0x3Fu;
+    if (op != 2u && op != 3u) return 0; /* j / jal */
+    return (pc & 0xF0000000u) | ((insn & 0x03FFFFFFu) << 2);
+}
 
 /* Format the CPU register file (pc + all 32 GPRs) and the full 1 KB
  * scratchpad as JSON into `out`. Returns bytes written (NUL-terminated,
@@ -330,12 +438,25 @@ static volatile long s_dump_in_progress = 0;
  * the BIOS A0/B0/C0 function index while the guest is parked in a kernel-call
  * poll — i.e. "which B0 function is it waiting on" with no extra plumbing.
  * Emitting the GPRs in the same shape as psx_last_run_report.json's "cpu"
- * means existing analysis tooling reads it unchanged. */
+ * means existing analysis tooling reads it unchanged. COP0 sr/cause/epc
+ * (plus IEc / IM2) are required to tell a VSync wait from a stuck IRQ
+ * gate — R3000A has no EXL; IEc=0 is "cannot take VBlank". */
 static int hb_format_cpu_scratchpad(char *out, size_t cap) {
     if (cap < 64) { if (cap) out[0] = 0; return 0; }
     const CPUState *cpu = debug_cpu_ptr;
-    int n = snprintf(out, cap, "  \"cpu\":{\"pc\":\"0x%08X\",\"gpr\":[",
-                     cpu ? cpu->pc : 0u);
+    uint32_t sr = cpu ? cpu->cop0[12] : 0u;
+    int n = snprintf(out, cap,
+                     "  \"cpu\":{\"pc\":\"0x%08X\",\"hi\":\"0x%08X\",\"lo\":\"0x%08X\","
+                     "\"sr\":\"0x%08X\",\"cause\":\"0x%08X\",\"epc\":\"0x%08X\","
+                     "\"iec\":%u,\"im2\":%u,\"gpr\":[",
+                     cpu ? cpu->pc : 0u,
+                     cpu ? cpu->hi : 0u,
+                     cpu ? cpu->lo : 0u,
+                     sr,
+                     cpu ? cpu->cop0[13] : 0u,
+                     cpu ? cpu->cop0[14] : 0u,
+                     (sr & 1u) ? 1u : 0u,
+                     (sr & (1u << 10)) ? 1u : 0u);
     for (int i = 0; i < 32 && n > 0 && (size_t)n < cap; i++) {
         int m = snprintf(out + n, cap - (size_t)n, "%s\"0x%08X\"",
                          i ? "," : "", cpu ? cpu->gpr[i] : 0u);
@@ -355,18 +476,42 @@ static int hb_format_cpu_scratchpad(char *out, size_t cap) {
         }
     }
     if ((size_t)(n + 2) < cap) out[n++] = '"';
+
+    /* DRAM slices: $ra-32 (jalr at ra-8), $s0-16, j/jal target, overlay page. */
+    {
+        uint32_t ra = cpu ? (cpu->gpr[31] & ~3u) : 0u;
+        uint32_t s0 = cpu ? (cpu->gpr[16] & ~3u) : 0u;
+        uint32_t ra_peek = (ra >= 32u) ? (ra - 32u) : ra;
+        uint32_t s0_peek = (s0 >= 16u) ? (s0 - 16u) : s0;
+        uint32_t jal_tgt = hb_jal_target_from_ra(ra);
+        int m = snprintf(out + n, cap - (size_t)n,
+                         ",\n  \"ram_peeks\":{\"ra\":");
+        if (m > 0) n += m;
+        n = hb_append_ram_peek(out, n, cap, ra_peek, 64);
+        m = snprintf(out + n, cap - (size_t)n, ",\"s0\":");
+        if (m > 0) n += m;
+        n = hb_append_ram_peek(out, n, cap, s0_peek, 48);
+        m = snprintf(out + n, cap - (size_t)n, ",\"jal_target\":");
+        if (m > 0) n += m;
+        n = hb_append_ram_peek(out, n, cap, jal_tgt, jal_tgt ? 64 : 0);
+        m = snprintf(out + n, cap - (size_t)n, ",\"overlay_80165000\":");
+        if (m > 0) n += m;
+        n = hb_append_ram_peek(out, n, cap, 0x80165000u, 64);
+        if ((size_t)(n + 2) < cap) out[n++] = '}';
+    }
+
     out[n] = 0;
     return n;
 }
 
-static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
-                              uint64_t exc_reentry, uint32_t cur_fn,
-                              uint32_t last_store, uint32_t i_stat_v,
-                              uint32_t i_mask_v, int in_exc,
-                              uint64_t total_checks, uint32_t dispatch_count,
-                              uint64_t exc_entries,
-                              uint16_t sio_stat_v, uint16_t sio_ctrl_v,
-                              int sio_card_active, int mc_max, int tx_writes)
+static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
+                             uint64_t exc_reentry, uint32_t cur_fn,
+                             uint32_t last_store, uint32_t i_stat_v,
+                             uint32_t i_mask_v, int in_exc,
+                             uint64_t total_checks, uint32_t dispatch_count,
+                             uint64_t exc_entries,
+                             uint16_t sio_stat_v, uint16_t sio_ctrl_v,
+                             int sio_card_active, int mc_max, int tx_writes)
 {
     /* Snapshot the kind at entry — the global can be flipped mid-write by
      * the other thread, which is what sent the fatal (kind 4) path into
@@ -375,18 +520,21 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
 
 #ifdef _WIN32
     if (InterlockedCompareExchange((volatile LONG *)&s_dump_in_progress, 1, 0) != 0)
-        return;
+        return 0;
 #else
     if (__sync_lock_test_and_set(&s_dump_in_progress, 1) != 0)
-        return;
+        return 0;
 #endif
 
     char path[128];
-    snprintf(path, sizeof(path),
-             "psx_freeze_dump_%s_%lld.json", s_backend, wall);
+    uint32_t sequence = s_dump_sequence++;
+    if (!freeze_dump_format_path(path, sizeof(path), s_backend, wall, sequence)) {
+        freeze_dump_unlock();
+        return 0;
+    }
 
     FILE *f = fopen(path, "wb");
-    if (!f) { s_dump_in_progress = 0; return; }
+    if (!f) { freeze_dump_unlock(); return 0; }
 
     /* Large stdio buffer so multi-MB JSON arrays write efficiently. */
     static char io_buf[1 << 16];
@@ -526,7 +674,7 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     debug_server_freeze_dump_dirty_block_json(f, DUMP_CAP_DIRTY_BLOCK);
     fputs(",\n", f);
 
-#if defined(_WIN32) && (!defined(WINAPI_FAMILY) || WINAPI_FAMILY != WINAPI_FAMILY_APP)
+#ifdef _WIN32
     /* Main-thread call stack. Hard freeze (wedge_kind==1): one snapshot of the
      * wedged thread in `main_stack`. Still-running wedges (kind 2 reentry
      * storm, kind 3 slow frames): a single frame is noise — take multiple
@@ -550,7 +698,7 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
 #endif
 
     {
-        static char cs_buf[4096];
+        static char cs_buf[6144];
         hb_format_cpu_scratchpad(cs_buf, sizeof(cs_buf));
         fputs(",\n", f);
         fputs(cs_buf, f);
@@ -558,7 +706,11 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     }
 
     fputs("}\n", f);
-    fclose(f);
+    int written = !ferror(f);
+    if (fclose(f) != 0) written = 0;
+    if (!written) (void)remove(path);
+    freeze_dump_unlock();
+    return written;
 }
 
 /* Full ring dump for deliberate fatal sites (psx_fatal_halt). Runs ON the
@@ -594,14 +746,13 @@ void freeze_heartbeat_fatal_dump(const char *reason) {
                         &sio_stat, &sio_ctrl, &card_active);
 
     s_last_wedge_kind = 4;
-    s_dump_armed = 0;  /* the watchdog must not overwrite the fatal dump */
-    freeze_dump_write((long long)time(NULL), s_frame_count,
-                      psx_get_cycle_count(), exc_reentry,
-                      g_debug_current_func_addr, g_debug_last_store_pc,
-                      i_stat, i_mask, in_exc, total_checks,
-                      dispatch_count, exc_entries,
-                      sio_stat, sio_ctrl, card_active,
-                      sio_get_mc_max_state(), sio_get_tx_writes());
+    (void)freeze_dump_write((long long)time(NULL), s_frame_count,
+                            psx_get_cycle_count(), exc_reentry,
+                            g_debug_current_func_addr, g_debug_last_store_pc,
+                            i_stat, i_mask, in_exc, total_checks,
+                            dispatch_count, exc_entries,
+                            sio_stat, sio_ctrl, card_active,
+                            sio_get_mc_max_state(), sio_get_tx_writes());
 }
 
 static void heartbeat_write(void) {
@@ -657,17 +808,21 @@ static void heartbeat_write(void) {
     s_ring_head = (s_ring_head + 1) % RING_CAP;
     if (s_ring_count < RING_CAP) s_ring_count++;
 
-    /* ---- Wedge detection: arm-once auto-dump ----
+    /* ---- Wedge detection: bounded automatic dump ----
      * Walk back WEDGE_WINDOW_TICKS in the heartbeat ring (just pushed
      * above) and compute deltas. Trigger if any of:
      *   A. frame_count delta == 0                  (hard freeze)
      *   B. exc_reentry delta PER FRAME > threshold (reentry storm)
      *   C. frame_count delta < slow-frames floor   (host-side stall)
      *
-     * Only fires once the ring has enough history. When the wedge clears
-     * (a healthy tick), re-arm. */
+     * Only fires once the ring has enough history. The dump policy requires
+     * a sustained healthy interval before it accepts a new event, and bounds
+     * automatic full dumps for the process. Deliberate fatal dumps bypass it. */
     uint32_t wedge_kind = 0;  /* 0=healthy 1=hard 2=reentry storm 3=slow frames */
-    if (s_ring_count >= WEDGE_WINDOW_TICKS) {
+    if (s_wedge_classification_paused) {
+        s_ring_count = 0;
+        s_last_wedge_kind = 0;
+    } else if (s_ring_count >= WEDGE_WINDOW_TICKS) {
         /* The just-pushed tick is at (s_ring_head - 1). The oldest in
          * our window is WEDGE_WINDOW_TICKS - 1 ticks before it. */
         uint32_t newest_idx = (s_ring_head + RING_CAP - 1u) % RING_CAP;
@@ -699,23 +854,24 @@ static void heartbeat_write(void) {
             wedge_kind = 2;
         else if (frame_delta < WEDGE_SLOW_FRAMES_MAX_DELTA)
             wedge_kind = 3;
-        else if (logic_pinned)
+        else if (logic_pinned && !mdec_recently_active((uint32_t)frame_delta + 1u))
             wedge_kind = 5;  /* spin freeze: game wedged while frames advance */
+        /* Wave-5 F9: during an FMV the guest parks in BIOS MDEC code with the dirty-RAM
+         * counters legitimately still while frames advance -- exactly the spin signature.
+         * Every boot FMV wrote a 47-76 MB dump (1.8 GB per kit in one session). MDEC
+         * activity inside the window rules the spin classification out. */
     }
 
-    if (wedge_kind != 0) {
-        if (s_dump_armed) {
-            s_dump_armed = 0;
-            s_last_wedge_kind = wedge_kind;
-            freeze_dump_write(wall, frame, cyc, exc_reentry, cur_fn, last_store,
-                              i_stat, i_mask, in_exc, total_checks,
-                              dispatch_count, exc_entries,
-                              sio_stat, sio_ctrl, card_active,
-                              mc_max, tx_writes);
-        }
-    } else {
-        /* Healthy tick: re-arm for the next wedge. */
-        s_dump_armed = 1;
+    if (!s_wedge_classification_paused &&
+        freeze_dump_policy_observe(&s_dump_policy, wedge_kind,
+                                   g_psx_fatal_reason != NULL)) {
+        s_last_wedge_kind = wedge_kind;
+        int written = freeze_dump_write(
+            wall, frame, cyc, exc_reentry, cur_fn, last_store,
+            i_stat, i_mask, in_exc, total_checks,
+            dispatch_count, exc_entries,
+            sio_stat, sio_ctrl, card_active, mc_max, tx_writes);
+        freeze_dump_policy_record_result(&s_dump_policy, written);
     }
 
     /* Timer1/RootCounter1 decode (Tomba 2 RCnt-wait diagnosis): if the game
@@ -732,6 +888,26 @@ static void heartbeat_write(void) {
     uint32_t bl_site_ra = 0, bl_wild = 0, bl_ssp = 0, bl_gsp = 0, bl_uniq = 0;
     uint64_t bl_count = 0;
     psx_bail_ledger_top(&bl_site_ra, &bl_wild, &bl_ssp, &bl_gsp, &bl_count, &bl_uniq);
+
+    /* FAIL-FAST reasons contain raw newlines; unescaped they break this JSON
+     * (psx_freeze_heartbeat.json.tmp was invalid on the TM4 jalr dumps). */
+    char fatal_esc[384];
+    fatal_esc[0] = 0;
+    if (g_psx_fatal_reason) {
+        size_t w = 0;
+        for (const char *p = g_psx_fatal_reason; *p && w + 2 < sizeof(fatal_esc); p++) {
+            unsigned char ch = (unsigned char)*p;
+            if (ch == '\\' || ch == '"') {
+                fatal_esc[w++] = '\\';
+                fatal_esc[w++] = (char)ch;
+            } else if (ch >= 0x20) {
+                fatal_esc[w++] = (char)ch;
+            } else {
+                fatal_esc[w++] = ' ';
+            }
+        }
+        fatal_esc[w] = 0;
+    }
 
     /* Buffer sized for current-state JSON + ring (~256B per ring entry). */
     static char buf[64 * 1024];
@@ -795,6 +971,10 @@ static void heartbeat_write(void) {
         "  \"bail_resolved\":%llu,\n"
         "  \"bail_flattened\":%llu,\n"
         "  \"bail_anomaly\":%llu,\n"
+        "  \"automatic_freeze_dumps\":%u,\n"
+        "  \"failed_freeze_dumps\":%u,\n"
+        "  \"suppressed_freeze_events\":%u,\n"
+        "  \"automatic_freeze_dump_limit\":%u,\n"
         "  \"fatal\":%s%s%s\n"
         "}\n",
         s_backend,
@@ -854,8 +1034,12 @@ static void heartbeat_write(void) {
         (unsigned long long)g_psx_bail_resolved,
         (unsigned long long)g_psx_bail_flattened,
         (unsigned long long)g_psx_bail_anomaly,
+        s_dump_policy.automatic_dumps,
+        s_dump_policy.failed_dumps,
+        s_dump_policy.suppressed_events,
+        (unsigned)FREEZE_DUMP_AUTO_LIMIT,
         g_psx_fatal_reason ? "\"" : "",
-        g_psx_fatal_reason ? g_psx_fatal_reason : "null",
+        g_psx_fatal_reason ? fatal_esc : "null",
         g_psx_fatal_reason ? "\"" : "");
 
     if (n <= 0 || n >= (int)sizeof(buf)) return;

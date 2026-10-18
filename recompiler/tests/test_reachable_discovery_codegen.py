@@ -6,6 +6,7 @@ Usage: python test_reachable_discovery_codegen.py \
 """
 import argparse
 import os
+import pathlib
 import struct
 import subprocess
 import sys
@@ -34,8 +35,6 @@ def make_psxexe():
         jal(LOAD + 0x100), 0,              # reachable direct call
         0x0320F809, 0,                     # unresolved jalr $ra,$t9
         jal(LOAD + 0x1100), 0,             # outside configured bound
-        jal(LOAD + 0x300), 0,              # prologue-free direct-call thunk
-        jal(LOAD + 0x304), 0,              # overlapping target inside thunk
         0x03E00008, 0,
     ]
     for i, word in enumerate(root):
@@ -43,32 +42,17 @@ def make_psxexe():
     for offset in (0x100, 0x200, 0x1100):
         for i, word in enumerate((0x27BDFFF0, 0x03E00008, 0x27BD0010)):
             put32(text, offset + i * 4, word)
-    for i, word in enumerate((0x240A00B0, 0x01400008, 0x24090010)):
+    # Valid primary opcodes with unsupported COP0 memory transfers followed by
+    # a return: discovery admits the entry, then production emission correctly
+    # demotes the >=50%-untranslatable body to a fail-closed data stub.
+    # Undefined SPECIAL words are now intentionally emitted as compatible
+    # no-ops, so they no longer exercise the untranslatable-data guard.
+    for i, word in enumerate((
+            0x27BDFFF0,
+            0xC0000000, 0xC0000000, 0xC0000000, 0xC0000000, 0xC0000000,
+            jal(LOAD + 0x100), 0,
+            0x03E00008, 0x27BD0010)):
         put32(text, 0x300 + i * 4, word)
-
-    # Explicit frameless leaf with one alignment NOP after the preceding
-    # function's return delay slot. Reachable mode must accept this seed.
-    for offset, word in (
-            (0x3F4, 0x03E00008), (0x3F8, 0x24840001),
-            (0x3FC, 0x00000000), (0x400, 0x8C880000),
-            (0x404, 0x03E00008), (0x408, 0x00000000)):
-        put32(text, offset, word)
-
-    # A non-NOP gap is not alignment and must fail closed.
-    for offset, word in (
-            (0x4F4, 0x03E00008), (0x4F8, 0x00000000),
-            (0x4FC, 0x24020001), (0x500, 0x8C880000),
-            (0x504, 0x03E00008), (0x508, 0x00000000)):
-        put32(text, offset, word)
-
-    # Four NOPs exceed the bounded alignment heuristic.
-    for offset, word in (
-            (0x5E8, 0x03E00008), (0x5EC, 0x00000000),
-            (0x5F0, 0x00000000), (0x5F4, 0x00000000),
-            (0x5F8, 0x00000000), (0x5FC, 0x00000000),
-            (0x600, 0x8C880000), (0x604, 0x03E00008),
-            (0x608, 0x00000000)):
-        put32(text, offset, word)
     return bytes(header + text)
 
 
@@ -114,12 +98,12 @@ def main():
         with open(exe, "wb") as f:
             f.write(make_psxexe())
         with open(seeds, "w", encoding="utf-8") as f:
-            f.write(
-                "0x80010000\n"
-                "0x80010400\n"
-                "0x80010500\n"
-                "0x80010600\n"
-            )
+            # 0x80010300 is the deliberately untranslatable fixture above. It
+            # is retained as a fail-closed psx_unknown_dispatch stub for
+            # diagnostics, but must not be advertised as a callable native
+            # entry: runtime overlays can replace the same address and
+            # coincidentally share a short instruction such as NOP.
+            f.write("0x80010000\n0x80010300\n")
 
         write_config(config)
         result = run(args.recompiler, config)
@@ -127,11 +111,17 @@ def main():
         if result.returncode != 0:
             failures.append(f"reachable recompile failed:\n{output}")
         else:
-            full_path = os.path.join(tmp, "generated", "test.exe_full.c")
+            full_paths = sorted(path for path in
+                                pathlib.Path(tmp, "generated").glob("test.exe_full*.c")
+                                if "_dispatch" not in path.name)
             dispatch_path = os.path.join(
                 tmp, "generated", "test.exe_dispatch.c")
-            with open(full_path, encoding="utf-8") as f:
-                full = f.read()
+            if not full_paths:
+                failures.append("reachable recompile emitted no _full*.c shards")
+                full = ""
+            else:
+                full = "\n".join(path.read_text(encoding="utf-8")
+                                   for path in full_paths)
             with open(dispatch_path, encoding="utf-8") as f:
                 dispatch = f.read()
 
@@ -139,24 +129,22 @@ def main():
                 failures.append("main EXE entry was not emitted")
             if "void func_80010100" not in full:
                 failures.append("reachable direct-JAL target was not emitted")
-            if "void func_80010300" not in full:
-                failures.append("prologue-free direct-JAL gap target was not emitted")
-            if "void func_80010400" not in full:
-                failures.append("aligned frameless explicit seed was not emitted")
-            if "void func_80010500" in full:
-                failures.append("explicit seed behind a non-NOP gap was emitted")
-            if "void func_80010600" in full:
-                failures.append("explicit seed beyond the alignment limit was emitted")
-            if "alias entry into host func_80010300" not in full:
-                failures.append("overlapping direct-JAL target truncated its host instead of aliasing")
             if "void func_80010200" in full:
                 failures.append("unseen indirect callback was emitted")
             if "void func_80011100" in full:
                 failures.append("target beyond analysis bound was emitted")
             if "phys < 0x00011000u" not in dispatch:
                 failures.append("dispatch text range did not use verified bound")
-            if "dirty_ram_text_native_ok_ranges(" not in dispatch:
+            if "dirty_ram_text_native_ok_ranges_from(" not in dispatch:
                 failures.append("exact static-range dispatch guard was lost")
+            if "uint32_t count, uint32_t exec_pc" not in dispatch:
+                failures.append("dispatch guard does not accept a continuation PC")
+            if dispatch.count("entry->range_count, addr)") != 2:
+                failures.append("dispatch guards do not validate from their resume PC")
+            if "int psx_game_text_native_ok_full(uint32_t addr)" not in dispatch:
+                failures.append("full-range straight-line handoff guard was not emitted")
+            if "dirty_ram_text_native_ok_ranges(" not in dispatch:
+                failures.append("full-range handoff guard lost exact range validation")
             if "psx_native_bad_entry(" in full:
                 failures.append("reachable main image incorrectly used overlay codegen")
             if "=== Exact-Entry Function Analysis ===" not in output:
@@ -168,6 +156,25 @@ def main():
         default_output = default_mode.stdout + default_mode.stderr
         if default_mode.returncode != 0 or "=== Function Boundary Detection ===" not in default_output:
             failures.append("omitted discovery key did not preserve whole-image default")
+        else:
+            default_full_paths = sorted(path for path in
+                                        pathlib.Path(tmp, "generated").glob("test.exe_full*.c")
+                                        if "_dispatch" not in path.name)
+            default_full = "\n".join(path.read_text(encoding="utf-8")
+                                       for path in default_full_paths)
+            default_dispatch = pathlib.Path(
+                tmp, "generated", "test.exe_dispatch.c").read_text(
+                    encoding="utf-8")
+            if "void func_80010300" not in default_full:
+                failures.append("forced data diagnostic stub was not emitted")
+            elif ("void func_80010300(CPUState* cpu)\n{\n"
+                  "    psx_unknown_dispatch(cpu, 0x80010300u, "
+                  "0x00010300u);") not in default_full:
+                failures.append("forced data entry was not fail-closed")
+            if "{0x80010300u," in default_dispatch:
+                failures.append("fail-closed data stub leaked into game dispatch")
+            if "{0x80010320u," in default_dispatch:
+                failures.append("fail-closed stub continuation leaked into game dispatch")
 
         write_config(config, discovery="invent-functions")
         invalid_mode = run(args.recompiler, config)

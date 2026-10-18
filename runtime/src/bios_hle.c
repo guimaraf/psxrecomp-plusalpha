@@ -33,6 +33,7 @@
  */
 
 #include "bios_hle.h"
+#include "psx_memory.h"
 
 #include "cpu_state.h"
 #include "psx_cycles.h"
@@ -52,10 +53,15 @@ static int s_call_hle_on     = 0;   /* service kernel calls in HLE */
 static int s_boot_skip_on    = 0;   /* one-shot shell intercept */
 static int s_shell_skipped   = 0;   /* boot skip already fired */
 
-/* SCPH1001 physical addresses. The shell is unpacked to RAM 0x30000 by
- * LoadRunShell (ROM 0xBFC06FF0: memcpy(0x80030000, 0xBFC18000, 0x67FF0)) and
- * entered via an indirect call, which always routes through the dispatcher. */
-#define PSX_SHELL_ENTRY_PHYS 0x00030000u
+/* Per-image anchors come from the LINKED recompiled BIOS itself
+ * (psx_bios_image, emitted into <stem>_dispatch.c from the BIOS profile's
+ * [recompiler.runtime_exports]). For SCPH1001 the shell is unpacked to RAM
+ * 0x30000 by LoadRunShell (ROM 0xBFC06FF0: memcpy(0x80030000, 0xBFC18000,
+ * 0x67FF0)) and entered via an indirect call, which always routes through
+ * the dispatcher. A profile that omits an anchor exports 0 = the feature is
+ * STRUCTURALLY UNAVAILABLE on that BIOS (never "address 0"): the boot skip
+ * then simply never fires, and DeliverEvent callbacks stay LLE. */
+#include "psx_bios_image.h"
 
 /* Kernel EvCB table anchors (docs/psx_bios_disasm.txt; kseg1 like the kernel
  * itself uses so reads/writes are plain RAM traffic). */
@@ -76,10 +82,10 @@ static int s_shell_skipped   = 0;   /* boot skip already fired */
 #define EVMD_CALLBACK 0x1000u
 #define EVMD_MARK     0x2000u
 
-/* DeliverEvent's callback return site in kernel RAM (the instruction after
- * the kernel loop's `jalr v0` at 0x1718) — the exact $ra an LLE delivery
- * gives the callback, reused here so the dispatch return contract matches. */
-#define KADDR_DELIVER_RET 0x80001720u
+/* DeliverEvent's callback return site (psx_bios_image.deliver_event_ret):
+ * the instruction after the kernel loop's `jalr v0` — the exact $ra an LLE
+ * delivery gives the callback, reused here so the dispatch return contract
+ * matches. 0 = unknown for this BIOS: callback delivery stays LLE. */
 
 /* ── always-on ring ──────────────────────────────────────────────────────── */
 
@@ -95,7 +101,7 @@ static void hle_record(uint32_t vector, uint32_t fn, const CPUState* cpu,
      * load-bearing for event-consumption races (MMX6 card check). */
     uint32_t pcb = cpu->read_word(0xA0000108u);
     uint32_t pcb_phys = pcb & 0x1FFFFFFFu;
-    uint32_t tcb = (pcb != 0u && pcb_phys < 0x200000u)
+    uint32_t tcb = (pcb != 0u && pcb_phys < psx_ram_live_bytes())
                        ? cpu->read_word(0xA0000000u | pcb_phys) : 0u;
     extern int psx_get_in_exception(void);
     uint8_t in_exc = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
@@ -176,7 +182,7 @@ static void hle_open_event(CPUState* cpu, uint32_t base, uint32_t n)
         cpu->write_word(ev + EV_STATUS, EVST_DISABLED);
         cpu->gpr[2] = 0xF1000000u | slot;
     }
-    psx_advance_cycles(40u + 6u * (slot == 0xFFFFFFFFu ? n : slot + 1u));
+    psx_cpu_charge(40u + 6u * (slot == 0xFFFFFFFFu ? n : slot + 1u));
 }
 
 /* CloseEvent (kernel 0x1E1C): status=free, return 1. */
@@ -185,7 +191,7 @@ static void hle_close_event(CPUState* cpu, uint32_t base)
     uint32_t ev = base + (cpu->gpr[4] & 0xFFFFu) * EVCB_STRIDE;
     cpu->write_word(ev + EV_STATUS, EVST_FREE);
     cpu->gpr[2] = 1u;
-    psx_advance_cycles(36u);
+    psx_cpu_charge(36u);
 }
 
 /* TestEvent (kernel 0x1EC8): ready => re-arm to enabled and return 1, else 0. */
@@ -198,7 +204,7 @@ static void hle_test_event(CPUState* cpu, uint32_t base)
     } else {
         cpu->gpr[2] = 0u;
     }
-    psx_advance_cycles(40u);
+    psx_cpu_charge(40u);
 }
 
 /* EnableEvent (kernel 0x1F10) / DisableEvent (kernel 0x1F4C): a non-free
@@ -210,7 +216,7 @@ static void hle_set_event_status(CPUState* cpu, uint32_t base, uint32_t status)
     if (cpu->read_word(ev + EV_STATUS) != EVST_FREE)
         cpu->write_word(ev + EV_STATUS, status);
     cpu->gpr[2] = 1u;
-    psx_advance_cycles(40u);
+    psx_cpu_charge(40u);
 }
 
 /* DeliverEvent (kernel 0x1B44): for every ENABLED EvCB matching class+spec,
@@ -230,17 +236,20 @@ static void hle_deliver_event(CPUState* cpu, uint32_t base, uint32_t n)
             cpu->write_word(ev + EV_STATUS, EVST_READY);
         } else if (mode == EVMD_CALLBACK) {
             uint32_t func = cpu->read_word(ev + EV_FUNC);
-            if (func != 0) {
+            /* deliver_event_ret == 0 never reaches here: configure() refuses
+             * call-HLE when the linked BIOS exports no anchor (dropping a
+             * callback silently wedges Ape LOAD card EvCBs). */
+            if (func != 0 && psx_bios_image.deliver_event_ret != 0) {
                 /* Nested guest call, same shape as any compiled call site.
                  * $ra is the kernel's real post-jalr address so the callback
                  * returns through the standard dispatch contract; the caller's
                  * $ra is restored before the hook returns. */
                 uint32_t saved_ra = cpu->gpr[31];
-                cpu->gpr[31] = KADDR_DELIVER_RET;
+                cpu->gpr[31] = psx_bios_image.deliver_event_ret;
                 extern int g_exec_phase;   /* wall-time sampler (dirty_ram_interp.c) */
                 int prev_phase = g_exec_phase;
                 g_exec_phase = 3;   /* compiled route; dirty/native callees re-tag inside */
-                psx_dispatch_call(cpu, func, KADDR_DELIVER_RET);
+                psx_dispatch_call(cpu, func, psx_bios_image.deliver_event_ret);
                 g_exec_phase = prev_phase;
                 cpu->gpr[31] = saved_ra;
             }
@@ -251,7 +260,7 @@ static void hle_deliver_event(CPUState* cpu, uint32_t base, uint32_t n)
      * caller may depend on it (libapi types DeliverEvent void). Set 0 for a
      * stable, observable value. */
     cpu->gpr[2] = 0u;
-    psx_advance_cycles(36u + 12u * n);
+    psx_cpu_charge(36u + 12u * n);
 }
 
 /* B0 vector service. Returns 1 iff serviced in HLE. */
@@ -287,7 +296,7 @@ static int hle_boot_shell_skip(CPUState* cpu)
      * immediately with no disc-menu interaction. Kernel state at this point
      * was built entirely by the real recompiled kernel init. */
     cpu->gpr[2] = 0u;
-    hle_record(PSX_SHELL_ENTRY_PHYS, 0u, cpu, 0u, PSX_HLE_ROUTE_BOOT);
+    hle_record(psx_bios_image.shell_entry_phys, 0u, cpu, 0u, PSX_HLE_ROUTE_BOOT);
     return 1;
 }
 
@@ -312,7 +321,8 @@ static int bios_hle_dispatch(struct CPUState* cpu, uint32_t phys)
         hle_record(phys, cpu->gpr[9], cpu, 0u, PSX_HLE_ROUTE_LLE);
         return 0;
     }
-    if (phys == PSX_SHELL_ENTRY_PHYS)
+    if (psx_bios_image.shell_entry_phys != 0 &&
+        phys == psx_bios_image.shell_entry_phys)
         return hle_boot_shell_skip(cpu);
     return 0;
 }
@@ -321,8 +331,21 @@ static int bios_hle_dispatch(struct CPUState* cpu, uint32_t phys)
 
 void psx_bios_hle_configure(int call_hle, int boot_skip)
 {
-    s_call_hle_on  = call_hle ? 1 : 0;
-    s_boot_skip_on = boot_skip ? 1 : 0;
+    /* IMPORTANT (Ape Escape + OpenBIOS): clamp call-HLE to deliver_event_ret.
+     * OpenBIOS omits the anchor; servicing B0:07 without it silently skips
+     * CALLBACK EvCBs (HwCARD/SwCARD flag handlers at 0x80022930/0x80022980
+     * never run → LOAD phase waits never complete). Plan should already
+     * refuse; this is the runtime backstop. Boot-skip remains independent. */
+    s_call_hle_on  = (call_hle && psx_bios_image.deliver_event_ret != 0) ? 1 : 0;
+    /* Clamp to what THIS image can actually do, so the state the banner and
+     * `hle_dump` report can never claim a skip that bios_hle_dispatch below is
+     * structurally unable to perform. Callers are expected to have gone
+     * through psx_bios_hle_plan(); this is the backstop, not the policy. */
+    s_boot_skip_on = (boot_skip && psx_bios_image.shell_entry_phys != 0) ? 1 : 0;
+    /* Rematch / session_reboot re-enters bring-up without process exit; the
+     * shell-skip latch must arm again or peers run the interactive shell and
+     * appear hung after netplay lockstep. */
+    s_shell_skipped = 0;
     g_psx_bios_hle_hook =
         (s_call_hle_on || s_boot_skip_on) ? &bios_hle_dispatch : NULL;
 }

@@ -158,6 +158,12 @@ std::string display(const std::filesystem::path& path, const std::string& game_i
     return "Unavailable";
 }
 
+void stop() {
+#if defined(_WIN32) && !defined(PSX_UWP)
+    finish();
+#endif
+}
+
 void start(const std::filesystem::path& path, const std::string& game_id) {
 #if defined(_WIN32) && !defined(PSX_UWP)
     auto& state = session();

@@ -1,9 +1,26 @@
 #include "gte.h"
+#include "gte_view.h"
 #include "cpu_state.h"
+#include "execution_profile.h"
+#include "hle_gte.h"
+#include "nd_intro_ot.h"
+#include "pgxp.h"
+#include "gte_nclip_stats.h"
+#include "render_pass_projection.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+extern "C" int psx_netplay_active(void);
+
+extern "C" uint32_t psx_read_word(uint32_t addr);
+extern "C" int gpu_ws_precise_nclip_enabled(void);
+/* overlay_loader.c: nonzero while an overlay shadow diff (interpreter record
+ * plus native replay of one candidate) is running. */
+extern "C" int psx_overlay_shadow_diff_active(void);
+extern "C" uint64_t s_frame_count;            /* debug_server.c */
+extern "C" uint32_t g_debug_last_store_pc;     /* debug_server.c */
+extern "C" { int (*g_psx_projection_command)(CPUState*, uint32_t) = nullptr; }
 
 namespace PSXRecomp {
 namespace GTE {
@@ -73,100 +90,101 @@ static int32_t gte_divide(uint16_t H, uint16_t SZ3, uint32_t& FLAG) {
 static inline bool gte_instr_lm(uint32_t instr) { return (instr & (1u << 10)) != 0; }
 static inline int  gte_instr_sf(uint32_t instr) { return (instr & (1u << 19)) ? 12 : 0; }
 
+static int64_t gte_mac44_stage(GTEState* gte, int64_t value, int mac_num) {
+    constexpr uint64_t mask = (1ull << 44) - 1ull;
+    constexpr uint64_t sign = 1ull << 43;
+    gte->check_mac_overflow(value, mac_num);
+    uint64_t wrapped = static_cast<uint64_t>(value) & mask;
+    if (wrapped & sign) wrapped |= ~mask;
+    return static_cast<int64_t>(wrapped);
+}
+
+static void gte_store_mac_ir(GTEState* gte, int mac_num, int64_t value,
+                             int shift, bool lm) {
+    value = gte_mac44_stage(gte, value, mac_num) >> shift;
+    int32_t mac = static_cast<int32_t>(value);
+    if (mac_num == 1) { gte->MAC1 = mac; gte->IR1 = gte->saturate_ir(mac, 1, lm); }
+    if (mac_num == 2) { gte->MAC2 = mac; gte->IR2 = gte->saturate_ir(mac, 2, lm); }
+    if (mac_num == 3) { gte->MAC3 = mac; gte->IR3 = gte->saturate_ir(mac, 3, lm); }
+}
+
 // Transform a vertex by Light matrix → IR1/IR2/IR3 (step 1 of lighting)
 static void light_transform(GTEState* gte, int16_t* V, uint32_t instr) {
     const bool lm = gte_instr_lm(instr);
-    int64_t mac1 = ((int64_t)gte->L[0][0] * V[0] +
-                    (int64_t)gte->L[0][1] * V[1] +
-                    (int64_t)gte->L[0][2] * V[2]) >> 12;
-    int64_t mac2 = ((int64_t)gte->L[1][0] * V[0] +
-                    (int64_t)gte->L[1][1] * V[1] +
-                    (int64_t)gte->L[1][2] * V[2]) >> 12;
-    int64_t mac3 = ((int64_t)gte->L[2][0] * V[0] +
-                    (int64_t)gte->L[2][1] * V[1] +
-                    (int64_t)gte->L[2][2] * V[2]) >> 12;
-    gte->MAC1 = static_cast<int32_t>(mac1);
-    gte->MAC2 = static_cast<int32_t>(mac2);
-    gte->MAC3 = static_cast<int32_t>(mac3);
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, lm);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, lm);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, lm);
+    const int shift = gte_instr_sf(instr);
+    for (int row = 0; row < 3; ++row) {
+        int64_t acc = gte_mac44_stage(
+            gte, (int64_t)gte->L[row][0] * V[0] +
+                 (int64_t)gte->L[row][1] * V[1], row + 1);
+        gte_store_mac_ir(gte, row + 1,
+                         acc + (int64_t)gte->L[row][2] * V[2], shift, lm);
+    }
 }
 
 // Apply light color matrix + background color to IR → IR (step 2 of lighting)
 static void light_color(GTEState* gte, uint32_t instr) {
     const bool lm = gte_instr_lm(instr);
-    int64_t mac1 = ((int64_t)gte->BK[0] << 12) +
-                   (int64_t)gte->LC[0][0] * gte->IR1 +
-                   (int64_t)gte->LC[0][1] * gte->IR2 +
-                   (int64_t)gte->LC[0][2] * gte->IR3;
-    int64_t mac2 = ((int64_t)gte->BK[1] << 12) +
-                   (int64_t)gte->LC[1][0] * gte->IR1 +
-                   (int64_t)gte->LC[1][1] * gte->IR2 +
-                   (int64_t)gte->LC[1][2] * gte->IR3;
-    int64_t mac3 = ((int64_t)gte->BK[2] << 12) +
-                   (int64_t)gte->LC[2][0] * gte->IR1 +
-                   (int64_t)gte->LC[2][1] * gte->IR2 +
-                   (int64_t)gte->LC[2][2] * gte->IR3;
-    gte->MAC1 = static_cast<int32_t>(mac1 >> 12);
-    gte->MAC2 = static_cast<int32_t>(mac2 >> 12);
-    gte->MAC3 = static_cast<int32_t>(mac3 >> 12);
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, lm);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, lm);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, lm);
+    const int shift = gte_instr_sf(instr);
+    const int16_t input[3] = {gte->IR1, gte->IR2, gte->IR3};
+    for (int row = 0; row < 3; ++row) {
+        int64_t acc = gte_mac44_stage(
+            gte, (int64_t)gte->BK[row] * 4096 +
+                 (int64_t)gte->LC[row][0] * input[0], row + 1);
+        acc = gte_mac44_stage(
+            gte, acc + (int64_t)gte->LC[row][1] * input[1], row + 1);
+        gte_store_mac_ir(gte, row + 1,
+                         acc + (int64_t)gte->LC[row][2] * input[2], shift, lm);
+    }
 }
 
-// Multiply IR by RGBC color and push to RGB FIFO (step 3 of color output)
-static void color_output(GTEState* gte, uint32_t instr) {
-    const bool lm = gte_instr_lm(instr);
-    uint8_t r0 = (gte->RGBC >> 0)  & 0xFF;
-    uint8_t g0 = (gte->RGBC >> 8)  & 0xFF;
-    uint8_t b0 = (gte->RGBC >> 16) & 0xFF;
-    int64_t mac1 = ((int64_t)r0 * gte->IR1) << 4;
-    int64_t mac2 = ((int64_t)g0 * gte->IR2) << 4;
-    int64_t mac3 = ((int64_t)b0 * gte->IR3) << 4;
-    gte->MAC1 = static_cast<int32_t>(mac1 >> 12);
-    gte->MAC2 = static_cast<int32_t>(mac2 >> 12);
-    gte->MAC3 = static_cast<int32_t>(mac3 >> 12);
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, lm);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, lm);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, lm);
+static void push_rgb_from_mac(GTEState* gte) {
     gte->push_rgb(
         gte->saturate_color(gte->MAC1 >> 4, 0),
         gte->saturate_color(gte->MAC2 >> 4, 1),
         gte->saturate_color(gte->MAC3 >> 4, 2));
 }
 
-// Depth cue / interpolate current IR toward the far color using IR0
-// (common tail of DPCS/DPCT/DPCL/INTPL/NCDS/NCDT/CDP). Hardware:
-//   base    = IR << 12
-//   step    = lim(((FC << 12) - base) >> (sf*12))   ; ±0x8000 clamp, lm FORCED off
-//   MAC     = (base + IR0 * step) >> (sf*12)
-//   IR      = lim(MAC, lm)                          ; lm from the instruction
-static void depth_cue_from_ir(GTEState* gte, uint32_t instr) {
+// Multiply IR by RGBC color (step 3 of NCCS/CC color output).
+static void color_multiply(GTEState* gte, uint32_t instr) {
+    const bool lm = gte_instr_lm(instr);
+    const int shift = gte_instr_sf(instr);
+    uint8_t r0 = (gte->RGBC >> 0)  & 0xFF;
+    uint8_t g0 = (gte->RGBC >> 8)  & 0xFF;
+    uint8_t b0 = (gte->RGBC >> 16) & 0xFF;
+    const int16_t input[3] = {gte->IR1, gte->IR2, gte->IR3};
+    gte_store_mac_ir(gte, 1, (int64_t)r0 * input[0] * 16, shift, lm);
+    gte_store_mac_ir(gte, 2, (int64_t)g0 * input[1] * 16, shift, lm);
+    gte_store_mac_ir(gte, 3, (int64_t)b0 * input[2] * 16, shift, lm);
+}
+
+static void color_output(GTEState* gte, uint32_t instr) {
+    color_multiply(gte, instr);
+    push_rgb_from_mac(gte);
+}
+
+// Interpolate an unshifted MAC input toward far color using IR0. The first
+// stage always uses lm=0; the command's lm applies only to the final result.
+static void depth_cue_from_mac(GTEState* gte, int64_t base1, int64_t base2,
+                               int64_t base3, uint32_t instr) {
     const int  shift = gte_instr_sf(instr);
     const bool lm    = gte_instr_lm(instr);
-    int64_t base1 = (int64_t)gte->IR1 << 12;
-    int64_t base2 = (int64_t)gte->IR2 << 12;
-    int64_t base3 = (int64_t)gte->IR3 << 12;
-    int16_t step1 = gte->saturate_ir(
-        (int32_t)(( ((int64_t)gte->FC[0] << 12) - base1) >> shift), 1, false);
-    int16_t step2 = gte->saturate_ir(
-        (int32_t)(( ((int64_t)gte->FC[1] << 12) - base2) >> shift), 2, false);
-    int16_t step3 = gte->saturate_ir(
-        (int32_t)(( ((int64_t)gte->FC[2] << 12) - base3) >> shift), 3, false);
-    int64_t mac1 = (base1 + (int64_t)gte->IR0 * step1) >> shift;
-    int64_t mac2 = (base2 + (int64_t)gte->IR0 * step2) >> shift;
-    int64_t mac3 = (base3 + (int64_t)gte->IR0 * step3) >> shift;
-    gte->check_mac_overflow(mac1, 1);
-    gte->check_mac_overflow(mac2, 2);
-    gte->check_mac_overflow(mac3, 3);
-    gte->MAC1 = static_cast<int32_t>(mac1);
-    gte->MAC2 = static_cast<int32_t>(mac2);
-    gte->MAC3 = static_cast<int32_t>(mac3);
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, lm);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, lm);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, lm);
+    gte_store_mac_ir(gte, 1, (int64_t)gte->FC[0] * 4096 - base1, shift, false);
+    gte_store_mac_ir(gte, 2, (int64_t)gte->FC[1] * 4096 - base2, shift, false);
+    gte_store_mac_ir(gte, 3, (int64_t)gte->FC[2] * 4096 - base3, shift, false);
+    const int16_t step1 = gte->IR1;
+    const int16_t step2 = gte->IR2;
+    const int16_t step3 = gte->IR3;
+    gte_store_mac_ir(gte, 1, base1 + (int64_t)gte->IR0 * step1, shift, lm);
+    gte_store_mac_ir(gte, 2, base2 + (int64_t)gte->IR0 * step2, shift, lm);
+    gte_store_mac_ir(gte, 3, base3 + (int64_t)gte->IR0 * step3, shift, lm);
+}
+
+static void depth_cue_from_ir(GTEState* gte, uint32_t instr) {
+    depth_cue_from_mac(gte,
+                       (int64_t)gte->IR1 * 4096,
+                       (int64_t)gte->IR2 * 4096,
+                       (int64_t)gte->IR3 * 4096,
+                       instr);
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +203,415 @@ static void depth_cue_from_ir(GTEState* gte, uint32_t instr) {
 static int32_t s_ws_xnum = 1, s_ws_xden = 1;
 extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
 extern "C" void psx_ws_note_gte_project(int nverts);  /* gpu.c — gte_game_mode stamp */
+static int s_gte_replay_sandbox = 0;
+
+/* Optional visual-only geometry precision cache. The PS1-visible SXY FIFO
+ * remains integer and fully faithful; this side cache retains the discarded
+ * 16.16 projection fraction so the high-resolution software mirror can match
+ * a later GP0 polygon and place its vertices between native pixels. */
+/* Direct-indexed by the projected screen position, matching what both reference
+ * PGXP implementations use for this fallback (beetle-psx pgxp_gpu.c
+ * vertexCache[0x800*2][0x800*2]; DuckStation cpu_pgxp.cpp 2048x2048). SXY is an
+ * 11-bit signed pair, so every reachable position gets its OWN slot and
+ * distinct positions can never collide.
+ *
+ * The previous 8192-entry HASHED table was the defect: unrelated positions
+ * shared a slot, so a vertex could be handed a different vertex's fraction, and
+ * eviction made which triangles got corrected change frame to frame (moving
+ * seams). Allocated lazily on enable so the faithful default costs nothing. */
+#define GEOM_AXIS   2048u                       /* -1024 .. 1023 */
+#define GEOM_BIAS   1024
+#define GEOM_CACHE_SIZE (GEOM_AXIS * GEOM_AXIS)
+struct GeomVertex {
+    int32_t x16, y16;
+    uint32_t generation;
+    uint32_t ambiguous;   /* two DIFFERENT sub-pixel values seen at this pixel */
+};
+static GeomVertex *s_geom_cache = nullptr;
+static uint32_t s_geom_generation = 1;
+static int s_geom_enabled = 0;
+static uint32_t s_geom_hits = 0;
+/* Lookup outcome census — this is what says whether coverage is limited by the
+ * cache or by projections never reaching the packet in a matchable form. */
+static uint32_t s_geom_lookups = 0;      /* lookups attempted                  */
+static uint32_t s_geom_miss_unrec = 0;   /* nothing was ever recorded here     */
+static uint32_t s_geom_miss_ambig = 0;   /* recorded, but not unambiguously    */
+
+/* Exact GTE projection provenance now lives in the PGXP value-propagation
+ * engine (pgxp.cpp): per-word RAM/scratchpad shadows plus per-GPR and per-GTE-
+ * register shadows, validated on read (docs/ENHANCEMENTS.md G1.2/G1.3). The
+ * gte_precision_* entry points below are kept as the stable emit/ABI surface
+ * (v14 swc2 sites, tests) and forward into that engine. The hashed
+ * s_precision_store table and the s_precise_sxy FIFO it fed are retired —
+ * the GTE register shadows ARE the FIFO now. */
+static uint32_t s_speculative_depth = 0;
+static int s_speculative_timeline_invalidated = 0;
+
+static void gte_nclip_precision_invalidate();
+static void gte_geom_generation_advance(void) {
+    gte_nclip_precision_invalidate();
+    if (++s_geom_generation == 0) {
+        if (s_geom_cache)
+            std::memset(s_geom_cache, 0, GEOM_CACHE_SIZE * sizeof(GeomVertex));
+        s_geom_generation = 1;
+    }
+}
+
+extern "C" void gte_precision_timeline_invalidate(void) {
+    /* Raw machine-state restore is authoritative even if host polling reached
+     * it during a speculative validation pass. Defer the generation advance
+     * until the outer transaction ends so old provenance cannot be restored.
+     * (pgxp_invalidate_all defers the same way behind its suppress bracket.) */
+    pgxp_invalidate_all();
+    if (s_speculative_depth != 0) {
+        s_speculative_timeline_invalidated = 1;
+        return;
+    }
+    gte_geom_generation_advance();
+}
+
+extern "C" void gte_precision_speculative_begin(void) {
+    if (s_speculative_depth++ == 0)
+        s_speculative_timeline_invalidated = 0;
+    /* The speculative pass runs real GTE commands and hooks on state that is
+     * rolled back afterwards: suppress all shadow recording so the shadows
+     * still describe the restored timeline when the bracket closes. */
+    pgxp_suppress_begin();
+}
+
+extern "C" void gte_precision_speculative_end(void) {
+    if (s_speculative_depth == 0) return;
+    pgxp_suppress_end();
+    if (--s_speculative_depth == 0) {
+        if (s_speculative_timeline_invalidated) {
+            gte_geom_generation_advance();
+            s_speculative_timeline_invalidated = 0;
+        }
+    }
+}
+
+extern "C" void gte_precision_tracking_set(int enabled) {
+    pgxp_set_enabled(enabled);
+}
+
+/* v14 ABI emit surface: every swc2 site (all backends, overlay DLLs) calls
+ * this. The pgxp engine copies the GTE register shadow to the RAM shadow;
+ * the GPU-side lookup validates against the actual packet word, so a stale
+ * register shadow can never be believed. */
+extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
+    if (s_gte_replay_sandbox || reg < 12 || reg > 15) return;
+    pgxp_store_gte_reg(addr, reg);
+}
+
+/* Retired: plain-store invalidation is unnecessary under validate-on-read
+ * (the GPU compares the tracked word against the actual packet word). Kept
+ * as a no-op for link compatibility. */
+extern "C" void gte_precision_invalidate_word(uint32_t addr) {
+    (void)addr;
+}
+
+extern "C" int gte_precision_load_word(uint32_t addr, uint32_t packed,
+                                        int32_t *x16, int32_t *y16,
+                                        uint16_t *z) {
+    if (s_speculative_depth != 0) return 0;
+    return pgxp_load_precise_word(addr, packed, x16, y16, z);
+}
+
+/* Exact slot for a packed SXY pair, or -1 if it is outside the representable
+ * screen range. No hashing: distinct positions never share a slot. */
+static inline int64_t geom_slot(uint32_t packed) {
+    int32_t x = (int16_t)(packed & 0xFFFFu);
+    int32_t y = (int16_t)(packed >> 16);
+    if (x < -GEOM_BIAS || x >= GEOM_BIAS || y < -GEOM_BIAS || y >= GEOM_BIAS)
+        return -1;
+    return (int64_t)(y + GEOM_BIAS) * GEOM_AXIS + (x + GEOM_BIAS);
+}
+
+extern "C" void gpu_pgxp_rederive_enable(void);
+
+extern "C" void gte_geometry_correction_set(int enabled) {
+    s_geom_enabled = enabled ? 1 : 0;
+    s_geom_hits = 0;
+    s_geom_lookups = 0;
+    s_geom_miss_unrec = 0;
+    s_geom_miss_ambig = 0;
+    if (s_geom_enabled && !s_geom_cache) {
+        s_geom_cache = (GeomVertex *)std::calloc(GEOM_CACHE_SIZE,
+                                                 sizeof(GeomVertex));
+        if (!s_geom_cache) s_geom_enabled = 0;   /* fail closed: stay faithful */
+    }
+    gte_geom_generation_advance();
+    gpu_pgxp_rederive_enable();
+}
+
+/* Lookup census for the debug server: attempted, hit, and the two miss classes.
+ * "unrecorded" means no projection was ever cached at that screen position —
+ * with an exact table that is a genuine coverage gap, not a cache artifact. */
+extern "C" void gte_geometry_correction_stats(uint32_t *lookups, uint32_t *hits,
+                                              uint32_t *miss_unrecorded,
+                                              uint32_t *miss_ambiguous) {
+    if (lookups) *lookups = s_geom_lookups;
+    if (hits) *hits = s_geom_hits;
+    if (miss_unrecorded) *miss_unrecorded = s_geom_miss_unrec;
+    if (miss_ambiguous) *miss_ambiguous = s_geom_miss_ambig;
+}
+
+extern "C" int gte_geometry_correction_enabled(void) {
+    return s_geom_enabled;
+}
+
+extern "C" uint32_t gte_geometry_correction_hits(void) {
+    return s_geom_hits;
+}
+
+static int gte_geometry_correction_lookup_impl(uint32_t packed,
+                                                int32_t *x16, int32_t *y16,
+                                                int count_stats) {
+    if (s_speculative_depth != 0 || !s_geom_enabled || !s_geom_cache) return 0;
+    int64_t slot = geom_slot(packed);
+    if (slot < 0) return 0;
+    if (count_stats) s_geom_lookups++;
+    const GeomVertex &entry = s_geom_cache[slot];
+    if (entry.generation != s_geom_generation) {
+        if (count_stats) s_geom_miss_unrec++;
+        return 0;
+    }
+    /* Ambiguity gate, as in both references (beetle gFlags == 1): if two
+     * DIFFERENT sub-pixel positions rounded to this same pixel, we cannot tell
+     * which one this packet means, and guessing is what makes a vertex inherit
+     * a neighbour's fraction. Fall back to the faithful integer position. */
+    if (entry.ambiguous) {
+        if (count_stats) s_geom_miss_ambig++;
+        return 0;
+    }
+    if (x16) *x16 = entry.x16;
+    if (y16) *y16 = entry.y16;
+    if (count_stats) s_geom_hits++;
+    return 1;
+}
+
+extern "C" int gte_geometry_correction_lookup(uint32_t packed,
+                                                int32_t *x16, int32_t *y16) {
+    return gte_geometry_correction_lookup_impl(packed, x16, y16, 1);
+}
+
+/* Read-only variant used by instrumentation probes. A probe must not change
+ * the geometry-correction census that describes rendered vertices. */
+extern "C" int gte_geometry_correction_lookup_probe(uint32_t packed,
+                                                      int32_t *x16,
+                                                      int32_t *y16) {
+    return gte_geometry_correction_lookup_impl(packed, x16, y16, 0);
+}
+
+/* Frame generation's vertex sources ([video] frame_generation,
+ * docs/FRAME_GENERATION.md). Every RTPS/RTPT output position is noted with
+ * what produced it: an identity (the game function that issued the
+ * projection, ra, and the model-space input vertex VX/VY/VZ - the same in
+ * consecutive frames for the same piece of geometry, whatever the camera did
+ * and in whatever order the game draws), the camera-space position RT*V+TR
+ * the GTE divided, and the projection distance H. The GPU side looks a packet
+ * vertex up by its packed screen word; frame generation estimates the camera
+ * motion from these positions and re-projects from an in-between camera.
+ * Direct-indexed by screen position like the geometry cache, pointing into a
+ * ring of the recent projections; a position two different vertices projected
+ * to in one frame is ambiguous. Entries a few frames old are not believed.
+ * Allocated only while frame generation is on: the guest-visible GTE results
+ * are untouched either way. */
+struct FgSrcEntry { uint32_t seq, seq2; uint32_t gen; };   /* gen: frame << 1 | ambiguous; seq2: a second point */
+struct FgSrcRec { uint32_t seq, id, ra; int32_t p[3]; int32_t h; };
+#define FGSRC_RING (1u << 17)
+static FgSrcEntry *s_fgsrc = nullptr;
+static FgSrcRec   *s_fgsrc_ring = nullptr;
+static uint32_t    s_fgsrc_seq = 0;
+#define FGSRC_MAX_AGE 4u
+extern "C" { extern uint64_t s_frame_count; }
+static int32_t gte_h_scaled(const GTEState* gte);
+
+extern "C" void gte_fg_source_set(int enabled) {
+    if (enabled && !s_fgsrc) {
+        s_fgsrc = (FgSrcEntry *)std::calloc(GEOM_CACHE_SIZE, sizeof(FgSrcEntry));
+        s_fgsrc_ring = (FgSrcRec *)std::calloc(FGSRC_RING, sizeof(FgSrcRec));
+        if (!s_fgsrc || !s_fgsrc_ring) enabled = 0;
+    }
+    if (!enabled) {
+        std::free(s_fgsrc); s_fgsrc = nullptr;
+        std::free(s_fgsrc_ring); s_fgsrc_ring = nullptr;
+    }
+}
+
+extern "C" int gte_fg_source_enabled(void) { return s_fgsrc != nullptr; }
+
+static inline uint32_t fgsrc_frame(void) { return (uint32_t)(s_frame_count + 1u) & 0x7FFFFFFFu; }
+
+static void fgsrc_note(const GTEState *g, int32_t packed, uint32_t ra, const int16_t v[3]) {
+    const int64_t slot = geom_slot((uint32_t)packed);
+    if (slot < 0) return;
+    uint32_t h = 2166136261u;
+    const uint32_t w[4] = { ra, (uint16_t)v[0], (uint16_t)v[1], (uint16_t)v[2] };
+    for (int i = 0; i < 4; i++)
+        for (int k = 0; k < 4; k++) h = (h ^ ((w[i] >> (8 * k)) & 0xFFu)) * 16777619u;
+    if (!h) h = 1;
+    const uint32_t seq = ++s_fgsrc_seq ? s_fgsrc_seq : ++s_fgsrc_seq;
+    FgSrcRec &r = s_fgsrc_ring[seq & (FGSRC_RING - 1u)];
+    r.seq = seq;
+    r.id = h;
+    r.ra = ra;
+    for (int i = 0; i < 3; i++) {
+        int64_t m = (int64_t)g->TR[i] * 4096;
+        for (int k = 0; k < 3; k++) m += (int64_t)g->RT[i][k] * v[k];
+        r.p[i] = (int32_t)(m >> 12);
+    }
+    r.h = gte_h_scaled(g);
+    FgSrcEntry &e = s_fgsrc[slot];
+    const uint32_t f = fgsrc_frame();
+    if ((e.gen >> 1) != f) { e.gen = f << 1; e.seq = seq; e.seq2 = 0; return; }
+    /* Earlier this frame: the same point projected again (another function,
+     * another model vertex: shared corners of separate meshes) is one vertex,
+     * keeping the smaller identity so the choice does not depend on draw
+     * order. Up to two different points on one pixel are kept (the GPU side
+     * picks by the triangle's other vertices); a third is ambiguous. */
+    auto same = [&](uint32_t sq) {
+        const FgSrcRec &o = s_fgsrc_ring[sq & (FGSRC_RING - 1u)];
+        return o.seq == sq && std::abs(o.p[0] - r.p[0]) <= 2 && std::abs(o.p[1] - r.p[1]) <= 2 &&
+               std::abs(o.p[2] - r.p[2]) <= 2;
+    };
+    auto keep = [&](uint32_t &sq) { if (s_fgsrc_ring[sq & (FGSRC_RING - 1u)].id > h) sq = seq; };
+    if (same(e.seq)) { keep(e.seq); return; }
+    if (!e.seq2) { e.seq2 = seq; return; }
+    if (same(e.seq2)) { keep(e.seq2); return; }
+    e.gen |= 1u;
+}
+
+static void fgsrc_record(const GTEState *g, uint32_t cmd, uint32_t ra) {
+    ra &= 0x1FFFFFFFu;
+    if ((cmd & 0x3F) == 0x30) {
+        fgsrc_note(g, g->SXY[0], ra, g->V0);
+        fgsrc_note(g, g->SXY[1], ra, g->V1);
+        fgsrc_note(g, g->SXY[2], ra, g->V2);
+    } else {
+        fgsrc_note(g, g->SXY[2], ra, g->V0);
+    }
+}
+
+/* The sources of the vertices last projected to a packed screen word this
+ * frame (or a few frames ago): 0 when none, ambiguous or stale, else 1 or 2
+ * (two different points on that pixel). */
+extern "C" int gte_fg_source_lookup(uint32_t packed, GteFgSrc out[2]) {
+    if (!s_fgsrc) return 0;
+    const int64_t slot = geom_slot(packed);
+    if (slot < 0) return 0;
+    const FgSrcEntry &e = s_fgsrc[slot];
+    if (!e.seq || (e.gen & 1u)) return 0;
+    if (((fgsrc_frame() - (e.gen >> 1)) & 0x7FFFFFFFu) > FGSRC_MAX_AGE) return 0;
+    int n = 0;
+    const uint32_t sq[2] = { e.seq, e.seq2 };
+    for (int i = 0; i < 2; i++) {
+        if (!sq[i]) continue;
+        const FgSrcRec &r = s_fgsrc_ring[sq[i] & (FGSRC_RING - 1u)];
+        if (r.seq != sq[i]) continue;
+        out[n].id = r.id; out[n].ra = r.ra; out[n].h = r.h;
+        for (int k = 0; k < 3; k++) out[n].p[k] = r.p[k];
+        n++;
+    }
+    return n;
+}
+
+/* Render-pass checkpoint for the gte.cpp side of precision tracking: the
+ * position cache entries a pass writes are journaled and put back, and the
+ * speculative bracket depth is restored (a watchdog abort can leave one open).
+ * The PGXP shadows roll back through pgxp_checkpoint_*. */
+struct GeomJournalEntry { GeomVertex *slot; GeomVertex old; };
+static uint32_t          s_gck_depth = 0;
+static GeomJournalEntry *s_gck_log = nullptr;
+static size_t            s_gck_n = 0, s_gck_cap = 0;
+static int               s_gck_lossy = 0;
+static uint32_t          s_gck_generation = 0;
+static GeomVertex       *s_gck_cache = nullptr;
+static uint32_t          s_gck_spec_depth = 0;
+static int               s_gck_spec_invalidated = 0;
+
+static uint8_t *s_gck_bits = nullptr;          /* one bit per cache slot */
+
+static inline void geom_ck_note(GeomVertex *slot) {
+    if (s_gck_depth == 0) return;
+    if (s_geom_cache != s_gck_cache || !s_gck_bits) { s_gck_lossy = 1; return; }
+    size_t i = (size_t)(slot - s_geom_cache);
+    uint8_t bit = (uint8_t)(1u << (i & 7u));
+    if (s_gck_bits[i >> 3] & bit) return;      /* journaled this pass        */
+    if (s_gck_n == s_gck_cap) {
+        size_t cap = s_gck_cap ? s_gck_cap * 2 : 16384;
+        GeomJournalEntry *p = (GeomJournalEntry *)std::realloc(
+            s_gck_log, cap * sizeof *p);
+        if (!p) { s_gck_lossy = 1; return; }
+        s_gck_log = p;
+        s_gck_cap = cap;
+    }
+    s_gck_bits[i >> 3] |= bit;
+    s_gck_log[s_gck_n].slot = slot;
+    s_gck_log[s_gck_n].old = *slot;
+    s_gck_n++;
+}
+
+extern "C" void gte_precision_checkpoint_begin(void) {
+    pgxp_checkpoint_begin();
+    if (s_gck_depth++ != 0) return;
+    if (s_geom_cache && !s_gck_bits)
+        s_gck_bits = (uint8_t *)std::calloc(GEOM_CACHE_SIZE / 8u, 1);
+    s_gck_n = 0;
+    s_gck_generation = s_geom_generation;
+    s_gck_cache = s_geom_cache;
+    s_gck_spec_depth = s_speculative_depth;
+    s_gck_spec_invalidated = s_speculative_timeline_invalidated;
+}
+
+extern "C" void gte_precision_checkpoint_rollback(void) {
+    if (s_gck_depth != 0 && --s_gck_depth == 0) {
+        for (size_t i = s_gck_n; i-- > 0;) {
+            GeomVertex *slot = s_gck_log[i].slot;
+            *slot = s_gck_log[i].old;
+            size_t k = (size_t)(slot - s_gck_cache);
+            s_gck_bits[k >> 3] &= (uint8_t)~(1u << (k & 7u));
+        }
+        s_gck_n = 0;
+        s_speculative_depth = s_gck_spec_depth;
+        s_speculative_timeline_invalidated = s_gck_spec_invalidated;
+        if (s_gck_lossy || s_geom_cache != s_gck_cache ||
+            s_geom_generation < s_gck_generation) {
+            s_gck_lossy = 0;
+            gte_geom_generation_advance();     /* fail closed                 */
+        } else {
+            s_geom_generation = s_gck_generation;
+        }
+    }
+    pgxp_checkpoint_rollback();
+}
+
+static inline void geom_note(uint32_t packed, int64_t x16, int64_t y16) {
+    if (s_speculative_depth != 0 || s_gte_replay_sandbox || !s_geom_enabled ||
+        !s_geom_cache) return;
+    /* Dataflow-only (G1.11): nothing will read the cache, so do not fill it. */
+    if (!pgxp_position_fallback()) return;
+    /* Saturated off-screen projections are unsuitable for subpixel recovery. */
+    int32_t x = (int16_t)(packed & 0xFFFFu);
+    int32_t y = (int16_t)(packed >> 16);
+    if (x <= -0x400 || x >= 0x3FF || y <= -0x400 || y >= 0x3FF) return;
+    int64_t slot = geom_slot(packed);
+    if (slot < 0) return;
+    GeomVertex &entry = s_geom_cache[slot];
+    geom_ck_note(&entry);
+    if (entry.generation == s_geom_generation) {
+        /* Already occupied this generation: only flag ambiguity if the stored
+         * sub-pixel position actually DIFFERS — re-projecting the same vertex
+         * to the same place is not ambiguous. */
+        if (entry.x16 != (int32_t)x16 || entry.y16 != (int32_t)y16)
+            entry.ambiguous = 1;
+        return;                      /* first writer wins, as in the references */
+    }
+    entry.x16 = (int32_t)x16;
+    entry.y16 = (int32_t)y16;
+    entry.ambiguous = 0;
+    entry.generation = s_geom_generation;
+}
 
 // Per-draw suppression of the X-squash (8C far-backdrop). The far backdrop
 // (ocean/cloud/distant mountain) is a parallax layer that is conceptually at
@@ -270,6 +697,7 @@ extern "C" void gte_dome_probe(int on, int thr) {
     if (on) for (int i = 0; i < DOME_PROBE_SLOTS; i++) { s_dome_probe[i].func = 0; s_dome_probe[i].count = 0; s_dome_probe[i].max_sz = 0; }
 }
 static inline void dome_probe_note(int32_t sz) {
+    if (s_gte_replay_sandbox) return;
     if (!s_dome_probe_on || sz < s_dome_probe_thr) return;
     /* Tally the guest RA (the GAME fn that jal'd to libgte for this projection),
      * NOT g_debug_current_func_addr (which is the libgte leaf 0x80000F40). */
@@ -303,11 +731,12 @@ extern "C" int gte_dome_probe_dump(uint32_t* funcs, uint32_t* counts, int32_t* m
 // so types are referred to unqualified.
 extern "C" { extern uint64_t s_frame_count; }
 struct GteRtpRec {
-    uint32_t seq, frame, caller_ra, cmd;
+    uint32_t seq, frame, caller_ra, cmd, render_view;
     int16_t  V0[3], V1[3], V2[3];
     int16_t  RT[9];
     int32_t  TR[3];
     uint16_t H;  int32_t OFX, OFY;
+    uint16_t Hs;   /* H after fov_scale (== H when identity); SXY0..2 used Hs */
     int32_t  SXY0, SXY1, SXY2;
     uint16_t SZ1, SZ2, SZ3;
     uint32_t FLAG;
@@ -336,7 +765,30 @@ static uint64_t   s_gte_latch_seq = 0;
 static inline int gte_sxx(int32_t p){ int v=p&0xFFFF; return v>=0x8000? v-0x10000:v; }
 static inline int gte_syy(int32_t p){ int v=(p>>16)&0xFFFF; return v>=0x8000? v-0x10000:v; }
 
+static int32_t gte_h_scaled(const GTEState* gte);
+static int32_t s_render_view[3];
+static PSXModRenderView s_render_pose;
+static bool s_render_rotate;
+extern "C" void gte_render_pose_get(PSXModRenderView *view) { *view = s_render_pose; }
+extern "C" void gte_render_pose_set(const PSXModRenderView *view) {
+    s_render_pose = *view;
+    s_render_rotate = false;
+    for (int i = 0; i < 9; ++i)
+        if (view->rotation_q12[i] != (i % 4 == 0 ? 4096 : 0)) s_render_rotate = true;
+    /* An all-zero reset record means identity. */
+    if (!view->struct_size) s_render_rotate = false;
+    for (int i = 0; i < 3; ++i) s_render_view[i] = view->translation[i];
+}
+
+extern "C" void gte_render_view_get(int32_t xyz[3]) {
+    for (int i = 0; i < 3; i++) xyz[i] = s_render_view[i];
+}
+extern "C" void gte_render_view_set(const int32_t xyz[3]) {
+    for (int i = 0; i < 3; i++) s_render_view[i] = s_render_pose.translation[i] = xyz[i];
+}
+
 static void gte_rtp_record(const GTEState* g, uint32_t cmd) {
+    if (s_gte_replay_sandbox) return;
     if (!s_gte_rtp_ring) {
         s_gte_rtp_ring = (GteRtpRec*)calloc(GTE_RTP_RING_CAP, sizeof(GteRtpRec));
         if (!s_gte_rtp_ring) return;
@@ -346,10 +798,11 @@ static void gte_rtp_record(const GTEState* g, uint32_t cmd) {
     e->frame = (uint32_t)s_frame_count;
     e->caller_ra = s_gte_caller_ra;
     e->cmd = cmd;
+    e->render_view = s_render_pose.struct_size || s_render_view[0] || s_render_view[1] || s_render_view[2];
     for (int i = 0; i < 3; i++) { e->V0[i]=g->V0[i]; e->V1[i]=g->V1[i]; e->V2[i]=g->V2[i]; }
     for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) e->RT[r*3+c]=g->RT[r][c];
     for (int i = 0; i < 3; i++) e->TR[i]=g->TR[i];
-    e->H=g->H; e->OFX=g->OFX; e->OFY=g->OFY;
+    e->H=g->H; e->Hs=(uint16_t)gte_h_scaled(g); e->OFX=g->OFX; e->OFY=g->OFY;
     e->SXY0=g->SXY[0]; e->SXY1=g->SXY[1]; e->SXY2=g->SXY[2];
     e->SZ1=g->SZ[1]; e->SZ2=g->SZ[2]; e->SZ3=g->SZ[3];
     e->FLAG=g->FLAG;
@@ -415,6 +868,7 @@ static uint64_t     s_gte_intpl_seq  = 0;
 
 static void gte_intpl_record(const GTEState* g,
                              const int16_t pre_ir[4], const int32_t pre_fc[3]) {
+    if (s_gte_replay_sandbox) return;
     if (!s_gte_intpl_ring) {
         s_gte_intpl_ring = (GteIntplRec*)calloc(GTE_INTPL_RING_CAP, sizeof(GteIntplRec));
         if (!s_gte_intpl_ring) return;
@@ -522,12 +976,12 @@ extern "C" int gte_latch_dump_json(char* out, int outsz, int max_count) {
         if (pos>outsz-700) break;
         pos+=snprintf(out+pos,outsz-pos,
             "%s{\"frame\":%u,\"ra\":\"0x%08X\",\"cmd\":\"0x%08X\","
-            "\"RT\":[%d,%d,%d,%d,%d,%d,%d,%d,%d],\"TR\":[%d,%d,%d],\"H\":%u,"
+            "\"RT\":[%d,%d,%d,%d,%d,%d,%d,%d,%d],\"TR\":[%d,%d,%d],\"H\":%u,\"Hs\":%u,"
             "\"V0\":[%d,%d,%d],\"V1\":[%d,%d,%d],\"V2\":[%d,%d,%d],"
             "\"S0\":[%d,%d],\"S1\":[%d,%d],\"S2\":[%d,%d],\"SZ\":[%u,%u,%u],\"FLAG\":\"0x%08X\"}",
             emitted?",":"", e->frame, e->caller_ra, e->cmd,
             e->RT[0],e->RT[1],e->RT[2],e->RT[3],e->RT[4],e->RT[5],e->RT[6],e->RT[7],e->RT[8],
-            e->TR[0],e->TR[1],e->TR[2],(unsigned)e->H,
+            e->TR[0],e->TR[1],e->TR[2],(unsigned)e->H,(unsigned)e->Hs,
             e->V0[0],e->V0[1],e->V0[2], e->V1[0],e->V1[1],e->V1[2], e->V2[0],e->V2[1],e->V2[2],
             gte_sxx(e->SXY0),gte_syy(e->SXY0),gte_sxx(e->SXY1),gte_syy(e->SXY1),
             gte_sxx(e->SXY2),gte_syy(e->SXY2),(unsigned)e->SZ1,(unsigned)e->SZ2,(unsigned)e->SZ3,e->FLAG);
@@ -539,7 +993,7 @@ extern "C" int gte_latch_dump_json(char* out, int outsz, int max_count) {
 /* Format up to max_count recent entries as a JSON array body (no outer braces).
  * If frame_filter >= 0, only entries with that frame are emitted. Returns count. */
 extern "C" int gte_rtp_ring_dump_json(char* out, int outsz, int max_count,
-                                      int newest_first, long frame_filter) {
+                                      int newest_first, long frame_filter, int offset, int render_filter) {
     if (!s_gte_rtp_ring || outsz < 64) { if (out && outsz) out[0]=0; return 0; }
     uint64_t total = s_gte_rtp_seq;
     if (total == 0) { out[0]=0; return 0; }
@@ -550,6 +1004,8 @@ extern "C" int gte_rtp_ring_dump_json(char* out, int outsz, int max_count,
         if (seq < oldest || seq >= total) break;
         const GteRtpRec* e = &s_gte_rtp_ring[seq % GTE_RTP_RING_CAP];
         if (frame_filter >= 0 && e->frame != (uint32_t)frame_filter) continue;
+        if (render_filter >= 0 && (int)(e->render_view != 0) != render_filter) continue;
+        if (offset > 0) { --offset; continue; }
         auto sxx = [](int32_t p){ int v=p&0xFFFF; return v>=0x8000? v-0x10000:v; };
         auto syy = [](int32_t p){ int v=(p>>16)&0xFFFF; return v>=0x8000? v-0x10000:v; };
         if (pos > outsz - 700) break;
@@ -557,13 +1013,13 @@ extern "C" int gte_rtp_ring_dump_json(char* out, int outsz, int max_count,
             "%s{\"seq\":%u,\"frame\":%u,\"ra\":\"0x%08X\",\"cmd\":\"0x%08X\","
             "\"V0\":[%d,%d,%d],\"V1\":[%d,%d,%d],\"V2\":[%d,%d,%d],"
             "\"RT\":[%d,%d,%d,%d,%d,%d,%d,%d,%d],\"TR\":[%d,%d,%d],"
-            "\"H\":%u,\"OFX\":%d,\"OFY\":%d,"
+            "\"H\":%u,\"Hs\":%u,\"OFX\":%d,\"OFY\":%d,\"render_view\":%u,"
             "\"S0\":[%d,%d],\"S1\":[%d,%d],\"S2\":[%d,%d],"
             "\"SZ\":[%u,%u,%u],\"FLAG\":\"0x%08X\"}",
             emitted?",":"", e->seq, e->frame, e->caller_ra, e->cmd,
             e->V0[0],e->V0[1],e->V0[2], e->V1[0],e->V1[1],e->V1[2], e->V2[0],e->V2[1],e->V2[2],
             e->RT[0],e->RT[1],e->RT[2],e->RT[3],e->RT[4],e->RT[5],e->RT[6],e->RT[7],e->RT[8],
-            e->TR[0],e->TR[1],e->TR[2], (unsigned)e->H, e->OFX, e->OFY,
+            e->TR[0],e->TR[1],e->TR[2], (unsigned)e->H, (unsigned)e->Hs, e->OFX, e->OFY, e->render_view,
             sxx(e->SXY0),syy(e->SXY0), sxx(e->SXY1),syy(e->SXY1), sxx(e->SXY2),syy(e->SXY2),
             (unsigned)e->SZ1,(unsigned)e->SZ2,(unsigned)e->SZ3, e->FLAG);
         emitted++;
@@ -583,44 +1039,115 @@ extern "C" void gte_set_display_aspect(int num, int den) {
 }
 
 // ---------------------------------------------------------------------------
-// RTPS — Perspective Transformation (internal, operates on given vertex V)
+// VR: perspective (FOV) scale.
+//
+// The PS1 projection distance lives in GTE control register H; psx-spx:
+//     fov = 2*atan(screen_width / (2*H))
+// gte_h_scaled applies H * num / den. A *FOV multiplier* v maps to
+// (num, den) = (1000, v*1000), i.e. H becomes H/v, so v > 1 widens the view.
+// Scaling H here avoids guest-code patches, which cannot change a statically
+// recompiled constant. Identity (num==den) by default, so the faithful path is
+// unchanged. Set from PSX_GTE_FOV_SCALE (float) or gte_set_fov_scale(num, den).
 // ---------------------------------------------------------------------------
-void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
+static int32_t s_h_scale_num = 1;
+static int32_t s_h_scale_den = 1;
+
+extern "C" void gte_set_fov_scale(int num, int den) {
+    if (num <= 0 || den <= 0) { s_h_scale_num = s_h_scale_den = 1; return; }
+    s_h_scale_num = num;
+    s_h_scale_den = den;
+}
+
+static int32_t gte_h_scaled(const GTEState* gte) {
+    if (s_h_scale_num == s_h_scale_den) return gte->H;
+    if (gte->H == 0) return 0;   // a guest H of 0 is a real (degenerate) projection
+    // Both peers must compute identical SXY/MAC/FLAG: the scale is a local
+    // display option, so it is forced to identity for the whole netplay session.
+    if (psx_netplay_active()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "psxrecomp: fov_scale ignored while netplay is active\n");
+        }
+        return gte->H;
+    }
+    int64_t h = (int64_t)gte->H * s_h_scale_num / s_h_scale_den;
+    if (h < 1) h = 1;
+    if (h > 0xFFFF) h = 0xFFFF;
+    return (int32_t)h;
+}
+
+// ---------------------------------------------------------------------------
+// RTPS — Perspective Transformation (internal, operates on given vertex V)
+//
+// Matches DuckStation/Beetle (psx-spx):
+//   MAC1/2/3 = (TR*1000h + RT*V) SAR (sf*12)
+//   IR1/IR2  = limB(MAC, lm)
+//   IR3 FLAG = limB(MAC3_unshifted SAR 12, lm=0); stored IR3 = limB(MAC3, lm)
+//   SZ3      = limE(MAC3_unshifted SAR 12)   — always >>12, independent of sf
+// ---------------------------------------------------------------------------
+void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) {
+    const int  shift = gte_instr_sf(instr);
+    const bool lm    = gte_instr_lm(instr);
+
     // Step 1: Matrix multiplication + translation
-    int64_t mac1 = ((int64_t)gte->TR[0] << 12) +
-                   (int64_t)gte->RT[0][0] * V[0] +
-                   (int64_t)gte->RT[0][1] * V[1] +
-                   (int64_t)gte->RT[0][2] * V[2];
-    int64_t mac2 = ((int64_t)gte->TR[1] << 12) +
-                   (int64_t)gte->RT[1][0] * V[0] +
-                   (int64_t)gte->RT[1][1] * V[1] +
-                   (int64_t)gte->RT[1][2] * V[2];
-    int64_t mac3 = ((int64_t)gte->TR[2] << 12) +
-                   (int64_t)gte->RT[2][0] * V[0] +
-                   (int64_t)gte->RT[2][1] * V[1] +
-                   (int64_t)gte->RT[2][2] * V[2];
+    auto dot = [&](int row, int mac_num) {
+        int64_t acc = ((int64_t)gte->TR[row] + (s_render_rotate ? 0 : s_render_view[row])) * 4096 +
+                      (int64_t)gte->RT[row][0] * V[0];
+        acc = gte_mac44_stage(gte, acc, mac_num);
+        acc += (int64_t)gte->RT[row][1] * V[1];
+        acc = gte_mac44_stage(gte, acc, mac_num);
+        return acc + (int64_t)gte->RT[row][2] * V[2];
+    };
+    int64_t mac1 = dot(0, 1);
+    int64_t mac2 = dot(1, 2);
+    int64_t mac3 = dot(2, 3);
+    if (s_render_rotate) {
+        const int64_t v[3] = {mac1, mac2, mac3};
+        int64_t result[3];
+        for (int row = 0; row < 3; ++row) {
+            int64_t sum = 0;
+            for (int col = 0; col < 3; ++col)
+                sum += v[col] * s_render_pose.rotation_q12[row * 3 + col];
+            result[row] = (sum >> 12) + (int64_t)s_render_view[row] * 4096;
+        }
+        mac1 = result[0]; mac2 = result[1]; mac3 = result[2];
+    }
 
-    gte->check_mac_overflow(mac1 >> 12, 1);
-    gte->check_mac_overflow(mac2 >> 12, 2);
-    gte->check_mac_overflow(mac3 >> 12, 3);
-    gte->MAC1 = static_cast<int32_t>(mac1 >> 12);
-    gte->MAC2 = static_cast<int32_t>(mac2 >> 12);
-    gte->MAC3 = static_cast<int32_t>(mac3 >> 12);
+    // MAC1..3 overflow flags observe the unshifted 44-bit accumulator.
+    gte->check_mac_overflow(mac1, 1);
+    gte->check_mac_overflow(mac2, 2);
+    gte->check_mac_overflow(mac3, 3);
+    gte->MAC1 = static_cast<int32_t>(mac1 >> shift);
+    gte->MAC2 = static_cast<int32_t>(mac2 >> shift);
+    gte->MAC3 = static_cast<int32_t>(mac3 >> shift);
 
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, false);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, false);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, false);
+    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, lm);
+    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, lm);
+    // IR3 quirk (psx-spx / DuckStation): FLAG.22 from (mac3>>12) as if lm=0;
+    // stored IR3 clamps MAC3 with the real lm bit and does not touch FLAG again.
+    (void)gte->saturate_ir(static_cast<int32_t>(mac3 >> 12), 3, false);
+    {
+        int32_t ir3 = gte->MAC3;
+        const int32_t lo = lm ? 0 : -0x8000;
+        if (ir3 < lo) ir3 = lo;
+        if (ir3 > 0x7FFF) ir3 = 0x7FFF;
+        gte->IR3 = static_cast<int16_t>(ir3);
+    }
 
-    // Step 2: Push SZ FIFO
-    gte->push_sz(gte->MAC3);
+    // Step 2: Push SZ FIFO — always unshifted>>12 (not MAC3 when sf=0).
+    gte->push_sz(static_cast<int32_t>(mac3 >> 12));
 
     // Step 3: Perspective division
-    int32_t h_div_sz = gte_divide(gte->H, gte->SZ[3], gte->FLAG);
+    int32_t h_div_sz = gte_divide(gte_h_scaled(gte), gte->SZ[3], gte->FLAG);
 
     // Step 4: Project to screen coordinates. Squash X only when configured AND
     // this frame is being stretched — never on a 4:3-presented frame (FMV /
     // full-2D screen), so content and present stay locked.
     int64_t xterm = (int64_t)gte->IR1 * h_div_sz;
+    /* Horizontal factor applied to xterm below, for the exact-projection
+     * shadow (pgxp_project_precise) to apply the same one. */
+    int64_t x_num = 1, x_den = 1;
     bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_present_native_43();
     const bool dome_call = ws_dome_call_matches();
     // Curved backdrops are authored to cover the original 4:3 projection.
@@ -631,29 +1158,114 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
         /* Depth-gated: un-squash only FAR geometry (the backdrop); keep near
          * props squashed so they stay aligned. Record SZ stats for tuning. */
         int32_t sz = gte->SZ[3];
-        if (sz < s_ws_sz_min) s_ws_sz_min = sz;
-        if (sz > s_ws_sz_max) s_ws_sz_max = sz;
-        s_ws_sz_n++;
-        if (sz >= s_ws_far_threshold) { do_squash = false; s_ws_sz_far++; }
+        if (!s_gte_replay_sandbox) {
+            if (sz < s_ws_sz_min) s_ws_sz_min = sz;
+            if (sz > s_ws_sz_max) s_ws_sz_max = sz;
+            s_ws_sz_n++;
+        }
+        if (sz >= s_ws_far_threshold) {
+            do_squash = false;
+            if (!s_gte_replay_sandbox) s_ws_sz_far++;
+        }
     }
-    if (do_squash)
+    if (do_squash) {
         xterm = xterm * s_ws_xnum / s_ws_xden;
+        x_num = s_ws_xnum;
+        x_den = s_ws_xden;
+    }
     // Native-wide dome expansion remains a diagnostic-only depth probe.
     else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
              !gpu_ws_present_native_43()) {
         int32_t sz = gte->SZ[3];
-        if (sz < s_ws_sz_min) s_ws_sz_min = sz;
-        if (sz > s_ws_sz_max) s_ws_sz_max = sz;
-        s_ws_sz_n++;
+        if (!s_gte_replay_sandbox) {
+            if (sz < s_ws_sz_min) s_ws_sz_min = sz;
+            if (sz > s_ws_sz_max) s_ws_sz_max = sz;
+            s_ws_sz_n++;
+        }
         if (sz >= s_ws_far_threshold) {
             xterm = xterm * s_ws_dome_num / s_ws_dome_den;
-            s_ws_sz_far++;
+            x_num = s_ws_dome_num;
+            x_den = s_ws_dome_den;
+            if (!s_gte_replay_sandbox) s_ws_sz_far++;
         }
     }
     dome_probe_note(gte->SZ[3]);   /* locate the dome draw fn (far-vertex tally) */
-    int64_t sx = (gte->OFX + xterm) >> 16;
-    int64_t sy = (gte->OFY + (int64_t)gte->IR2 * h_div_sz) >> 16;
+    int64_t sx16 = gte->OFX + xterm;
+    int64_t sy16 = gte->OFY + (int64_t)gte->IR2 * h_div_sz;
+    /* Render-view projection override (psx_mod_render_view, projection=1).
+     * Only reachable inside a render-pass sandbox (set/restored by render_pass.c,
+     * rolled back with the GTE state), so no guest-visible state outside the
+     * pass sees it. It is an explicit per-eye projection and REPLACES the guest
+     * X/Y projection above entirely: the [video] fov_scale scaled-H, the
+     * widescreen/dome squash and guest H do not feed it, except through
+     * projection_h_ref, which deliberately multiplies the focal lengths by
+     * (fov-scaled guest H) / projection_h_ref so a plugin can follow the game's
+     * own per-draw H changes (and fov_scale) when it asks to. The guest-formula
+     * PGXP shadows below (precise projection, projection tracking) describe the
+     * guest projection and are skipped under the override. SZ, MAC0/IR0 depth
+     * cue and the divide flags still come from the guest division above. */
+    const bool proj_override = s_render_pose.projection && gte->SZ[3];
+    if (proj_override) {
+        sx16 = (int64_t)gte->OFX + s_render_pose.cx_delta_q16 +
+               (int64_t)gte->IR1 * s_render_pose.fx_q16 / gte->SZ[3];
+        sy16 = (int64_t)gte->OFY + s_render_pose.cy_delta_q16 +
+               (int64_t)gte->IR2 * s_render_pose.fy_q16 / gte->SZ[3];
+        if (s_render_pose.projection_h_ref) {
+            const int64_t h = gte_h_scaled(gte), ref = s_render_pose.projection_h_ref;
+            sx16 = (int64_t)gte->OFX + s_render_pose.cx_delta_q16 +
+                   ((int64_t)gte->IR1 * s_render_pose.fx_q16 / gte->SZ[3]) * h / ref;
+            sy16 = (int64_t)gte->OFY + s_render_pose.cy_delta_q16 +
+                   ((int64_t)gte->IR2 * s_render_pose.fy_q16 / gte->SZ[3]) * h / ref;
+        }
+    }
+    /* RTPS/RTPT reuse MAC0's overflow flags for each projected X/Y
+     * accumulator before MAC0 is replaced by the depth-cue result. */
+    gte->check_mac0_overflow(sx16);
+    gte->check_mac0_overflow(sy16);
+    int64_t sx = sx16 >> 16;
+    int64_t sy = sy16 >> 16;
     gte->push_sxy(sx, sy);
+    if (!s_gte_replay_sandbox) {
+        /* Bound the 16.16 transport so an extreme projection cannot wrap an
+         * int32 and masquerade as a valid on-screen shadow. */
+        const int64_t kLim = (int64_t)4096 << 16;
+        int64_t cx16 = sx16 < -kLim ? -kLim : (sx16 > kLim - 1 ? kLim - 1 : sx16);
+        int64_t cy16 = sy16 < -kLim ? -kLim : (sy16 > kLim - 1 ? kLim - 1 : sy16);
+        int32_t px16 = (int32_t)cx16, py16 = (int32_t)cy16;
+        /* Preserve projection precision (G1.11): shadow the exact projection
+         * instead when the vertex qualifies and it lies inside the GPU's
+         * truncation-agreement window; outside it the IR path's shadow is
+         * kept, so the vertex still draws precise rather than being rejected
+         * to native. Shadow only; the guest SXY, MAC and FLAG above are
+         * already final. Skipped while the hooks record nothing (speculative
+         * passes), where the shadow would be dropped anyway. */
+        if (!proj_override && pgxp_preserve_projection() && pgxp_active()) {
+            int32_t ex16, ey16;
+            if (pgxp_project_precise(mac1, mac2, mac3, shift, gte->IR1, gte->IR2,
+                                     gte->SZ[3], gte_h_scaled(gte), gte->OFX, gte->OFY,
+                                     x_num, x_den, &ex16, &ey16) &&
+                pgxp_ppp_accept(ex16, ey16, (uint32_t)gte->SXY[2])) {
+                px16 = ex16;
+                py16 = ey16;
+            }
+        }
+        pgxp_gte_push_sxy(px16, py16, gte->SZ[3], (uint32_t)gte->SXY[2]);
+        if (!proj_override && pgxp_projection_tracking() && shift == 12 && !lm) {
+            const double z = (double)(mac3 >> 12);
+            const double h_proj = (double)gte_h_scaled(gte);
+            double hx = (double)gte->MAC1 * h_proj;
+            if (do_squash) hx = hx * s_ws_xnum / s_ws_xden;
+            else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
+                     !gpu_ws_present_native_43() && gte->SZ[3] >= s_ws_far_threshold)
+                hx = hx * s_ws_dome_num / s_ws_dome_den;
+            PGXPProjection projection = {
+                (float)(gte->OFX / 65536.0 * z + hx),
+                (float)(gte->OFY / 65536.0 * z + (double)gte->MAC2 * h_proj),
+                (float)z, (float)h_proj / 2.0f};
+            pgxp_gte_set_projection(&projection);
+        }
+    }
+    geom_note((uint32_t)gte->SXY[2], sx16, sy16);
 
     // Step 5: Depth cueing (MAC0/IR0) — only for last vertex of RTPT or RTPS
     if (setMac0) {
@@ -667,47 +1279,249 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
 // RTPS (0x01) — single vertex, always sets MAC0
 void gte_rtps(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    gte_rtps_internal(gte, gte->V0, true);
+    gte_rtps_internal(gte, gte->V0, true, instr);
     gte->set_error_flag();
 }
 
 // RTPT (0x30) — triple vertex, only last sets MAC0
 void gte_rtpt(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    gte_rtps_internal(gte, gte->V0, false);
-    gte_rtps_internal(gte, gte->V1, false);
-    gte_rtps_internal(gte, gte->V2, true);
+    gte_rtps_internal(gte, gte->V0, false, instr);
+    gte_rtps_internal(gte, gte->V1, false, instr);
+    gte_rtps_internal(gte, gte->V2, true, instr);
     gte->set_error_flag();
 }
 
 // ---------------------------------------------------------------------------
 // NCLIP (0x06) — Normal Clipping (2D cross product for backface culling)
 // ---------------------------------------------------------------------------
+static uint64_t s_nclip_precise_hits = 0;
+static uint64_t s_nclip_fallbacks = 0;
+static uint64_t s_nclip_disagreements = 0;
+static int32_t s_nclip_last_native = 0;
+static int8_t s_nclip_last_precise_sign = 0;
+static bool s_nclip_last_precise_valid = false;
+static bool s_nclip_last_horizontal_saturated = false;
+static uint32_t s_nclip_last_generation;
+static int32_t s_nclip_previous_native;
+static int8_t s_nclip_previous_precise_sign;
+static bool s_nclip_previous_precise_valid;
+static bool s_nclip_previous_horizontal_saturated;
+static uint32_t s_nclip_previous_generation;
+static void gte_nclip_precision_invalidate() {
+    s_nclip_last_precise_valid = false;
+    s_nclip_previous_precise_valid = false;
+}
+extern "C" void gte_nclip_precise_stats(uint64_t *hits, uint64_t *fallbacks,
+                                        uint64_t *disagreements) {
+    if (hits) *hits = s_nclip_precise_hits;
+    if (fallbacks) *fallbacks = s_nclip_fallbacks;
+    if (disagreements) *disagreements = s_nclip_disagreements;
+}
+/* Always-on attribution tables (gte_nclip_stats.h): producers by guest
+ * function, consumers by branch PC. Open addressing; a full table drops new
+ * keys (counted in s_nclip_*_dropped) rather than evicting. */
+static GteNclipFuncStat s_nclip_func[GTE_NCLIP_STAT_CAP];  /* key 1 = unknown */
+static GteNclipSiteStat s_nclip_site[GTE_NCLIP_STAT_CAP];
+static uint32_t s_nclip_func_dropped = 0, s_nclip_site_dropped = 0;
+static inline uint32_t nclip_slot(uint32_t key) {
+    return (key * 2654435761u) >> 24;   /* GTE_NCLIP_STAT_CAP == 256 */
+}
+template <typename T>
+static T *nclip_find(T *table, uint32_t key, uint32_t T::*field,
+                     uint32_t *dropped) {
+    for (uint32_t i = 0, s = nclip_slot(key); i < GTE_NCLIP_STAT_CAP;
+         ++i, s = (s + 1) & (GTE_NCLIP_STAT_CAP - 1)) {
+        T *e = &table[s];
+        if (e->*field == key) return e;
+        if (e->*field == 0) { e->*field = key; return e; }
+    }
+    ++*dropped;
+    return nullptr;
+}
+extern "C" int gte_nclip_func_stats(GteNclipFuncStat *out, int max) {
+    int n = 0;
+    for (int i = 0; i < GTE_NCLIP_STAT_CAP && n < max; ++i)
+        if (s_nclip_func[i].func) out[n++] = s_nclip_func[i];
+    return n;
+}
+extern "C" int gte_nclip_site_stats(GteNclipSiteStat *out, int max) {
+    int n = 0;
+    for (int i = 0; i < GTE_NCLIP_STAT_CAP && n < max; ++i)
+        if (s_nclip_site[i].pc) out[n++] = s_nclip_site[i];
+    return n;
+}
+extern "C" void gte_nclip_stats_reset(void) {
+    memset(s_nclip_func, 0, sizeof s_nclip_func);
+    memset(s_nclip_site, 0, sizeof s_nclip_site);
+    s_nclip_func_dropped = s_nclip_site_dropped = 0;
+}
+static int s_nclip_exact_enabled = 1;
+extern "C" void gte_nclip_exact_set_enabled(int on) { s_nclip_exact_enabled = on ? 1 : 0; }
+extern "C" int gte_nclip_exact_enabled(void) { return s_nclip_exact_enabled; }
+extern "C" int32_t gte_nclip_exact_sign(int32_t native_mac0, uint32_t pc) {
+    const int32_t native = native_mac0 < 0 ? -1 : (native_mac0 > 0 ? 1 : 0);
+    const bool usable = s_nclip_exact_enabled && s_nclip_last_precise_valid &&
+                        native_mac0 == s_nclip_last_native;
+    const int32_t sign = usable ? s_nclip_last_precise_sign : native;
+    if (!s_gte_replay_sandbox && s_speculative_depth == 0) {
+        if (GteNclipSiteStat *e = nclip_find(s_nclip_site, pc,
+                                             &GteNclipSiteStat::pc,
+                                             &s_nclip_site_dropped)) {
+            e->evals++;
+            if (!usable) e->fallbacks++;
+            else if (sign != native) e->flips++;
+            e->last_frame = (uint32_t)s_frame_count;
+        }
+    }
+    return sign;
+}
+extern "C" int gte_nclip_native_wide_sign(int32_t native_mac0, int* sign) {
+    if (!s_nclip_last_precise_valid || !s_nclip_last_horizontal_saturated ||
+        native_mac0 != s_nclip_last_native || s_nclip_last_generation != s_geom_generation ||
+        s_gte_replay_sandbox || s_speculative_depth != 0) return 0;
+    *sign = s_nclip_last_precise_sign;
+    return 1;
+}
+/* Some guarded quad consumers save two MAC0 values before branching. Their
+ * first branch must use the first command's provenance, even when both native
+ * results are equal. This is explicitly selected by the title, never searched
+ * as a fallback for arbitrary architectural MAC0 readers. */
+extern "C" int gte_nclip_native_wide_previous_sign(int32_t native_mac0, int* sign) {
+    if (!s_nclip_previous_precise_valid || !s_nclip_previous_horizontal_saturated ||
+        native_mac0 != s_nclip_previous_native || s_nclip_previous_generation != s_geom_generation ||
+        s_gte_replay_sandbox || s_speculative_depth != 0) return 0;
+    *sign = s_nclip_previous_precise_sign;
+    return 1;
+}
+
 void gte_nclip(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    int16_t sx0 = static_cast<int16_t>(gte->SXY[0] & 0xFFFF);
-    int16_t sy0 = static_cast<int16_t>(gte->SXY[0] >> 16);
-    int16_t sx1 = static_cast<int16_t>(gte->SXY[1] & 0xFFFF);
-    int16_t sy1 = static_cast<int16_t>(gte->SXY[1] >> 16);
-    int16_t sx2 = static_cast<int16_t>(gte->SXY[2] & 0xFFFF);
-    int16_t sy2 = static_cast<int16_t>(gte->SXY[2] >> 16);
+    int32_t sx0 = static_cast<int16_t>(gte->SXY[0] & 0xFFFF);
+    int32_t sy0 = static_cast<int16_t>(gte->SXY[0] >> 16);
+    int32_t sx1 = static_cast<int16_t>(gte->SXY[1] & 0xFFFF);
+    int32_t sy1 = static_cast<int16_t>(gte->SXY[1] >> 16);
+    int32_t sx2 = static_cast<int16_t>(gte->SXY[2] & 0xFFFF);
+    int32_t sy2 = static_cast<int16_t>(gte->SXY[2] >> 16);
     int64_t mac0 = (int64_t)sx0 * (sy1 - sy2) +
                    (int64_t)sx1 * (sy2 - sy0) +
                    (int64_t)sx2 * (sy0 - sy1);
     gte->check_mac0_overflow(mac0);
-    gte->MAC0 = static_cast<int32_t>(mac0);
+    int32_t out = static_cast<int32_t>(mac0);
+    /* PGXP's NCLIP (docs/ENHANCEMENTS.md G1.12). While geometry correction is
+     * armed, compare the sign of the exact determinant of the three vertices
+     * PGXP will draw with the integer one; a disagreement is a face the game
+     * culls (or keeps) on a winding the drawn face does not have. Counted
+     * always; with precise culling on, MAC0 takes the exact sign. Never in a
+     * pass that is compared against another execution of the same code: the
+     * speculative and replay passes record no shadows, so the overlay shadow
+     * diff holds it off for its interpreter pass too and both passes see the
+     * integer MAC0. FLAG keeps the integer result's overflow bits. */
+    if (s_geom_enabled && !s_gte_replay_sandbox && s_speculative_depth == 0 &&
+        !psx_overlay_shadow_diff_active()) {
+        const uint32_t words[3] = { (uint32_t)gte->SXY[0], (uint32_t)gte->SXY[1],
+                                    (uint32_t)gte->SXY[2] };
+        int64_t cross = 0;
+        if (pgxp_gte_nclip_precise(words, &cross)) {
+            const int sp = (cross > 0) - (cross < 0);
+            const int sn = (out > 0) - (out < 0);
+            if (sp != 0 && sp != sn) {
+                const int corrected = pgxp_culling();
+                if (corrected) {
+                    const uint64_t mag = cross < 0 ? (uint64_t)(-cross)
+                                                   : (uint64_t)cross;
+                    uint64_t area = (mag + (1ull << 31)) >> 32;
+                    if (area < 1) area = 1;
+                    if (area > 0x7FFFFFFFull) area = 0x7FFFFFFFull;
+                    out = sp > 0 ? (int32_t)area : -(int32_t)area;
+                }
+                pgxp_note_nclip(1, corrected);
+            }
+        }
+    }
+    s_nclip_previous_native = s_nclip_last_native;
+    s_nclip_previous_precise_sign = s_nclip_last_precise_sign;
+    s_nclip_previous_precise_valid = s_nclip_last_precise_valid &&
+        !s_gte_replay_sandbox && s_speculative_depth == 0;
+    s_nclip_previous_horizontal_saturated = s_nclip_last_horizontal_saturated;
+    s_nclip_previous_generation = s_nclip_last_generation;
+    s_nclip_last_native = out;
+    s_nclip_last_precise_valid = false;
+    s_nclip_last_horizontal_saturated = false;
+    /* Compute an exact 16.16 determinant for configured branch consumers, but
+     * preserve native guest-visible MAC0 for every architectural reader. */
+    int32_t px0, py0, px1, py1, px2, py2;
+    if (gpu_ws_precise_nclip_enabled() &&
+        !s_gte_replay_sandbox && s_speculative_depth == 0 &&
+        pgxp_get_gte_sxy_checked(0, gte->SXY[0], 1, &px0, &py0) &&
+        pgxp_get_gte_sxy_checked(1, gte->SXY[1], 1, &px1, &py1) &&
+        pgxp_get_gte_sxy_checked(2, gte->SXY[2], 1, &px2, &py2)) {
+        s_nclip_precise_hits++;
+        const int64_t dx10 = (int64_t)px1 - px0;
+        const int64_t dy10 = (int64_t)py1 - py0;
+        const int64_t dx20 = (int64_t)px2 - px0;
+        const int64_t dy20 = (int64_t)py2 - py0;
+        const int64_t cross = dx10 * dy20 - dy10 * dx20;
+        s_nclip_last_precise_sign = cross < 0 ? -1 : (cross > 0 ? 1 : 0);
+        s_nclip_last_precise_valid = true;
+        s_nclip_last_generation = s_geom_generation;
+        /* Narrow rescue: exact Y still agrees with the architectural FIFO,
+         * depth is outside the GTE near region, and at least one X exceeded
+         * the matching saturation rail. Ordinary subpixel winding stays stock. */
+        const int raw_x[3] = {sx0, sx1, sx2}, raw_y[3] = {sy0, sy1, sy2};
+        const int32_t exact_x[3] = {px0, px1, px2}, exact_y[3] = {py0, py1, py2};
+        bool checked = true, saturated = false;
+        for (int i = 0; i < 3; ++i) {
+            const int x = exact_x[i] >> 16;
+            checked &= (exact_y[i] >> 16) == raw_y[i] && x > -4096 && x < 4096;
+            checked &= gte->SZ[i + 1] >= gte_h_scaled(gte) / 2 && gte->SZ[i + 1] != 0;
+            if (raw_x[i] == 1023 && x > 1023) saturated = true;
+            else if (raw_x[i] == -1024 && x < -1024) saturated = true;
+            else checked &= x == raw_x[i];
+        }
+        s_nclip_last_horizontal_saturated = checked && saturated;
+        const bool disagree = (cross > 0 && out <= 0) || (cross < 0 && out >= 0);
+        if (disagree)
+            s_nclip_disagreements++;
+        /* Last guest store before this NCLIP: codegen stamps it on every
+         * store, so it lands inside the emitter that issued the NCLIP (the
+         * function stamp is not maintained for static code). */
+        const uint32_t key = g_debug_last_store_pc ? g_debug_last_store_pc : 1u;
+        if (GteNclipFuncStat *e = nclip_find(s_nclip_func, key,
+                                             &GteNclipFuncStat::func,
+                                             &s_nclip_func_dropped)) {
+            e->nclips++;
+            if (disagree) e->disagree++;
+            if (sx0 == -0x400 || sx0 == 0x3FF || sy0 == -0x400 || sy0 == 0x3FF ||
+                sx1 == -0x400 || sx1 == 0x3FF || sy1 == -0x400 || sy1 == 0x3FF ||
+                sx2 == -0x400 || sx2 == 0x3FF || sy2 == -0x400 || sy2 == 0x3FF)
+                e->saturated++;
+            e->last_frame = (uint32_t)s_frame_count;
+        }
+    } else if (gpu_ws_precise_nclip_enabled() &&
+               !s_gte_replay_sandbox && s_speculative_depth == 0) {
+        s_nclip_fallbacks++;
+    }
+    gte->MAC0 = out;
     gte->set_error_flag();
 }
 
 // ---------------------------------------------------------------------------
 // AVSZ3 (0x2D) — Average Z (3 points)
 // ---------------------------------------------------------------------------
+// Hardware (psx-spx / DuckStation): MAC0 keeps ZSF3*(SZ1+SZ2+SZ3); only OTZ
+// gets MAC0/1000h. CTR NdIntroWoodEmitHelper indexes the batch OT with
+// MAC0>>17 (== OTZ>>5). Shifting MAC0 here collapsed every face into slot 0
+// (arms/trophy/chest z-fight + missing banner under later same-bucket paint).
 void gte_avsz3(GTEState* gte, uint32_t instr) {
+    (void)instr;
     gte->FLAG = 0;
-    int64_t mac0 = (int64_t)gte->ZSF3 * (gte->SZ[1] + gte->SZ[2] + gte->SZ[3]);
+    const int64_t sum =
+        (int64_t)(uint32_t)gte->SZ[1] + gte->SZ[2] + gte->SZ[3];
+    const int64_t mac0 = (int64_t)gte->ZSF3 * sum;
     gte->check_mac0_overflow(mac0);
-    gte->MAC0 = static_cast<int32_t>(mac0 >> 12);
-    gte->OTZ = gte->saturate_sz(gte->MAC0);
+    gte->MAC0 = static_cast<int32_t>(mac0);
+    gte->OTZ = gte->saturate_sz(static_cast<int32_t>(mac0 >> 12));
     gte->set_error_flag();
 }
 
@@ -715,11 +1529,14 @@ void gte_avsz3(GTEState* gte, uint32_t instr) {
 // AVSZ4 (0x2E) — Average Z (4 points)
 // ---------------------------------------------------------------------------
 void gte_avsz4(GTEState* gte, uint32_t instr) {
+    (void)instr;
     gte->FLAG = 0;
-    int64_t mac0 = (int64_t)gte->ZSF4 * (gte->SZ[0] + gte->SZ[1] + gte->SZ[2] + gte->SZ[3]);
+    const int64_t sum = (int64_t)(uint32_t)gte->SZ[0] + gte->SZ[1] +
+                        gte->SZ[2] + gte->SZ[3];
+    const int64_t mac0 = (int64_t)gte->ZSF4 * sum;
     gte->check_mac0_overflow(mac0);
-    gte->MAC0 = static_cast<int32_t>(mac0 >> 12);
-    gte->OTZ = gte->saturate_sz(gte->MAC0);
+    gte->MAC0 = static_cast<int32_t>(mac0);
+    gte->OTZ = gte->saturate_sz(static_cast<int32_t>(mac0 >> 12));
     gte->set_error_flag();
 }
 
@@ -755,8 +1572,15 @@ void gte_ncct(GTEState* gte, uint32_t instr) {
 void gte_ncds_internal(GTEState* gte, int16_t* V, uint32_t instr) {
     light_transform(gte, V, instr);
     light_color(gte, instr);
-    depth_cue_from_ir(gte, instr);
-    color_output(gte, instr);
+    const uint8_t r = (gte->RGBC >> 0) & 0xFF;
+    const uint8_t g = (gte->RGBC >> 8) & 0xFF;
+    const uint8_t b = (gte->RGBC >> 16) & 0xFF;
+    depth_cue_from_mac(gte,
+                       (int64_t)r * gte->IR1 * 16,
+                       (int64_t)g * gte->IR2 * 16,
+                       (int64_t)b * gte->IR3 * 16,
+                       instr);
+    push_rgb_from_mac(gte);
 }
 
 void gte_ncds(GTEState* gte, uint32_t instr) {
@@ -814,17 +1638,9 @@ void gte_dpcs(GTEState* gte, uint32_t instr) {
     uint8_t r = (gte->RGBC >> 0)  & 0xFF;
     uint8_t g = (gte->RGBC >> 8)  & 0xFF;
     uint8_t b = (gte->RGBC >> 16) & 0xFF;
-    // MAC = RGBC << 4
-    gte->IR1 = gte->saturate_ir(r << 4, 1, false);
-    gte->IR2 = gte->saturate_ir(g << 4, 2, false);
-    gte->IR3 = gte->saturate_ir(b << 4, 3, false);
-    // Interpolate toward far color using IR0
-    depth_cue_from_ir(gte, instr);
-    // Output
-    gte->push_rgb(
-        gte->saturate_color(gte->MAC1 >> 4, 0),
-        gte->saturate_color(gte->MAC2 >> 4, 1),
-        gte->saturate_color(gte->MAC3 >> 4, 2));
+    depth_cue_from_mac(gte, (int64_t)r << 16, (int64_t)g << 16,
+                       (int64_t)b << 16, instr);
+    push_rgb_from_mac(gte);
     gte->set_error_flag();
 }
 
@@ -837,14 +1653,9 @@ void gte_dpct(GTEState* gte, uint32_t instr) {
         uint8_t r = (gte->RGB[0] >> 0)  & 0xFF;
         uint8_t g = (gte->RGB[0] >> 8)  & 0xFF;
         uint8_t b = (gte->RGB[0] >> 16) & 0xFF;
-        gte->IR1 = gte->saturate_ir(r << 4, 1, false);
-        gte->IR2 = gte->saturate_ir(g << 4, 2, false);
-        gte->IR3 = gte->saturate_ir(b << 4, 3, false);
-        depth_cue_from_ir(gte, instr);
-        gte->push_rgb(
-            gte->saturate_color(gte->MAC1 >> 4, 0),
-            gte->saturate_color(gte->MAC2 >> 4, 1),
-            gte->saturate_color(gte->MAC3 >> 4, 2));
+        depth_cue_from_mac(gte, (int64_t)r << 16, (int64_t)g << 16,
+                           (int64_t)b << 16, instr);
+        push_rgb_from_mac(gte);
     }
     gte->set_error_flag();
 }
@@ -858,18 +1669,12 @@ void gte_dpcl(GTEState* gte, uint32_t instr) {
     uint8_t r = (gte->RGBC >> 0)  & 0xFF;
     uint8_t g = (gte->RGBC >> 8)  & 0xFF;
     uint8_t b = (gte->RGBC >> 16) & 0xFF;
-    gte->MAC1 = (r * gte->IR1) >> 8;
-    gte->MAC2 = (g * gte->IR2) >> 8;
-    gte->MAC3 = (b * gte->IR3) >> 8;
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, gte_instr_lm(instr));
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, gte_instr_lm(instr));
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, gte_instr_lm(instr));
-    // Depth cue toward far color
-    depth_cue_from_ir(gte, instr);
-    gte->push_rgb(
-        gte->saturate_color(gte->MAC1 >> 4, 0),
-        gte->saturate_color(gte->MAC2 >> 4, 1),
-        gte->saturate_color(gte->MAC3 >> 4, 2));
+    depth_cue_from_mac(gte,
+                       (int64_t)r * gte->IR1 * 16,
+                       (int64_t)g * gte->IR2 * 16,
+                       (int64_t)b * gte->IR3 * 16,
+                       instr);
+    push_rgb_from_mac(gte);
     gte->set_error_flag();
 }
 
@@ -879,10 +1684,7 @@ void gte_dpcl(GTEState* gte, uint32_t instr) {
 void gte_intpl(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
     depth_cue_from_ir(gte, instr);
-    gte->push_rgb(
-        gte->saturate_color(gte->MAC1 >> 4, 0),
-        gte->saturate_color(gte->MAC2 >> 4, 1),
-        gte->saturate_color(gte->MAC3 >> 4, 2));
+    push_rgb_from_mac(gte);
     gte->set_error_flag();
 }
 
@@ -893,8 +1695,15 @@ void gte_cdp(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
     // IR1/IR2/IR3 already set (from previous NCS or similar)
     light_color(gte, instr);
-    depth_cue_from_ir(gte, instr);
-    color_output(gte, instr);
+    const uint8_t r = (gte->RGBC >> 0) & 0xFF;
+    const uint8_t g = (gte->RGBC >> 8) & 0xFF;
+    const uint8_t b = (gte->RGBC >> 16) & 0xFF;
+    depth_cue_from_mac(gte,
+                       (int64_t)r * gte->IR1 * 16,
+                       (int64_t)g * gte->IR2 * 16,
+                       (int64_t)b * gte->IR3 * 16,
+                       instr);
+    push_rgb_from_mac(gte);
     gte->set_error_flag();
 }
 
@@ -917,7 +1726,8 @@ void gte_mvmva(GTEState* gte, uint32_t instr) {
     uint32_t mx = (instr >> 17) & 3;  // Matrix: 0=RT, 1=Light, 2=LightColor, 3=reserved
     uint32_t vv = (instr >> 15) & 3;  // Vector: 0=V0, 1=V1, 2=V2, 3=IR
     uint32_t tv = (instr >> 13) & 3;  // Translation: 0=TR, 1=BK, 2=FC/bugged, 3=none
-    int sf = (instr >> 19) & 1;        // Shift: 0=no shift, 1=shift right 12
+    const int shift = gte_instr_sf(instr);
+    const bool lm = gte_instr_lm(instr);
 
     // Select matrix
     int16_t M[3][3];
@@ -925,7 +1735,18 @@ void gte_mvmva(GTEState* gte, uint32_t instr) {
         case 0: std::memcpy(M, gte->RT, sizeof(M)); break;
         case 1: std::memcpy(M, gte->L, sizeof(M)); break;
         case 2: std::memcpy(M, gte->LC, sizeof(M)); break;
-        default: std::memset(M, 0, sizeof(M)); break; // Garbage on real HW
+        default: {
+            /* Undocumented matrix selector wiring, verified by hardware
+             * register vectors (also used by Beetle/DuckStation). */
+            const int16_t color = static_cast<int16_t>(
+                static_cast<uint16_t>(gte->RGBC & 0xFFu) << 4);
+            M[0][0] = static_cast<int16_t>(-color);
+            M[0][1] = color;
+            M[0][2] = gte->IR0;
+            M[1][0] = M[1][1] = M[1][2] = gte->RT[0][2];
+            M[2][0] = M[2][1] = M[2][2] = gte->RT[1][1];
+            break;
+        }
     }
 
     // Select vector
@@ -940,35 +1761,61 @@ void gte_mvmva(GTEState* gte, uint32_t instr) {
     // Select translation vector
     int64_t T[3];
     switch (tv) {
-        case 0: T[0] = (int64_t)gte->TR[0] << 12; T[1] = (int64_t)gte->TR[1] << 12; T[2] = (int64_t)gte->TR[2] << 12; break;
-        case 1: T[0] = (int64_t)gte->BK[0] << 12; T[1] = (int64_t)gte->BK[1] << 12; T[2] = (int64_t)gte->BK[2] << 12; break;
-        case 2: T[0] = (int64_t)gte->FC[0] << 12; T[1] = (int64_t)gte->FC[1] << 12; T[2] = (int64_t)gte->FC[2] << 12; break;
+        case 0: T[0] = (int64_t)gte->TR[0] * 4096; T[1] = (int64_t)gte->TR[1] * 4096; T[2] = (int64_t)gte->TR[2] * 4096; break;
+        case 1: T[0] = (int64_t)gte->BK[0] * 4096; T[1] = (int64_t)gte->BK[1] * 4096; T[2] = (int64_t)gte->BK[2] * 4096; break;
+        case 2: T[0] = (int64_t)gte->FC[0] * 4096; T[1] = (int64_t)gte->FC[1] * 4096; T[2] = (int64_t)gte->FC[2] * 4096; break;
         case 3: T[0] = 0; T[1] = 0; T[2] = 0; break;
     }
 
-    // Multiply
-    int64_t mac1 = T[0] + (int64_t)M[0][0] * V[0] + (int64_t)M[0][1] * V[1] + (int64_t)M[0][2] * V[2];
-    int64_t mac2 = T[1] + (int64_t)M[1][0] * V[0] + (int64_t)M[1][1] * V[1] + (int64_t)M[1][2] * V[2];
-    int64_t mac3 = T[2] + (int64_t)M[2][0] * V[0] + (int64_t)M[2][1] * V[1] + (int64_t)M[2][2] * V[2];
+    auto set_mac_ir = [&](int row, int64_t value) {
+        const int mac_num = row + 1;
+        value = gte_mac44_stage(gte, value, mac_num) >> shift;
+        int32_t mac = static_cast<int32_t>(value);
+        if (row == 0) { gte->MAC1 = mac; gte->IR1 = gte->saturate_ir(mac, 1, lm); }
+        if (row == 1) { gte->MAC2 = mac; gte->IR2 = gte->saturate_ir(mac, 2, lm); }
+        if (row == 2) { gte->MAC3 = mac; gte->IR3 = gte->saturate_ir(mac, 3, lm); }
+    };
 
-    if (sf) {
-        mac1 >>= 12; mac2 >>= 12; mac3 >>= 12;
+    for (int row = 0; row < 3; ++row) {
+        const int mac_num = row + 1;
+        if (tv == 2) {
+            /* Hardware's FC translation selector is wired incorrectly: its
+             * translation+X term only feeds a temporary IR saturation, then
+             * MAC/IR are replaced by the Y/Z dot product. */
+            int64_t first = gte_mac44_stage(
+                gte, T[row] + (int64_t)M[row][0] * V[0], mac_num);
+            int32_t temporary = static_cast<int32_t>(first >> shift);
+            if (row == 0) gte->IR1 = gte->saturate_ir(temporary, 1, false);
+            if (row == 1) gte->IR2 = gte->saturate_ir(temporary, 2, false);
+            if (row == 2) gte->IR3 = gte->saturate_ir(temporary, 3, false);
+            int64_t tail = gte_mac44_stage(
+                gte, (int64_t)M[row][1] * V[1], mac_num);
+            set_mac_ir(row, tail + (int64_t)M[row][2] * V[2]);
+        } else {
+            int64_t acc = gte_mac44_stage(
+                gte, T[row] + (int64_t)M[row][0] * V[0], mac_num);
+            acc = gte_mac44_stage(
+                gte, acc + (int64_t)M[row][1] * V[1], mac_num);
+            set_mac_ir(row, acc + (int64_t)M[row][2] * V[2]);
+        }
     }
 
-    gte->check_mac_overflow(mac1, 1);
-    gte->check_mac_overflow(mac2, 2);
-    gte->check_mac_overflow(mac3, 3);
-
-    gte->MAC1 = static_cast<int32_t>(mac1);
-    gte->MAC2 = static_cast<int32_t>(mac2);
-    gte->MAC3 = static_cast<int32_t>(mac3);
-
-    bool lm = (instr >> 10) & 1;
-    gte->IR1 = gte->saturate_ir(gte->MAC1, 1, lm);
-    gte->IR2 = gte->saturate_ir(gte->MAC2, 2, lm);
-    gte->IR3 = gte->saturate_ir(gte->MAC3, 3, lm);
-
     gte->set_error_flag();
+
+    /* PGXP scalar tier: MVMVA used as a multiplier on tracked vertex halves
+     * (CTC2'd matrix rows) - hand the engine the operands as used and the
+     * results, so MFC2 of MAC / IR can carry the precise weighted sum. */
+    if (!s_gte_replay_sandbox) {
+        PGXPMvmva op;
+        op.mx = mx; op.vv = vv; op.tv = tv; op.shift = shift;
+        std::memcpy(op.m, M, sizeof op.m);
+        std::memcpy(op.v, V, sizeof op.v);
+        std::memcpy(op.t, T, sizeof op.t);
+        op.mac[0] = gte->MAC1; op.mac[1] = gte->MAC2; op.mac[2] = gte->MAC3;
+        op.ir[0] = gte->IR1;   op.ir[1] = gte->IR2;   op.ir[2] = gte->IR3;
+        op.flag = gte->FLAG;
+        pgxp_gte_mvmva(&op);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,9 +1909,9 @@ void gte_gpl(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
     int sf = (instr >> 19) & 1;
 
-    int64_t mac1 = ((int64_t)gte->MAC1 << (sf ? 12 : 0)) + (int64_t)gte->IR0 * gte->IR1;
-    int64_t mac2 = ((int64_t)gte->MAC2 << (sf ? 12 : 0)) + (int64_t)gte->IR0 * gte->IR2;
-    int64_t mac3 = ((int64_t)gte->MAC3 << (sf ? 12 : 0)) + (int64_t)gte->IR0 * gte->IR3;
+    int64_t mac1 = (sf ? (int64_t)gte->MAC1 * 4096 : (int64_t)gte->MAC1) + (int64_t)gte->IR0 * gte->IR1;
+    int64_t mac2 = (sf ? (int64_t)gte->MAC2 * 4096 : (int64_t)gte->MAC2) + (int64_t)gte->IR0 * gte->IR2;
+    int64_t mac3 = (sf ? (int64_t)gte->MAC3 * 4096 : (int64_t)gte->MAC3) + (int64_t)gte->IR0 * gte->IR3;
 
     if (sf) { mac1 >>= 12; mac2 >>= 12; mac3 >>= 12; }
 
@@ -1115,7 +1962,7 @@ void gte_mtc2(GTEState* gte, uint8_t reg, uint32_t value) {
         case 20: gte->RGB[0] = value; break;
         case 21: gte->RGB[1] = value; break;
         case 22: gte->RGB[2] = value; break;
-        case 23: break; // RES1 reserved
+        case 23: gte->RES1 = value; break;
         case 24: gte->MAC0 = value; break;
         case 25: gte->MAC1 = value; break;
         case 26: gte->MAC2 = value; break;
@@ -1148,11 +1995,11 @@ void gte_mtc2(GTEState* gte, uint8_t reg, uint32_t value) {
 uint32_t gte_mfc2(GTEState* gte, uint8_t reg) {
     switch (reg) {
         case 0:  return (static_cast<uint16_t>(gte->V0[1]) << 16) | static_cast<uint16_t>(gte->V0[0]);
-        case 1:  return static_cast<uint16_t>(gte->V0[2]);
+        case 1:  return static_cast<uint32_t>(static_cast<int32_t>(gte->V0[2]));
         case 2:  return (static_cast<uint16_t>(gte->V1[1]) << 16) | static_cast<uint16_t>(gte->V1[0]);
-        case 3:  return static_cast<uint16_t>(gte->V1[2]);
+        case 3:  return static_cast<uint32_t>(static_cast<int32_t>(gte->V1[2]));
         case 4:  return (static_cast<uint16_t>(gte->V2[1]) << 16) | static_cast<uint16_t>(gte->V2[0]);
-        case 5:  return static_cast<uint16_t>(gte->V2[2]);
+        case 5:  return static_cast<uint32_t>(static_cast<int32_t>(gte->V2[2]));
         case 6:  return gte->RGBC;
         case 7:  return gte->OTZ;
         case 8:  return static_cast<int32_t>(gte->IR0);  // sign-extend
@@ -1170,7 +2017,7 @@ uint32_t gte_mfc2(GTEState* gte, uint8_t reg) {
         case 20: return gte->RGB[0];
         case 21: return gte->RGB[1];
         case 22: return gte->RGB[2];
-        case 23: return 0; // RES1
+        case 23: return gte->RES1;
         case 24: return gte->MAC0;
         case 25: return gte->MAC1;
         case 26: return gte->MAC2;
@@ -1223,7 +2070,10 @@ void gte_ctc2(GTEState* gte, uint8_t reg, uint32_t value) {
         case 28: gte->DQB = value; break;
         case 29: gte->ZSF3 = static_cast<int16_t>(value & 0xFFFF); break;
         case 30: gte->ZSF4 = static_cast<int16_t>(value & 0xFFFF); break;
-        case 31: gte->FLAG = value & 0x7FFFF000u; break;
+        case 31:
+            gte->FLAG = value & 0x7FFFF000u;
+            gte->set_error_flag();
+            break;
         default: break;
     }
 }
@@ -1237,7 +2087,7 @@ uint32_t gte_cfc2(GTEState* gte, uint8_t reg) {
         case 1:  return (static_cast<uint16_t>(gte->RT[1][0]) << 16) | static_cast<uint16_t>(gte->RT[0][2]);
         case 2:  return (static_cast<uint16_t>(gte->RT[1][2]) << 16) | static_cast<uint16_t>(gte->RT[1][1]);
         case 3:  return (static_cast<uint16_t>(gte->RT[2][1]) << 16) | static_cast<uint16_t>(gte->RT[2][0]);
-        case 4:  return static_cast<uint16_t>(gte->RT[2][2]);
+        case 4:  return static_cast<uint32_t>(static_cast<int32_t>(gte->RT[2][2]));
         case 5:  return gte->TR[0];
         case 6:  return gte->TR[1];
         case 7:  return gte->TR[2];
@@ -1245,7 +2095,7 @@ uint32_t gte_cfc2(GTEState* gte, uint8_t reg) {
         case 9:  return (static_cast<uint16_t>(gte->L[1][0]) << 16) | static_cast<uint16_t>(gte->L[0][2]);
         case 10: return (static_cast<uint16_t>(gte->L[1][2]) << 16) | static_cast<uint16_t>(gte->L[1][1]);
         case 11: return (static_cast<uint16_t>(gte->L[2][1]) << 16) | static_cast<uint16_t>(gte->L[2][0]);
-        case 12: return static_cast<uint16_t>(gte->L[2][2]);
+        case 12: return static_cast<uint32_t>(static_cast<int32_t>(gte->L[2][2]));
         case 13: return gte->BK[0];
         case 14: return gte->BK[1];
         case 15: return gte->BK[2];
@@ -1253,13 +2103,14 @@ uint32_t gte_cfc2(GTEState* gte, uint8_t reg) {
         case 17: return (static_cast<uint16_t>(gte->LC[1][0]) << 16) | static_cast<uint16_t>(gte->LC[0][2]);
         case 18: return (static_cast<uint16_t>(gte->LC[1][2]) << 16) | static_cast<uint16_t>(gte->LC[1][1]);
         case 19: return (static_cast<uint16_t>(gte->LC[2][1]) << 16) | static_cast<uint16_t>(gte->LC[2][0]);
-        case 20: return static_cast<uint16_t>(gte->LC[2][2]);
+        case 20: return static_cast<uint32_t>(static_cast<int32_t>(gte->LC[2][2]));
         case 21: return gte->FC[0];
         case 22: return gte->FC[1];
         case 23: return gte->FC[2];
         case 24: return gte->OFX;
         case 25: return gte->OFY;
-        case 26: return gte->H;
+        case 26: return static_cast<uint32_t>(static_cast<int32_t>(
+                            static_cast<int16_t>(gte->H)));
         case 27: return static_cast<int32_t>(gte->DQA); // sign-extend
         case 28: return gte->DQB;
         case 29: return static_cast<int32_t>(gte->ZSF3);
@@ -1277,29 +2128,238 @@ uint32_t gte_cfc2(GTEState* gte, uint8_t reg) {
 // ---------------------------------------------------------------------------
 static uint64_t s_gte_exec_count = 0;
 extern "C" uint64_t gte_get_exec_count(void) { return s_gte_exec_count; }
-
-extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
+static uint32_t s_gte_replay_saved_caller_ra = 0;
+extern "C" int gte_replay_side_effects_begin(void) {
     using namespace PSXRecomp::GTE;
-    s_gte_exec_count++;
+    if (s_gte_replay_sandbox) return 0;
+    s_gte_replay_saved_caller_ra = s_gte_caller_ra;
+    s_gte_replay_sandbox = 1;
+    pgxp_suppress_begin();
+    return 1;
+}
+extern "C" void gte_replay_side_effects_end(void) {
+    using namespace PSXRecomp::GTE;
+    if (!s_gte_replay_sandbox) return;
+    pgxp_suppress_end();
+    s_gte_caller_ra = s_gte_replay_saved_caller_ra;
+    s_gte_replay_sandbox = 0;
+}
+
+static uint32_t gte_cpu_lzcr(uint32_t value);
+
+static inline int16_t gte_unpack_s16(uint32_t value) {
+    return static_cast<int16_t>(value & 0xFFFFu);
+}
+
+static inline uint32_t gte_pack_s16_pair(int16_t lo, int16_t hi) {
+    return static_cast<uint32_t>(static_cast<uint16_t>(lo)) |
+           (static_cast<uint32_t>(static_cast<uint16_t>(hi)) << 16);
+}
+
+/* Exact full marshaling for GTE commands. Keep this explicit: GTEState has
+ * mixed-width fields and padding, while CPUState exposes architectural 32-bit
+ * register words. Whole-struct copies would be layout/endian dependent. */
+static void gte_import_cpu_state(PSXRecomp::GTE::GTEState* gte,
+                                 const CPUState* cpu) {
+    const uint32_t* d = cpu->gte_data;
+    const uint32_t* c = cpu->gte_ctrl;
+
+    gte->V0[0] = gte_unpack_s16(d[0]);
+    gte->V0[1] = gte_unpack_s16(d[0] >> 16);
+    gte->V0[2] = gte_unpack_s16(d[1]);
+    gte->V1[0] = gte_unpack_s16(d[2]);
+    gte->V1[1] = gte_unpack_s16(d[2] >> 16);
+    gte->V1[2] = gte_unpack_s16(d[3]);
+    gte->V2[0] = gte_unpack_s16(d[4]);
+    gte->V2[1] = gte_unpack_s16(d[4] >> 16);
+    gte->V2[2] = gte_unpack_s16(d[5]);
+    gte->RGBC = d[6];
+    gte->OTZ = static_cast<uint16_t>(d[7]);
+    gte->IR0 = gte_unpack_s16(d[8]);
+    gte->IR1 = gte_unpack_s16(d[9]);
+    gte->IR2 = gte_unpack_s16(d[10]);
+    gte->IR3 = gte_unpack_s16(d[11]);
+    gte->SXY[0] = static_cast<int32_t>(d[12]);
+    gte->SXY[1] = static_cast<int32_t>(d[13]);
+    gte->SXY[2] = static_cast<int32_t>(d[14]);
+    gte->SXY[3] = static_cast<int32_t>(d[14]);
+    for (int i = 0; i < 4; ++i) gte->SZ[i] = static_cast<uint16_t>(d[16 + i]);
+    for (int i = 0; i < 3; ++i) gte->RGB[i] = d[20 + i];
+    gte->RES1 = d[23];
+    gte->MAC0 = static_cast<int32_t>(d[24]);
+    gte->MAC1 = static_cast<int32_t>(d[25]);
+    gte->MAC2 = static_cast<int32_t>(d[26]);
+    gte->MAC3 = static_cast<int32_t>(d[27]);
+    /* Skip IRGB (28): importing it would quantize and overwrite IR1..3. */
+    gte->LZCS = static_cast<int32_t>(d[30]);
+    gte->LZCR = static_cast<int32_t>(gte_cpu_lzcr(d[30]));
+
+    gte->RT[0][0] = gte_unpack_s16(c[0]);
+    gte->RT[0][1] = gte_unpack_s16(c[0] >> 16);
+    gte->RT[0][2] = gte_unpack_s16(c[1]);
+    gte->RT[1][0] = gte_unpack_s16(c[1] >> 16);
+    gte->RT[1][1] = gte_unpack_s16(c[2]);
+    gte->RT[1][2] = gte_unpack_s16(c[2] >> 16);
+    gte->RT[2][0] = gte_unpack_s16(c[3]);
+    gte->RT[2][1] = gte_unpack_s16(c[3] >> 16);
+    gte->RT[2][2] = gte_unpack_s16(c[4]);
+    for (int i = 0; i < 3; ++i) gte->TR[i] = static_cast<int32_t>(c[5 + i]);
+
+    gte->L[0][0] = gte_unpack_s16(c[8]);
+    gte->L[0][1] = gte_unpack_s16(c[8] >> 16);
+    gte->L[0][2] = gte_unpack_s16(c[9]);
+    gte->L[1][0] = gte_unpack_s16(c[9] >> 16);
+    gte->L[1][1] = gte_unpack_s16(c[10]);
+    gte->L[1][2] = gte_unpack_s16(c[10] >> 16);
+    gte->L[2][0] = gte_unpack_s16(c[11]);
+    gte->L[2][1] = gte_unpack_s16(c[11] >> 16);
+    gte->L[2][2] = gte_unpack_s16(c[12]);
+    for (int i = 0; i < 3; ++i) gte->BK[i] = static_cast<int32_t>(c[13 + i]);
+
+    gte->LC[0][0] = gte_unpack_s16(c[16]);
+    gte->LC[0][1] = gte_unpack_s16(c[16] >> 16);
+    gte->LC[0][2] = gte_unpack_s16(c[17]);
+    gte->LC[1][0] = gte_unpack_s16(c[17] >> 16);
+    gte->LC[1][1] = gte_unpack_s16(c[18]);
+    gte->LC[1][2] = gte_unpack_s16(c[18] >> 16);
+    gte->LC[2][0] = gte_unpack_s16(c[19]);
+    gte->LC[2][1] = gte_unpack_s16(c[19] >> 16);
+    gte->LC[2][2] = gte_unpack_s16(c[20]);
+    for (int i = 0; i < 3; ++i) gte->FC[i] = static_cast<int32_t>(c[21 + i]);
+    gte->OFX = static_cast<int32_t>(c[24]);
+    gte->OFY = static_cast<int32_t>(c[25]);
+    gte->H = static_cast<uint16_t>(c[26]);
+    gte->DQA = gte_unpack_s16(c[27]);
+    gte->DQB = static_cast<int32_t>(c[28]);
+    gte->ZSF3 = gte_unpack_s16(c[29]);
+    gte->ZSF4 = gte_unpack_s16(c[30]);
+    gte->FLAG = c[31] & 0x7FFFF000u;
+}
+
+static uint32_t gte_state_pack_irgb(const PSXRecomp::GTE::GTEState* gte) {
+    const uint32_t r = static_cast<uint32_t>(std::clamp(
+        static_cast<int>(gte->IR1 >> 7), 0, 0x1F));
+    const uint32_t g = static_cast<uint32_t>(std::clamp(
+        static_cast<int>(gte->IR2 >> 7), 0, 0x1F));
+    const uint32_t b = static_cast<uint32_t>(std::clamp(
+        static_cast<int>(gte->IR3 >> 7), 0, 0x1F));
+    return (b << 10) | (g << 5) | r;
+}
+
+static void gte_export_cpu_state(CPUState* cpu,
+                                 const PSXRecomp::GTE::GTEState* gte) {
+    uint32_t* d = cpu->gte_data;
+    uint32_t* c = cpu->gte_ctrl;
+
+    d[0] = gte_pack_s16_pair(gte->V0[0], gte->V0[1]);
+    d[1] = static_cast<uint32_t>(static_cast<int32_t>(gte->V0[2]));
+    d[2] = gte_pack_s16_pair(gte->V1[0], gte->V1[1]);
+    d[3] = static_cast<uint32_t>(static_cast<int32_t>(gte->V1[2]));
+    d[4] = gte_pack_s16_pair(gte->V2[0], gte->V2[1]);
+    d[5] = static_cast<uint32_t>(static_cast<int32_t>(gte->V2[2]));
+    d[6] = gte->RGBC;
+    d[7] = gte->OTZ;
+    d[8] = static_cast<uint32_t>(static_cast<int32_t>(gte->IR0));
+    d[9] = static_cast<uint32_t>(static_cast<int32_t>(gte->IR1));
+    d[10] = static_cast<uint32_t>(static_cast<int32_t>(gte->IR2));
+    d[11] = static_cast<uint32_t>(static_cast<int32_t>(gte->IR3));
+    d[12] = static_cast<uint32_t>(gte->SXY[0]);
+    d[13] = static_cast<uint32_t>(gte->SXY[1]);
+    d[14] = static_cast<uint32_t>(gte->SXY[2]);
+    d[15] = static_cast<uint32_t>(gte->SXY[3]);
+    for (int i = 0; i < 4; ++i) d[16 + i] = gte->SZ[i];
+    for (int i = 0; i < 3; ++i) d[20 + i] = gte->RGB[i];
+    d[23] = gte->RES1;
+    d[24] = static_cast<uint32_t>(gte->MAC0);
+    d[25] = static_cast<uint32_t>(gte->MAC1);
+    d[26] = static_cast<uint32_t>(gte->MAC2);
+    d[27] = static_cast<uint32_t>(gte->MAC3);
+    d[28] = d[29] = gte_state_pack_irgb(gte);
+    d[30] = static_cast<uint32_t>(gte->LZCS);
+    d[31] = static_cast<uint32_t>(gte->LZCR);
+
+    c[0] = gte_pack_s16_pair(gte->RT[0][0], gte->RT[0][1]);
+    c[1] = gte_pack_s16_pair(gte->RT[0][2], gte->RT[1][0]);
+    c[2] = gte_pack_s16_pair(gte->RT[1][1], gte->RT[1][2]);
+    c[3] = gte_pack_s16_pair(gte->RT[2][0], gte->RT[2][1]);
+    c[4] = static_cast<uint32_t>(static_cast<int32_t>(gte->RT[2][2]));
+    for (int i = 0; i < 3; ++i) c[5 + i] = static_cast<uint32_t>(gte->TR[i]);
+    c[8] = gte_pack_s16_pair(gte->L[0][0], gte->L[0][1]);
+    c[9] = gte_pack_s16_pair(gte->L[0][2], gte->L[1][0]);
+    c[10] = gte_pack_s16_pair(gte->L[1][1], gte->L[1][2]);
+    c[11] = gte_pack_s16_pair(gte->L[2][0], gte->L[2][1]);
+    c[12] = static_cast<uint32_t>(static_cast<int32_t>(gte->L[2][2]));
+    for (int i = 0; i < 3; ++i) c[13 + i] = static_cast<uint32_t>(gte->BK[i]);
+    c[16] = gte_pack_s16_pair(gte->LC[0][0], gte->LC[0][1]);
+    c[17] = gte_pack_s16_pair(gte->LC[0][2], gte->LC[1][0]);
+    c[18] = gte_pack_s16_pair(gte->LC[1][1], gte->LC[1][2]);
+    c[19] = gte_pack_s16_pair(gte->LC[2][0], gte->LC[2][1]);
+    c[20] = static_cast<uint32_t>(static_cast<int32_t>(gte->LC[2][2]));
+    for (int i = 0; i < 3; ++i) c[21 + i] = static_cast<uint32_t>(gte->FC[i]);
+    c[24] = static_cast<uint32_t>(gte->OFX);
+    c[25] = static_cast<uint32_t>(gte->OFY);
+    c[26] = static_cast<uint32_t>(static_cast<int32_t>(
+        static_cast<int16_t>(gte->H)));
+    c[27] = static_cast<uint32_t>(static_cast<int32_t>(gte->DQA));
+    c[28] = static_cast<uint32_t>(gte->DQB);
+    c[29] = static_cast<uint32_t>(static_cast<int32_t>(gte->ZSF3));
+    c[30] = static_cast<uint32_t>(static_cast<int32_t>(gte->ZSF4));
+    c[31] = gte->FLAG;
+}
+
+static void gte_run_command(PSXRecomp::GTE::GTEState* gte, uint32_t cmd) {
+    using namespace PSXRecomp::GTE;
+    switch (cmd & 0x3Fu) {
+        case 0x01: gte_rtps(gte, cmd); break;
+        case 0x06: gte_nclip(gte, cmd); break;
+        case 0x0C: gte_op(gte, cmd); break;
+        case 0x10: gte_dpcs(gte, cmd); break;
+        case 0x11: gte_intpl(gte, cmd); break;
+        case 0x12: gte_mvmva(gte, cmd); break;
+        case 0x13: gte_ncds(gte, cmd); break;
+        case 0x14: gte_cdp(gte, cmd); break;
+        case 0x16: gte_ncdt(gte, cmd); break;
+        case 0x1B: gte_nccs(gte, cmd); break;
+        case 0x1C: gte_cc(gte, cmd); break;
+        case 0x1E: gte_ncs(gte, cmd); break;
+        case 0x20: gte_nct(gte, cmd); break;
+        case 0x28: gte_sqr(gte, cmd); break;
+        case 0x29: gte_dpcl(gte, cmd); break;
+        case 0x2A: gte_dpct(gte, cmd); break;
+        case 0x2D: gte_avsz3(gte, cmd); break;
+        case 0x2E: gte_avsz4(gte, cmd); break;
+        case 0x30: gte_rtpt(gte, cmd); break;
+        case 0x3D: gte_gpf(gte, cmd); break;
+        case 0x3E: gte_gpl(gte, cmd); break;
+        case 0x3F: gte_ncct(gte, cmd); break;
+        default: std::exit(1);
+    }
+}
+
+static void gte_execute_impl(CPUState* cpu, uint32_t cmd, bool charge_latency) {
+    using namespace PSXRecomp::GTE;
+    uint32_t original_transform[8];
+    const bool observe_projection = g_psx_projection_command &&
+        ((cmd & 63) == 1 || (cmd & 63) == 0x30);
+    if (observe_projection) std::memcpy(original_transform, cpu->gte_ctrl, sizeof original_transform);
+    const bool intermediate = observe_projection && g_psx_projection_command(cpu, cmd);
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (!s_gte_replay_sandbox) s_gte_exec_count++;
     s_gte_caller_ra = cpu->gpr[31];   /* dome-locate probe: game fn that issued this projection */
+#endif
 
     GTEState gte;
-    // Skip reg 15 (SXYP: push-write, would corrupt SXY FIFO) and
-    // reg 28 (IRGB: overwrites IR1/2/3 with lossy 5-bit values; use regs 9-11 instead)
-    for (int i = 0; i < 32; i++) {
-        if (i == 15 || i == 28) continue;
-        gte_mtc2(&gte, i, cpu->gte_data[i]);
-    }
-    for (int i = 0; i < 32; i++) gte_ctc2(&gte, i, cpu->gte_ctrl[i]);
+    gte_import_cpu_state(&gte, cpu);
 
     uint8_t func = cmd & 0x3F;
     /* GTE-activity gameplay detector ([widescreen] gte_game_mode): note every
      * perspective projection so gpu.c can stamp real 3D frames as gameplay
      * (no-op unless the game opts in — early-out on the config flag). */
-    if (func == 0x01 || func == 0x30)
+    if (!s_gte_replay_sandbox && (func == 0x01 || func == 0x30))
         psx_ws_note_gte_project(func == 0x30 ? 3 : 1);
+#ifndef PSX_NO_DEBUG_TOOLS
     /* INTPL ring: snapshot inputs before the op mutates IR (outputs recorded
-     * after the switch). */
+     * after the switch). Debug tooling only; production does no probe copies. */
     int16_t intpl_pre_ir[4] = {0,0,0,0};
     int32_t intpl_pre_fc[3] = {0,0,0};
     if (func == 0x11) {
@@ -1307,7 +2367,117 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
         intpl_pre_ir[2]=gte.IR2; intpl_pre_ir[3]=gte.IR3;
         intpl_pre_fc[0]=gte.FC[0]; intpl_pre_fc[1]=gte.FC[1]; intpl_pre_fc[2]=gte.FC[2];
     }
-    switch (func) {
+#endif
+    gte_run_command(&gte, cmd);
+    pgxp_gte_op_end(func);               /* IR / MAC scalars the op overwrote */
+    if (s_fgsrc && !s_gte_replay_sandbox && (func == 0x01 || func == 0x30))
+        fgsrc_record(&gte, cmd, cpu->gpr[31]);
+
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (func == 0x01 || func == 0x30) gte_rtp_record(&gte, cmd);
+    if (func == 0x11) gte_intpl_record(&gte, intpl_pre_ir, intpl_pre_fc);
+#endif
+
+    gte_export_cpu_state(cpu, &gte);
+    if (intermediate) std::memcpy(cpu->gte_ctrl, original_transform, sizeof original_transform);
+
+#ifndef PSX_NO_DEBUG_TOOLS
+    /* ND digit-rain: NdIntroSiblingFaceLoop (jal 0x80069CC4; $ra stays 69C3C..
+     * while FaceLoop runs). face_hi=0 → AddPrim at a3 (main OT last slot).
+     * WoodEmit/glow: model+228 base + (MAC0>>17)*4 via 0x8006AD88.
+     *
+     * Frame order on rain: WoodBatchSetup (all models, incl. CODE/GLOW) →
+     * sibling → WoodEmit. CODE model is stable at 0x800FF390.
+     *
+     * PSX_ND_SIB_OT_BATCH=1: $s2 = CODE/GLOW batch OT + index*4.
+     * PSX_ND_SIB_OT_IDX=N: force index (else OTZ>>5 + PSX_ND_SIB_OT_BIAS).
+     * Same-bucket as digits still loses: DMA walks flaps then 0x36 (digits on
+     * top). Prefer correct AVSZ MAC0 OT indices; FLAP_LAST is opt-in only. */
+    if (func == 0x30 && !s_gte_replay_sandbox) {
+        static int s_sib_batch = -1;
+        static int s_sib_avsz = -1;
+        static int s_sib_bias = 0;
+        static int s_sib_force_idx = -1;
+        if (s_sib_batch < 0) {
+            const char *e = std::getenv("PSX_ND_SIB_OT_BATCH");
+            s_sib_batch = (e && *e && *e != '0') ? 1 : 0;
+            const char *a = std::getenv("PSX_ND_SIB_OT_AVSZ");
+            s_sib_avsz = (a && *a && *a != '0') ? 1 : 0;
+            const char *b = std::getenv("PSX_ND_SIB_OT_BIAS");
+            s_sib_bias = (b && *b) ? std::atoi(b) : 0;
+            const char *ix = std::getenv("PSX_ND_SIB_OT_IDX");
+            s_sib_force_idx = (ix && *ix) ? std::atoi(ix) : -1;
+            if (s_sib_batch)
+                std::fprintf(stdout,
+                    "psxrecomp: PSX_ND_SIB_OT_BATCH enabled (bias=%d idx=%d)\n",
+                    s_sib_bias, s_sib_force_idx);
+            else if (s_sib_avsz)
+                std::fprintf(stdout,
+                    "psxrecomp: PSX_ND_SIB_OT_AVSZ enabled (main OTZ>>5, bias=%d)\n",
+                    s_sib_bias);
+        }
+        if (s_sib_batch || s_sib_avsz) {
+            const uint32_t ra = s_gte_caller_ra;
+            if (ra == 0x80069C3Cu || ra == 0x80069C60u ||
+                ra == 0x80069C84u || ra == 0x80069CA8u) {
+                const uint32_t a3 = cpu->gpr[7];
+                uint32_t ot_base = 0;
+                if (s_sib_batch) {
+                    /* CODE model+228 preferred (digit rain); noted at 6AAF0
+                     * and refreshed at sibling entry from 0x800FF390. */
+                    ot_base = psx_nd_wood_batch_ot();
+                    if (!ot_base)
+                        ot_base = psx_nd_sibling_ot_hint();
+                } else if (a3 >= 4092u) {
+                    ot_base = a3 - 4092u;
+                }
+                if (ot_base) {
+                    int32_t idx;
+                    if (s_sib_force_idx >= 0) {
+                        idx = s_sib_force_idx;
+                    } else {
+                        const int64_t mac0 = (int64_t)gte.ZSF3 *
+                            ((int64_t)gte.SZ[1] + gte.SZ[2] + gte.SZ[3]);
+                        idx = (int32_t)(mac0 >> 17) + s_sib_bias;
+                    }
+                    if (idx < 0) idx = 0;
+                    if (idx > 2047) idx = 2047;
+                    cpu->gpr[18] = ot_base + ((uint32_t)idx << 2); /* $s2 */
+                }
+            }
+        }
+    }
+#endif
+
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    /* Faithful GTE command completion-stall: arm the per-command deadline
+     * (serializing back-to-back ops). Any later COP2 register access stalls to
+     * it. Single shared site for BOTH backends (compiled + dirty interp both
+     * route GTE commands through gte_execute). */
+    if (charge_latency) psx_gte_set(cpu, psx_gte_cmd_latency(cmd));
+#endif
+}
+
+extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
+    gte_execute_impl(cpu, cmd, true);
+}
+
+extern "C" void psx_hle_gte_execute(CPUState* cpu, uint32_t cmd) {
+    gte_execute_impl(cpu, cmd, !PSX_EXECUTION_ENHANCED);
+}
+
+#ifdef PSX_GTE_REGISTER_TEST
+/* Preserved pre-optimization bridge: test oracle for full command marshaling. */
+extern "C" void gte_test_execute_reference(CPUState* cpu, uint32_t cmd) {
+    using namespace PSXRecomp::GTE;
+    GTEState gte;
+    for (uint8_t reg = 0; reg < 32; ++reg) {
+        if (reg == 15 || reg == 28) continue;
+        gte_mtc2(&gte, reg, cpu->gte_data[reg]);
+    }
+    for (uint8_t reg = 0; reg < 32; ++reg)
+        gte_ctc2(&gte, reg, cpu->gte_ctrl[reg]);
+    switch (cmd & 0x3Fu) {
         case 0x01: gte_rtps(&gte, cmd); break;
         case 0x06: gte_nclip(&gte, cmd); break;
         case 0x0C: gte_op(&gte, cmd); break;
@@ -1330,69 +2500,260 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
         case 0x3D: gte_gpf(&gte, cmd); break;
         case 0x3E: gte_gpl(&gte, cmd); break;
         case 0x3F: gte_ncct(&gte, cmd); break;
-        default:
-            exit(1);
-            break;
+        default: std::exit(1);
     }
-
-    if (func == 0x01 || func == 0x30) gte_rtp_record(&gte, cmd);
-    if (func == 0x11) gte_intpl_record(&gte, intpl_pre_ir, intpl_pre_fc);
-
-    for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
-    for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);
-
-#ifdef PSX_ENABLE_BLOCK_CYCLES
-    /* Faithful GTE command completion-stall: arm the per-command deadline
-     * (serializing back-to-back ops). Any later COP2 register access stalls to
-     * it. Single shared site for BOTH backends (compiled + dirty interp both
-     * route GTE commands through gte_execute). */
-    psx_gte_set(cpu, psx_gte_cmd_latency(cmd));
+    for (uint8_t reg = 0; reg < 32; ++reg)
+        cpu->gte_data[reg] = gte_mfc2(&gte, reg);
+    for (uint8_t reg = 0; reg < 32; ++reg)
+        cpu->gte_ctrl[reg] = gte_cfc2(&gte, reg);
+}
 #endif
+
+/* C-callable wrappers for GTE register transfers.
+ *
+ * CPUState's arrays are the canonical GTE backing store between commands.
+ * The old wrappers rebuilt a full GTEState by replaying 62 register writes
+ * for every read, and rebuilt plus exported 64 registers for every write.
+ * Transfers are common in vertex loops, so that exact-but-accidental work was
+ * a severe interpreter-only tax.  These switches implement the same guest
+ * register semantics in O(1), without changing the command implementation. */
+
+static uint32_t gte_cpu_lzcr(uint32_t value) {
+    uint32_t bits = (value & 0x80000000u) ? ~value : value;
+    if (bits == 0) return 32;
+    uint32_t count = 0;
+    while ((bits & 0x80000000u) == 0) {
+        bits <<= 1;
+        ++count;
+    }
+    return count;
 }
 
-/* C-callable wrappers for GTE register transfers */
-// Helper: load GTEState from CPUState, skipping push-write and lossy registers
-static void gte_load_data(PSXRecomp::GTE::GTEState& gte, CPUState* cpu) {
-    using namespace PSXRecomp::GTE;
-    for (int i = 0; i < 32; i++) {
-        if (i == 15 || i == 28) continue;  // SXYP (push) and IRGB (lossy overwrite)
-        gte_mtc2(&gte, i, cpu->gte_data[i]);
-    }
-    for (int i = 0; i < 32; i++) gte_ctc2(&gte, i, cpu->gte_ctrl[i]);
-    /* Loading emulator state is not a guest CTC2 write. CTC2 to FLAG masks
-     * bit 31, but a previously computed FLAG error bit must survive reads and
-     * unrelated control-register writes. */
-    gte.FLAG = cpu->gte_ctrl[31];
+static uint32_t gte_cpu_irgb_component(uint32_t value) {
+    const int32_t ir = static_cast<int16_t>(value & 0xFFFFu);
+    if (ir <= 0) return 0;
+    const uint32_t scaled = static_cast<uint32_t>(ir) >> 7;
+    return scaled > 0x1Fu ? 0x1Fu : scaled;
+}
+
+static uint32_t gte_cpu_pack_irgb(const CPUState* cpu) {
+    const uint32_t r = gte_cpu_irgb_component(cpu->gte_data[9]);
+    const uint32_t g = gte_cpu_irgb_component(cpu->gte_data[10]);
+    const uint32_t b = gte_cpu_irgb_component(cpu->gte_data[11]);
+    return (b << 10) | (g << 5) | r;
+}
+
+static uint32_t gte_sign_extend_16(uint32_t value) {
+    return static_cast<uint32_t>(static_cast<int32_t>(
+        static_cast<int16_t>(value & 0xFFFFu)));
+}
+
+/* Normalize only the guest-visible backing words. This deliberately does not
+ * invalidate host precision caches: it is also the compatibility boundary for
+ * committed AOT C emitted before all masked/aliased writes used helpers. */
+static void gte_cpu_canonicalize_backing(CPUState* cpu) {
+    static const uint8_t data_u16[] = {7, 16, 17, 18, 19};
+    static const uint8_t data_s16[] = {1, 3, 5, 8, 9, 10, 11};
+    static const uint8_t ctrl_s16[] = {4, 12, 20, 26, 27, 29, 30};
+
+    for (uint8_t reg : data_u16) cpu->gte_data[reg] &= 0xFFFFu;
+    for (uint8_t reg : data_s16)
+        cpu->gte_data[reg] = gte_sign_extend_16(cpu->gte_data[reg]);
+    cpu->gte_data[15] = cpu->gte_data[14];
+    cpu->gte_data[28] = cpu->gte_data[29] = gte_cpu_pack_irgb(cpu);
+    cpu->gte_data[31] = gte_cpu_lzcr(cpu->gte_data[30]);
+
+    for (uint8_t reg : ctrl_s16)
+        cpu->gte_ctrl[reg] = gte_sign_extend_16(cpu->gte_ctrl[reg]);
 }
 
 extern "C" uint32_t gte_read_data(CPUState* cpu, uint8_t reg) {
-    using namespace PSXRecomp::GTE;
-    GTEState gte;
-    gte_load_data(gte, cpu);
-    return gte_mfc2(&gte, reg);
+    if (reg >= 32) return 0;
+    switch (reg) {
+        case 7: case 16: case 17: case 18: case 19:
+            return cpu->gte_data[reg] & 0xFFFFu;
+        case 1: case 3: case 5: case 8: case 9: case 10: case 11:
+            return gte_sign_extend_16(cpu->gte_data[reg]);
+        case 15:
+            return cpu->gte_data[14];
+        case 28: case 29:
+            return gte_cpu_pack_irgb(cpu);
+        case 31:
+            return gte_cpu_lzcr(cpu->gte_data[30]);
+        default:
+            return cpu->gte_data[reg];
+    }
 }
 
 extern "C" uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg) {
-    using namespace PSXRecomp::GTE;
-    GTEState gte;
-    gte_load_data(gte, cpu);
-    return gte_cfc2(&gte, reg);
+    if (reg >= 32) return 0;
+    switch (reg) {
+        case 4: case 12: case 20: case 26: case 27: case 29: case 30:
+            return gte_sign_extend_16(cpu->gte_ctrl[reg]);
+        default:
+            return cpu->gte_ctrl[reg];
+    }
 }
 
 extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
-    using namespace PSXRecomp::GTE;
-    GTEState gte;
-    gte_load_data(gte, cpu);
-    gte_mtc2(&gte, reg, val);
-    for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
-    for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);
+    if (reg >= 32) return;
+    gte_cpu_canonicalize_backing(cpu);
+    switch (reg) {
+        case 7: case 16: case 17: case 18: case 19:
+            cpu->gte_data[reg] = val & 0xFFFFu;
+            break;
+        case 1: case 3: case 5: case 8: case 9: case 10: case 11:
+            cpu->gte_data[reg] = gte_sign_extend_16(val);
+            if (reg >= 9) {
+                const uint32_t packed = gte_cpu_pack_irgb(cpu);
+                cpu->gte_data[28] = packed;
+                cpu->gte_data[29] = packed;
+            }
+            break;
+        /* Guest writes to the SXY FIFO: regs 12/13 overwrite their shadow, a
+         * reg 14 write overwrites SXY2 and its SXYP mirror, and a reg 15
+         * write is the FIFO push, which pgxp_gte_reg_written applies to the
+         * shadows exactly as the registers move. */
+        case 12: case 13:
+            cpu->gte_data[reg] = val;
+            if (!PSXRecomp::GTE::s_gte_replay_sandbox)
+                pgxp_gte_reg_written(reg, val);
+            break;
+        case 14:
+            cpu->gte_data[14] = val;
+            cpu->gte_data[15] = val;
+            if (!PSXRecomp::GTE::s_gte_replay_sandbox)
+                pgxp_gte_reg_written(14, val);   /* resets the SXYP mirror too */
+            break;
+        case 15:
+            cpu->gte_data[12] = cpu->gte_data[13];
+            cpu->gte_data[13] = cpu->gte_data[14];
+            cpu->gte_data[14] = val;
+            cpu->gte_data[15] = val;
+            if (!PSXRecomp::GTE::s_gte_replay_sandbox)
+                pgxp_gte_reg_written(15, val);   /* FIFO push on the shadows */
+            break;
+        case 28: {
+            cpu->gte_data[9] = (val & 0x1Fu) << 7;
+            cpu->gte_data[10] = ((val >> 5) & 0x1Fu) << 7;
+            cpu->gte_data[11] = ((val >> 10) & 0x1Fu) << 7;
+            const uint32_t packed = val & 0x7FFFu;
+            cpu->gte_data[28] = packed;
+            cpu->gte_data[29] = packed;
+            break;
+        }
+        case 29: {
+            const uint32_t packed = gte_cpu_pack_irgb(cpu);
+            cpu->gte_data[28] = packed;
+            cpu->gte_data[29] = packed;
+            break;
+        }
+        case 30:
+            cpu->gte_data[30] = val;
+            cpu->gte_data[31] = gte_cpu_lzcr(val);
+            break;
+        case 31:
+            cpu->gte_data[31] = gte_cpu_lzcr(cpu->gte_data[30]);
+            break;
+        default:
+            cpu->gte_data[reg] = val;
+            break;
+    }
 }
 
 extern "C" void gte_write_ctrl(CPUState* cpu, uint8_t reg, uint32_t val) {
-    using namespace PSXRecomp::GTE;
-    GTEState gte;
-    gte_load_data(gte, cpu);
-    gte_ctc2(&gte, reg, val);
-    for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
-    for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);
+    if (reg >= 32) return;
+    gte_cpu_canonicalize_backing(cpu);
+    switch (reg) {
+        case 4: case 12: case 20: case 26: case 27: case 29: case 30:
+            cpu->gte_ctrl[reg] = gte_sign_extend_16(val);
+            break;
+        case 31:
+            cpu->gte_ctrl[31] = val & 0x7FFFF000u;
+            if (cpu->gte_ctrl[31] & PSXRecomp::GTE::FLAG_ERROR_MASK)
+                cpu->gte_ctrl[31] |= PSXRecomp::GTE::FLAG_ERROR_BIT;
+            break;
+        default:
+            cpu->gte_ctrl[reg] = val;
+            break;
+    }
 }
+
+extern "C" void gte_canonicalize_cpu_state(CPUState* cpu) {
+    gte_cpu_canonicalize_backing(cpu);
+    /* ctrl[31] is emulator state, not a guest CTC2 write. Preserve the
+     * command-computed summary bit 31 exactly. */
+    /* Raw restore replaced RAM and SXY0..2. Drop every host-only provenance
+     * cache from the previous timeline, including address-keyed packet depth
+     * and geometry correction entries. */
+    gte_precision_timeline_invalidate();
+}
+
+#ifdef PSX_GTE_REGISTER_TEST
+/* The precise-projection FIFO is the pgxp GTE register shadow (regs 12..15);
+ * these keep the historical test entry points working over it. */
+extern "C" void gte_test_set_precise_valid_mask(uint32_t mask) {
+    for (uint32_t i = 0; i < 4; ++i)
+        pgxp_test_seed_gte_sxy(i, 0, 0, 0, 1, (mask >> i) & 1u);
+}
+
+extern "C" uint32_t gte_test_get_precise_valid_mask(void) {
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < 4; ++i) {
+        uint8_t valid = 0;
+        pgxp_test_get_gte_sxy(i, nullptr, nullptr, nullptr, nullptr, &valid);
+        mask |= (valid ? 1u : 0u) << i;
+    }
+    return mask;
+}
+
+extern "C" void gte_test_set_timeline_generations(uint32_t precision,
+                                                    uint32_t geometry) {
+    pgxp_test_set_generation(precision);
+    PSXRecomp::GTE::s_geom_generation = geometry;
+}
+
+extern "C" uint32_t gte_test_get_precision_generation(void) {
+    return pgxp_test_generation();
+}
+
+extern "C" uint32_t gte_test_get_geometry_generation(void) {
+    return PSXRecomp::GTE::s_geom_generation;
+}
+
+extern "C" void gte_test_seed_precise_projection(uint32_t index,
+                                                    uint32_t packed,
+                                                    int32_t x16,
+                                                    int32_t y16,
+                                                    uint16_t z) {
+    pgxp_test_seed_gte_sxy(index, packed, x16, y16, z, 1);
+}
+
+extern "C" void gte_test_get_precise_projection(uint32_t index,
+                                                  uint32_t* packed,
+                                                  int32_t* x16,
+                                                  int32_t* y16,
+                                                  uint16_t* z,
+                                                  uint8_t* valid) {
+    pgxp_test_get_gte_sxy(index, packed, x16, y16, z, valid);
+}
+
+extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,
+                                         int32_t y16) {
+    /* The table is allocated lazily on enable; tests seed it directly, so make
+     * sure it exists rather than writing through a null pointer. */
+    if (!PSXRecomp::GTE::s_geom_cache) {
+        PSXRecomp::GTE::s_geom_cache =
+            (PSXRecomp::GTE::GeomVertex *)std::calloc(
+                GEOM_CACHE_SIZE, sizeof(PSXRecomp::GTE::GeomVertex));
+        if (!PSXRecomp::GTE::s_geom_cache) return;
+    }
+    int64_t slot = PSXRecomp::GTE::geom_slot(packed);
+    if (slot < 0) return;
+    auto &entry = PSXRecomp::GTE::s_geom_cache[slot];
+    entry.x16 = x16;
+    entry.y16 = y16;
+    entry.ambiguous = 0;
+    entry.generation = PSXRecomp::GTE::s_geom_generation;
+}
+#endif

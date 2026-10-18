@@ -1,4 +1,4 @@
-/* psx_interpreter.h — R3000A interpreter for oracle builds.
+﻿/* psx_interpreter.h — R3000A interpreter for oracle builds.
  *
  * Oracle-only: provides a cycle-accurate reference implementation
  * of the PSX CPU. Shares the same CPUState and memory bus as the
@@ -21,6 +21,10 @@ extern "C" {
 
 /* Initialize interpreter state. Call once after CPUState is allocated. */
 void interp_init(CPUState* cpu);
+
+/* Drop host-static pending load-delay (not in boot_state). See
+ * dirty_ram_ld_delay_discard — same restore contract for the debug interp. */
+void interp_ld_delay_discard(void);
 
 /* Execute exactly `count` instructions. Returns number actually executed
  * (may be less if a breakpoint fires). */

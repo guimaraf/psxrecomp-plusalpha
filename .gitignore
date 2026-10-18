@@ -1,13 +1,11 @@
-# LOCAL-ONLY SAFETY
-# These rules prevent accidental staging; they do NOT authorize deleting files
-# that already exist. In particular, never run `git clean -fdX`: `-X` deletes
-# exactly the ignored BIOS, generated sources, build trees, caches, and saves.
-
-# BIOS ROMs (copyrighted, not distributable). `psx-bios/` covers the local
-# layout used by PS1RecompProjetct; the preferred shared copy lives beside this
-# repository and is selected through PSXRECOMP_BIOS_ROM.
-/bios/
-/psx-bios/
+# BIOS ROM (copyrighted, not distributable)
+bios/*
+!bios/*.toml
+# OpenBIOS is MIT — the one BIOS image that is legal to track (see
+# THIRD_PARTY_ATTRIBUTION.md; pin recorded in bios/OpenBIOS.toml; notice
+# shipped alongside as bios/OpenBIOS.LICENSE).
+!bios/openbios.bin
+!bios/*.LICENSE
 
 # DuckStation — upstream source is a git submodule pointing at stenzek/duckstation.
 # Our custom changes live in tools/duckstation/psxrecomp_oracle.patch (committed).
@@ -22,29 +20,53 @@ ghidra/
 # Backup of the working state — see CURRENT_STATE.md for what this contains.
 .happypath/
 
-# Build artifacts. Cover named variants such as build-ucrt, build-asan,
-# build-checked, and build-t2 without deleting or relocating an existing tree.
-/recompiler/build*/
-/recompiler/cmake-build*/
-/runtime/build*/
-/test_msvc/
+# Build artifacts
+/build-integration-*/
+recompiler/build/
+recompiler/build-asan/
+recompiler/build-asan2/
+recompiler/build-checked/
+recompiler/build-cli/
+recompiler/build-t2/
+runtime/build/
+runtime/build-msvc/
+runtime/build-*/
+runtime/build-*.exe
+test_msvc/
 
-# Recompiler output (derivative of copyrighted Sony BIOS, regenerate locally)
+# Recompiler output. The two BIOS backends every release links are COMMITTED
+# (decision 2026-09-30: the recompiled BIOS carries the same risk as the
+# recompiled game, which titles already commit); CI builds them and the
+# runtime.cmake fingerprint check fails a release whose stamp predates the
+# emitter. Everything else under generated/ (scratch stems, skipped-function
+# reports, per-dump work) stays local. Regenerate with:
+#   tools/regen_bios.sh --config bios/OpenBIOS.toml
+#   tools/regen_bios.sh --config bios/SCPH1001.toml   (needs your own dump)
+generated/*
+!generated/OpenBIOS_full.c
+!generated/OpenBIOS_dispatch.c
+!generated/OpenBIOS.emitter.sha
 
 # Release packaging artifacts
 release-stage/
 *.zip
 
 # Vendored upstream sources (cloned locally, not checked in)
-beetle-psx/
+beetle-psx
 
-# Prebuilt SDL2 / dep zips (large, regenerable)
+# Explicit-fallback SDL2 / dep zips (large, regenerable)
 sdl2-dev.zip
 sdl2-msvc/
 
 # Diagnostic dumps & smoke logs (transient)
 *.log
 *.jsonl
+/.aot_capture_history/
+
+# Local additive overlay-capture store configuration and game-derived data.
+.psxrecomp.env
+.env
+.local/
 
 # Build-generated codegen-hash header (hash_codegen.cmake): folds an emitter
 # content hash into the overlay cache path; regenerated each build, never committed.
@@ -59,12 +81,13 @@ psx_out.txt
 
 # Probe / scratch artifacts
 # All ad-hoc diagnostic dumps land under probes/ so the repo root stays clean.
-# Runtime data (memcards) is intentionally NOT covered: card*.mcd, dummy.*.mcr.
+# Runtime memcards are not covered here either — see the *.mcr / /*.mcd rules
+# below; the tracked fixtures live in runtime/tests/fixtures/memcards/.
 probes/
 
-# Ad-hoc scratch tools and their generated data use the underscore prefix.
+# Ad-hoc scratch tools (underscore prefix convention).
 # Real tools have no leading underscore (e.g. tools/codegen_audit.py).
-tools/_*
+tools/_*.py
 /*.json
 /*.png
 /*.bmp
@@ -90,12 +113,14 @@ games/*/*
 !games/*/game.toml
 !games/*/seeds.txt
 
-# Runtime memory cards (local save data; never distribute)
-*.mcd
+# Memcards. Cards a run creates are scratch: *.mcr anywhere, and any .mcd
+# dropped at the repo root (the runtime writes card1.mcd/card2.mcd next to the
+# project root when no explicit path is configured). The only tracked cards are
+# test fixtures: runtime/tests/fixtures/memcards/ (see the README there) plus
+# the runtime/tests/test_* fixtures re-included further down.
 *.mcr
-gametime.save
-gametime.save.tmp.*
-gametime.save.lock
+/*.mcd
+!runtime/tests/fixtures/memcards/*
 
 # macOS .app bundle (contains recompiled BIOS-derived binary — not distributable)
 /dist/
@@ -103,5 +128,30 @@ gametime.save.lock
 # Session-scratch debug scripts (hardcoded local paths; kept on disk, not tracked)
 tools/_options_session/
 
-# Compiled test binaries (build artifacts; the runtime/tests/*.c sources are tracked)
+# Compiled test binaries (build artifacts; the runtime/tests/*.c sources are tracked).
+# The *.exe rule alone missed extension-less Linux binaries, and three of them
+# (test_netplay_snap_ring, test_netplay_hash_confirm, test_netplay_input_hist)
+# were committed as a result — the snap-ring one from before boot_state grew its
+# VRAM-incremental queries, so it could no longer be rebuilt from the tree it sat
+# in. Ignore everything matching test_* here except the tracked sources/fixtures.
 runtime/tests/*.exe
+runtime/tests/test_*
+!runtime/tests/test_*.c
+!runtime/tests/test_*.cpp
+!runtime/tests/test_*.py
+!runtime/tests/test_*.mcd
+!runtime/tests/test_dir/
+
+# transient split-gen build dirs
+recompiler/build-splitgen/
+recompiler/build-*/
+
+# Project Studio GUI venv (customtkinter)
+tools/new_project_layout/.venv/
+tools/new_project_layout/project_studio_repos.json
+
+# Fork play-time storage; never publish personal progress.
+gametime.save
+gametime.save.tmp.*
+gametime.save.lock
+/.cache/

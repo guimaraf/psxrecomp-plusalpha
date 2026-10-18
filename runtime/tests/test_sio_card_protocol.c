@@ -30,17 +30,31 @@
 
 #include "sio.h"
 #include "memcard.h"
+#include "psx_netplay.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 /* ---- Stubs for sio.c's external dependencies ---- */
 uint32_t i_stat = 0;
+uint32_t i_mask = 0;
 uint32_t g_debug_current_func_addr = 0;
+uint32_t g_debug_last_store_pc = 0;
 int psx_get_in_exception(void) { return 0; }
 uint8_t psx_read_byte(uint32_t addr) { (void)addr; return 0; }
+uint32_t psx_read_word(uint32_t addr) { (void)addr; return 0; }
+/* Advance the synthetic guest clock so SIO shift and ACK deadlines elapse. */
+uint64_t psx_get_cycle_count(void) {
+    static uint64_t t;
+    return t += 64;
+}
 uint32_t memory_get_sr(void) { return 0; }
 void debug_server_poll(void) {}
 void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
@@ -65,6 +79,13 @@ void card_read_summary_record(uint8_t slot, uint8_t cmd, uint16_t sector,
 void card_data_writes_arm(uint8_t value, uint16_t mc_state,
                           uint8_t mc_data_idx, uint8_t slot) {
     (void)value; (void)mc_state; (void)mc_data_idx; (void)slot;
+}
+void event_ring_record_aux(uint16_t kind, uint8_t detail, uint32_t aux) {
+    (void)kind; (void)detail; (void)aux;
+}
+void psx_irq_raise(uint32_t bit, uint32_t detail) {
+    (void)detail;
+    i_stat |= 1u << bit;
 }
 
 /* ---- Test harness ---- */
@@ -105,10 +126,15 @@ static uint8_t card_xchg(uint8_t tx, int slot) {
                   | (slot ? CTRL_SLOT : 0);
     sio_write(SIO_CTRL, ctrl);
     sio_write(SIO_TX_DATA, tx);
-    sio_tick(2000);
+    /* The cycle-paced SIO walker deliberately emits at most one edge per
+     * call.  Advance the byte shift and its ACK as separate hardware events
+     * instead of assuming one oversized tick collapses both. */
+    sio_advance(1088);
     uint8_t rx = (uint8_t)sio_read(SIO_RX_DATA);
+    sio_advance(170);
     /* Acknowledge IRQ between bytes (BIOS pattern) */
     sio_write(SIO_CTRL, ctrl | CTRL_ACK);
+    i_stat &= ~0x80u;
     return rx;
 }
 
@@ -229,7 +255,11 @@ static void test_card_read_sector_0(void) {
      * only public entry. Let's symlink/copy our file as card1.mcd. */
     f = fopen("test_dir/card1.mcd", "wb");
     if (!f) {
-        system("mkdir test_dir 2>/dev/null || mkdir -p test_dir");
+#ifdef _WIN32
+        (void)_mkdir("test_dir");
+#else
+        (void)mkdir("test_dir", 0755);
+#endif
         f = fopen("test_dir/card1.mcd", "wb");
     }
     assert(f);
@@ -356,8 +386,102 @@ static void test_directory_frame_layout(void) {
      * Just check that read succeeded. */
 }
 
-int main(void) {
+/* Exact scheduler deadlines must fire on the call that reaches the boundary.
+ * The old strict-inequality loops subtracted the countdown to zero without
+ * processing the event, after which sio_cycles_to_irq() no longer advertised
+ * it and the event could be delayed until an unrelated scheduler wake. */
+static void test_cycle_paced_exact_boundaries(void) {
+    const uint32_t irq_sio0 = 1u << 7;
+    const uint16_t ctrl = CTRL_TX_EN | CTRL_SELECT | CTRL_ACK_IRQ_EN;
+
+    sio_init();
+    memcard_init("test_dir");
+    i_stat = 0;
+    sio_write(SIO_CTRL, ctrl);
+    sio_write(SIO_TX_DATA, 0x81);
+
+    EXPECT_EQ("paced.shift.initial", 1088, sio_cycles_to_irq(irq_sio0));
+    sio_advance(1087);
+    EXPECT_EQ("paced.shift.remaining", 1, sio_cycles_to_irq(irq_sio0));
+    EXPECT_EQ("paced.shift.no_irq", 0, i_stat & irq_sio0);
+    sio_advance(1);
+    EXPECT_EQ("paced.ack.initial", 170, sio_cycles_to_irq(irq_sio0));
+    EXPECT_EQ("paced.ack.no_irq", 0, i_stat & irq_sio0);
+    sio_advance(169);
+    EXPECT_EQ("paced.ack.remaining", 1, sio_cycles_to_irq(irq_sio0));
+    sio_advance(1);
+    EXPECT_EQ("paced.ack.irq", irq_sio0, i_stat & irq_sio0);
+
+    /* sio_tick() retains the same event walker for access-paced callers. */
+    sio_init();
+    memcard_init("test_dir");
+    i_stat = 0;
+    sio_write(SIO_CTRL, ctrl);
+    sio_write(SIO_TX_DATA, 0x81);
+    sio_tick(1088);
+    EXPECT_EQ("paced.tick.ack", 170, sio_cycles_to_irq(irq_sio0));
+    sio_tick(170);
+    EXPECT_EQ("paced.tick.irq", irq_sio0, i_stat & irq_sio0);
+}
+
+/* Local input publishes RX/RY through the ordinary pad state/stick/type APIs.
+ * Pin the actual wire order, P2 independence and idle-boundary type change. */
+static void test_local_pad_report_delivery(void) {
+    PsxNetPad p1 = {0xA55A, 0x11, 0xE7, 0xF1, 0x17, 1, 1};
+    PsxNetPad p2 = {0x3C81, 0x33, 0x55, 0x99, 0xAA, 1, 1};
+    EXPECT_EQ("pad.blob.size", 8, sizeof(PsxNetPad));
+    sio_init();
+    sio_connect_pad(0); sio_connect_pad(1);
+    sio_set_pad_analog(0, 1, 128, 128, 128, 128);
+    sio_set_pad_analog(1, 1, 128, 128, 128, 128);
+    sio_set_pad_state_slot(0, p1.buttons);
+    sio_set_pad_sticks(0, p1.lx, p1.ly, p1.rx, p1.ry);
+    sio_request_pad_type(0, p1.analog);
+    sio_set_pad_state_slot(1, p2.buttons);
+    sio_set_pad_sticks(1, p2.lx, p2.ly, p2.rx, p2.ry);
+    sio_request_pad_type(1, p2.analog);
+    card_deselect(0);
+    EXPECT_EQ("pad.p1.prefix", 0xFF, card_xchg(0x01, 0));
+    EXPECT_EQ("pad.p1.id", 0x73, card_xchg(0x42, 0));
+    /* A frame's requested type cannot truncate an already-started report. */
+    sio_request_pad_type(0, 0);
+    EXPECT_EQ("pad.p1.marker", 0x5A, card_xchg(0, 0));
+    EXPECT_EQ("pad.p1.buttons.low", 0x5A, card_xchg(0, 0));
+    EXPECT_EQ("pad.p1.buttons.high", 0xA5, card_xchg(0, 0));
+    EXPECT_EQ("pad.p1.rx", 0xF1, card_xchg(0, 0));
+    EXPECT_EQ("pad.p1.ry", 0x17, card_xchg(0, 0));
+    EXPECT_EQ("pad.p1.lx", 0x11, card_xchg(0, 0));
+    EXPECT_EQ("pad.p1.ly", 0xE7, card_xchg(0, 0));
+    card_deselect(0);
+    EXPECT_EQ("pad.digital.prefix", 0xFF, card_xchg(0x01, 0));
+    EXPECT_EQ("pad.digital.id", 0x41, card_xchg(0x42, 0));
+    EXPECT_EQ("pad.digital.marker", 0x5A, card_xchg(0, 0));
+    EXPECT_EQ("pad.digital.buttons.low", 0x5A, card_xchg(0, 0));
+    EXPECT_EQ("pad.digital.buttons.high", 0xA5, card_xchg(0, 0));
+    card_deselect(1);
+    EXPECT_EQ("pad.p2.prefix", 0xFF, card_xchg(0x01, 1));
+    EXPECT_EQ("pad.p2.id", 0x73, card_xchg(0x42, 1));
+    EXPECT_EQ("pad.p2.marker", 0x5A, card_xchg(0, 1));
+    EXPECT_EQ("pad.p2.buttons.low", 0x81, card_xchg(0, 1));
+    EXPECT_EQ("pad.p2.buttons.high", 0x3C, card_xchg(0, 1));
+    EXPECT_EQ("pad.p2.rx", 0x99, card_xchg(0, 1));
+    EXPECT_EQ("pad.p2.ry", 0xAA, card_xchg(0, 1));
+    EXPECT_EQ("pad.p2.lx", 0x33, card_xchg(0, 1));
+    EXPECT_EQ("pad.p2.ly", 0x55, card_xchg(0, 1));
+    card_deselect(1);
+}
+
+int main(int argc, char **argv) {
     fprintf(stderr, "=== sio card protocol tests ===\n");
+    test_local_pad_report_delivery();
+    fprintf(stderr, "test_local_pad_report_delivery: %d/%d ok\n", g_checks-g_failures, g_checks);
+
+    if (argc == 2 && strcmp(argv[1], "exact-boundaries") == 0) {
+        test_cycle_paced_exact_boundaries();
+        fprintf(stderr, "test_cycle_paced_exact_boundaries:  %d/%d ok\n",
+                g_checks - g_failures, g_checks);
+        return g_failures > 0 ? 1 : 0;
+    }
 
     test_no_card_present();
     fprintf(stderr, "test_no_card_present:               %d/%d ok\n",
@@ -396,6 +520,12 @@ int main(void) {
     prev_checks = g_checks; prev_fails = g_failures;
     test_directory_frame_layout();
     fprintf(stderr, "test_directory_frame_layout:        %d/%d ok\n",
+            (g_checks - prev_checks) - (g_failures - prev_fails),
+            g_checks - prev_checks);
+
+    prev_checks = g_checks; prev_fails = g_failures;
+    test_cycle_paced_exact_boundaries();
+    fprintf(stderr, "test_cycle_paced_exact_boundaries:  %d/%d ok\n",
             (g_checks - prev_checks) - (g_failures - prev_fails),
             g_checks - prev_checks);
 

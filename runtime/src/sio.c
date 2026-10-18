@@ -13,9 +13,11 @@
  */
 
 #include "sio.h"
+#include "psx_bss.h"
 #include "memcard.h"
 #include "debug_server.h"
 #include "event_ring.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* I_STAT is owned by memory.c */
@@ -41,26 +43,58 @@ static void sio_debug_poll_maybe(void) {
     }
 }
 
-/* Pad state: 0=pressed, 1=released (PS1 convention). Per slot (port). */
-static uint16_t pad_buttons[2] = { 0xFFFF, 0xFFFF }; /* all released */
+/* Pad state: 0=pressed, 1=released (PS1 convention). Indexed by LOGICAL pad
+ * 0 .. PSX_MAX_PLAYERS-1 (not physical SIO slot). */
+static uint16_t pad_buttons[PSX_MAX_PLAYERS] = { PSX_PAD_INIT(0xFFFF) };
 
-/* Per-slot pad type + analog stick state. analog: 0=digital pad (poll id
- * 0x41), 1=DualShock/analog (poll id 0x73). Sticks are 0..255, 0x80 centred. */
-static uint8_t pad_analog[2]    = { 0, 0 };
-static uint8_t pad_stick[2][4]  = { { 0x80, 0x80, 0x80, 0x80 },
-                                    { 0x80, 0x80, 0x80, 0x80 } }; /* lx,ly,rx,ry */
+/* Per-logical-pad type + analog stick state. Values are SIO_PAD_*; sticks are
+ * 0..255, 0x80 centred. JogCon uses left-X as a signed wheel position; NeGcon
+ * uses it as the 0..255 twist axis (0x80 centred). */
+static PSX_BSS uint8_t pad_analog[PSX_MAX_PLAYERS];
+static uint8_t pad_stick[PSX_MAX_PLAYERS][4] = {
+    PSX_PAD_INIT({ 0x80, 0x80, 0x80, 0x80 })
+}; /* lx,ly,rx,ry */
+/* NeGcon analog buttons I, II and L (0x00 released .. 0xFF fully pressed).
+ * Host input like the sticks: refreshed before each guest poll, not device
+ * state, so it is not part of the snapshot. */
+static PSX_BSS uint8_t pad_negcon_analog[PSX_MAX_PLAYERS][3];
+/* The analog-capable device behind a config-mode pad: SIO_PAD_DUALSHOCK or
+ * SIO_PAD_JOGCON. Command 0x44 switches that device between its analog mode
+ * and digital mode (0x41); remembering the device keeps a JogCon that the game
+ * put in digital mode a JogCon when 0x44 selects analog again, instead of
+ * turning it into a DualShock. Guest-visible, so it is snapshotted. */
+static uint8_t pad_analog_device[PSX_MAX_PLAYERS] = {
+    PSX_PAD_INIT(SIO_PAD_DUALSHOCK)
+};
 
-/* Analog-mode lock, per slot. A real DualShock's config command 0x44 0x..02/0x03
- * locks/unlocks the mode (dualshock.cpp:714-725); a locked pad ignores the
- * physical analog button (dualshock.cpp:203). We emulate the analog button via
- * the host hybrid heuristic (pad_type_req), so when a game LOCKS the mode the
- * hybrid auto-flip must not override it — else the type flips underneath a game
- * that pinned DualShock, the exact desync the deferred-request machinery cannot
- * otherwise prevent. */
-static uint8_t analog_mode_locked[2] = { 0, 0 };
+/* DualShock command 0x4D maps the six writable bytes in a 0x42 poll onto the
+ * two motors: 0x00 = small/high-frequency, 0x01 = large/low-frequency,
+ * 0xFF = unused. The map powers up unassigned and is echoed back while a new
+ * map is latched, matching the physical pad/Mednafen protocol. */
+static uint8_t pad_rumble_map[PSX_MAX_PLAYERS][6] = {
+    PSX_PAD_INIT({ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF })
+};
+static PSX_BSS uint8_t pad_rumble_small[PSX_MAX_PLAYERS];
+static PSX_BSS uint8_t pad_rumble_large[PSX_MAX_PLAYERS];
 
-/* Which slots have devices connected */
+/* Analog-mode lock, per logical pad. A real DualShock's config command 0x44
+ * 0x..02/0x03 locks/unlocks the mode (dualshock.cpp:714-725); a locked pad
+ * ignores the physical analog button (dualshock.cpp:203). We emulate the
+ * analog button via the host hybrid heuristic (pad_type_req), so when a game
+ * LOCKS the mode the hybrid auto-flip must not override it — else the type
+ * flips underneath a game that pinned DualShock, the exact desync the
+ * deferred-request machinery cannot otherwise prevent. */
+static PSX_BSS uint8_t analog_mode_locked[PSX_MAX_PLAYERS];
+
+/* Which logical pads have devices connected (bit i = pad i). Fits 5 pads. */
 static uint8_t pad_connected = 0;
+
+/* Host-side SCPH-1070 enable. Only meaningful when PSX_MAX_PLAYERS >= 5. */
+static int sio_multitap_enabled = 0;
+/* Physical SIO port hosting the tap: 0 = console Port 1, 1 = Port 2. */
+static int sio_multitap_port = 0;
+/* Opt-in DualShock on tap seats (default off — faithful digital taps). */
+static int sio_multitap_analog_hack = 0;
 
 /* Pad communication state machine */
 typedef enum {
@@ -69,33 +103,60 @@ typedef enum {
     PAD_SEND_RESPONSE,  /* sending command response bytes */
 } PadState;
 
+/* Multitap 0x42 bulk: ID(0x80)+0x5A + 4×8 pad status bytes. */
+#define PAD_RESPONSE_MAX 34
+
+/* What the next 0x42 on a multitap port returns (psx-spx TAP/REQ latch).
+ * Indexed by physical SIO port so dual multitap keeps independent FSMs. */
+typedef enum {
+    MTAP_NEXT_SLOT_A = 0,
+    MTAP_NEXT_BULK,
+    MTAP_NEXT_GARBAGE,
+} MtapNextMode;
+
 static PadState pad_state = PAD_IDLE;
-static int selected_slot = 0;
-static uint8_t pad_response[8];
+static int selected_slot = 0;          /* physical SIO slot (CTRL bit13): 0 or 1 */
+static int pad_active_logical = 0;     /* logical pad for single-pad / config cmds */
+static PSX_BSS uint8_t pad_response[PAD_RESPONSE_MAX];
 static uint8_t pad_response_len = 0;
 static uint8_t pad_response_idx = 0;
 static uint8_t pad_current_cmd = 0;
-/* DualShock config-mode latch, per slot. A real controller only answers the
- * config commands (0x44/0x45/0x46/0x47/0x4C/0x4D/0x4F) and reports the config
- * ID 0xF3 while it is IN config mode; outside config it reports its normal ID
- * (0x41 digital / 0x73 analog) and ignores config commands. Config is entered/
- * exited by command 0x43 with the data byte 0x01(enter)/0x00(exit). Faking
- * "always in config" (constant 0xF3) wedges games that probe the pad type via
- * 0x43 before polling — e.g. Mega Man X6 loops 01 43 00 00 forever and never
- * reaches 0x42. (MMX6 ISSUES.md #2.) */
-static uint8_t pad_in_config[2] = { 0, 0 };
+/* Address byte that opened this pad txn (01h=Slot A / bulk, 02h..04h=B..D). */
+static uint8_t pad_mtap_addr = 0x01;
+static int mtap_next_mode[2] = { MTAP_NEXT_SLOT_A, MTAP_NEXT_SLOT_A };
+static int mtap_req_this[2];          /* TAP==1 seen on current 0x42 txn */
+static int mtap_returned[2] = { MTAP_NEXT_SLOT_A, MTAP_NEXT_SLOT_A };
+/* DualShock config-mode latch, per logical pad. A real controller only answers
+ * the config commands (0x44/0x45/0x46/0x47/0x4C/0x4D/0x4F) and reports the
+ * config ID 0xF3 while it is IN config mode; outside config it reports its
+ * normal ID (0x41 digital / 0x73 analog) and ignores config commands. Config is
+ * entered/exited by command 0x43 with the data byte 0x01(enter)/0x00(exit).
+ * Faking "always in config" (constant 0xF3) wedges games that probe the pad
+ * type via 0x43 before polling — e.g. Mega Man X6 loops 01 43 00 00 forever
+ * and never reaches 0x42. (MMX6 ISSUES.md #2.) */
+static PSX_BSS uint8_t pad_in_config[PSX_MAX_PLAYERS];
+/* JogCon's signed steering position from its preceding poll and the most
+ * recent motor command nibble. These are emulated device state, separate from
+ * the frontend's vibration/force-feedback capabilities. */
+static PSX_BSS int8_t pad_jogcon_last_steering[PSX_MAX_PLAYERS];
+static PSX_BSS uint8_t pad_jogcon_motor_command[PSX_MAX_PLAYERS];
+/* The same motor byte's strength nibble, for host force feedback only (not
+ * echoed to the guest and not savestated: every poll rewrites it). */
+static PSX_BSS uint8_t pad_jogcon_motor_strength[PSX_MAX_PLAYERS];
 
-/* Whether the pad on a slot is a config-capable DualShock (1) or a plain
- * digital controller (0). A real SCPH-1080 digital pad (poll id 0x41) does NOT
- * answer the config-mode commands (0x43/0x44/.../0x4F): it returns hi-z and the
- * transaction ends. A game's pad driver that probes with 0x43 to detect a
- * DualShock therefore classifies a digital pad as digital-only and just polls
- * it with 0x42. Tomba 2's driver probes this way every frame; when the SM
- * (wrongly) answered 0x43 for its digital pad it went down the DualShock config
- * path and read the 0x00 config-response bytes as buttons -> phantom "all
- * pressed" input. Default 1 keeps analog/hybrid pads unchanged; main.cpp sets 0
- * for PAD_MODE_DIGITAL. */
-static uint8_t pad_supports_config[2] = { 1, 1 };
+/* Whether the pad on a logical slot is config-capable (DualShock/JogCon, 1) or a
+ * plain digital controller (0). A real SCPH-1080 digital pad (poll id 0x41)
+ * does NOT answer the config-mode commands (0x43/0x44/.../0x4F): it returns
+ * hi-z and the transaction ends. A game's pad driver that probes with 0x43 to
+ * detect a DualShock therefore classifies a digital pad as digital-only and
+ * just polls it with 0x42. Tomba 2's driver probes this way every frame; when
+ * the SM (wrongly) answered 0x43 for its digital pad it went down the
+ * DualShock config path and read the 0x00 config-response bytes as buttons ->
+ * phantom "all pressed" input. Default 1 keeps analog/hybrid pads unchanged;
+ * main.cpp sets 0 for PAD_MODE_DIGITAL. */
+static uint8_t pad_supports_config[PSX_MAX_PLAYERS] = {
+    PSX_PAD_INIT(1)
+};
 
 /* Coherent-DualShock model (Tomba phantom-input fix). A real controller never
  * changes its reported type (0x41 digital <-> 0x73 analog) in the middle of a
@@ -108,7 +169,172 @@ static uint8_t pad_supports_config[2] = { 1, 1 };
  * host REQUESTS a type via pad_type_req[] and the change is applied atomically
  * only when the bus is idle (PAD_IDLE) and the pad is NOT in config mode. A
  * request raised during config is held until config exits. -1 = no request. */
-static int8_t  pad_type_req[2]  = { -1, -1 };
+static int8_t pad_type_req[PSX_MAX_PLAYERS] = {
+    PSX_PAD_INIT(-1)
+};
+
+/* ---- Logical pad ↔ physical SIO port mapping ----
+ *
+ * Multitap off (default / PSX_MAX_PLAYERS==2):
+ *   physical 0 → logical 0, physical 1 → logical 1
+ * Single multitap (PSX_MAX_PLAYERS 5..7) on Port 1 (sio_multitap_port==0):
+ *   physical 0 → multitap (pads A–D = logical 0–3; Slot A path = 0)
+ *   physical 1 → logical 4
+ * Single multitap on Port 2 (sio_multitap_port==1):
+ *   physical 0 → logical 0
+ *   physical 1 → multitap (pads A–D = logical 1–4; Slot A path = 1)
+ * Dual multitap (PSX_MAX_PLAYERS >= 8):
+ *   physical 0 → multitap pads A–D = logical 0–3
+ *   physical 1 → multitap pads A–D = logical 4–7
+ */
+static int sio_multitap_active(void) {
+#if PSX_MAX_PLAYERS >= 5
+    return sio_multitap_enabled;
+#else
+    return 0;
+#endif
+}
+
+/* Dual SCPH-1070 when the build can host 8 pads. */
+static int sio_dual_multitap(void) {
+#if PSX_MAX_PLAYERS >= 8
+    return sio_multitap_enabled;
+#else
+    return 0;
+#endif
+}
+
+static int mtap_slot_a_logical(void) {
+    if (sio_dual_multitap())
+        return (selected_slot == 0) ? 0 : 4;
+    return (sio_multitap_port == 0) ? 0 : 1;
+}
+
+static int mtap_standalone_logical(void) {
+    if (sio_dual_multitap())
+        return -1; /* no lone opposite-port pad */
+    return (sio_multitap_port == 0) ? 4 : 0;
+}
+
+static int pad_logical_for_port(int phys_port) {
+    if (phys_port < 0 || phys_port > 1) return -1;
+    if (sio_multitap_active()) {
+        if (sio_dual_multitap())
+            return (phys_port == 0) ? 0 : 4;
+        if (phys_port == sio_multitap_port)
+            return (sio_multitap_port == 0) ? 0 : 1;
+        return mtap_standalone_logical();
+    }
+    return phys_port;
+}
+
+/* Physical port answers when a device is present. Multitap itself is present
+ * whenever enabled (individual tap slots may still be empty). */
+static int pad_port_has_device(int phys_port) {
+    if (phys_port < 0 || phys_port > 1) return 0;
+    if (sio_multitap_active()) {
+        if (sio_dual_multitap()) return 1;
+        if (phys_port == sio_multitap_port) return 1;
+        return (pad_connected & (1u << mtap_standalone_logical())) ? 1 : 0;
+    }
+    return (pad_connected & (1u << phys_port)) ? 1 : 0;
+}
+
+static int selected_is_mtap_port(void) {
+    if (!sio_multitap_active()) return 0;
+    if (sio_dual_multitap()) return (selected_slot == 0 || selected_slot == 1);
+    return selected_slot == sio_multitap_port;
+}
+
+/* After a completed 0x42 on the multitap port, arm the next response mode
+ * from the REQ bit seen this transfer and what we just returned (psx-spx). */
+static void mtap_finish_42(void) {
+    int p;
+    if (!selected_is_mtap_port() || pad_current_cmd != 0x42 || pad_mtap_addr != 0x01)
+        return;
+    p = selected_slot;
+    if (p < 0 || p > 1) return;
+    if (!mtap_req_this[p]) {
+        mtap_next_mode[p] = MTAP_NEXT_SLOT_A;
+    } else if (mtap_returned[p] == MTAP_NEXT_SLOT_A) {
+        mtap_next_mode[p] = MTAP_NEXT_BULK;
+    } else if (mtap_returned[p] == MTAP_NEXT_BULK) {
+        mtap_next_mode[p] = MTAP_NEXT_GARBAGE;
+    } else {
+        mtap_next_mode[p] = MTAP_NEXT_BULK;
+    }
+}
+
+static uint8_t pad_protocol_id(int logical) {
+    if (pad_in_config[logical]) return 0xF3;
+    if (pad_analog[logical] == SIO_PAD_JOGCON) return 0xE3;
+    if (pad_analog[logical] == SIO_PAD_NEGCON) return 0x23;
+    if (pad_analog[logical] == SIO_PAD_DUALSHOCK) return 0x73;
+    return 0x41;
+}
+
+/* NeGcon (NPC-101) poll payload: buttons, twist, then analog I, II and L
+ * (Mednafen psx/input/negcon.cpp). The device has no config mode and no
+ * motors; every byte is fixed by the current host sample. */
+static void pad_fill_negcon_poll(int logical, uint8_t out[8]) {
+    out[0] = 0x23;
+    out[1] = 0x5A;
+    out[2] = (uint8_t)(pad_buttons[logical] & 0xFF);
+    out[3] = (uint8_t)(pad_buttons[logical] >> 8);
+    out[4] = pad_stick[logical][0];
+    out[5] = pad_negcon_analog[logical][0];
+    out[6] = pad_negcon_analog[logical][1];
+    out[7] = pad_negcon_analog[logical][2];
+}
+
+/* Poll payload for the JogCon. Steering is a signed absolute position; the
+ * direction bits report movement since the preceding poll. Byte 7 is reserved. */
+static void pad_fill_jogcon_poll(int logical, uint8_t id, uint8_t out[8]) {
+    const int8_t steering = (int8_t)((int)pad_stick[logical][0] - 0x80);
+    out[0] = id;
+    out[1] = 0x5A;
+    out[2] = (uint8_t)(pad_buttons[logical] & 0xFF);
+    out[3] = (uint8_t)(pad_buttons[logical] >> 8);
+    out[4] = (uint8_t)steering;
+    out[5] = steering < 0 ? 0xFF : 0x00;
+    out[6] = (uint8_t)(pad_jogcon_motor_command[logical] << 4);
+    if (steering > pad_jogcon_last_steering[logical]) out[6] |= 0x01;
+    else if (steering < pad_jogcon_last_steering[logical]) out[6] |= 0x02;
+    out[7] = 0x00;
+    pad_jogcon_last_steering[logical] = steering;
+}
+
+/* Fill 8-byte per-pad status block used in multitap bulk 0x42 responses.
+ * Disconnected → all 0xFF. Digital → 0x41, DualShock → 0x73 + axes,
+ * JogCon → 0xE3 + signed steering, NeGcon → 0x23 + twist/I/II/L,
+ * config mode → corresponding config ID. */
+static void pad_fill_status8(int logical, uint8_t out[8]) {
+    if (logical < 0 || logical >= PSX_MAX_PLAYERS ||
+        !(pad_connected & (1u << logical))) {
+        memset(out, 0xFF, 8);
+        return;
+    }
+    const uint8_t id = pad_protocol_id(logical);
+    const uint16_t btn = pad_buttons[logical];
+    out[0] = id;
+    out[1] = 0x5A;
+    out[2] = (uint8_t)(btn & 0xFF);
+    out[3] = (uint8_t)(btn >> 8);
+    if (pad_analog[logical] == SIO_PAD_JOGCON) {
+        uint8_t poll[8];
+        pad_fill_jogcon_poll(logical, id, poll);
+        memcpy(out, poll, sizeof(poll));
+    } else if (pad_analog[logical] == SIO_PAD_NEGCON) {
+        pad_fill_negcon_poll(logical, out);
+    } else if (pad_analog[logical] || pad_in_config[logical]) {
+        out[4] = pad_stick[logical][2]; /* right X */
+        out[5] = pad_stick[logical][3]; /* right Y */
+        out[6] = pad_stick[logical][0]; /* left X */
+        out[7] = pad_stick[logical][1]; /* left Y */
+    } else {
+        out[4] = out[5] = out[6] = out[7] = 0xFF;
+    }
+}
 
 /* Memory card SIO state machine */
 typedef enum {
@@ -230,7 +456,7 @@ static int sio_tx_gated = 0;        /* writes gated by missing TX_EN */
 static uint16_t sio_last_ctrl_on_tx = 0; /* CTRL at last TX write */
 
 /* ---- SIO byte-level trace ring buffer ---- */
-static SioTraceEntry sio_trace_buf[SIO_TRACE_CAP];
+static PSX_BSS SioTraceEntry sio_trace_buf[SIO_TRACE_CAP];
 static int sio_trace_idx = 0;       /* next write position */
 static uint32_t sio_trace_seq = 0;  /* monotonic sequence number */
 
@@ -251,6 +477,82 @@ int sio_card_protocol_active(void) {
     if (mc_slots[0].state != MC_IDLE) return 1;
     if (mc_slots[1].state != MC_IDLE) return 1;
     return 0;
+}
+
+#if SIO_MODEL_CYCLE_PACED
+static void sio_fire_ack_irq(void);
+static void sio_handle_shift_complete(void);
+#endif
+
+/* ---- Post-probe SIO / interrupt-mask handoff ring ---- */
+#define CARD_HANDOFF_CAP 256
+static SioCardHandoffEntry s_card_handoff[CARD_HANDOFF_CAP];
+static int s_card_handoff_idx = 0;
+static int s_card_handoff_count = 0;
+static int s_card_handoff_armed = 0; /* set after LOAD-style probe abort */
+
+static void card_handoff_push(uint8_t kind, uint8_t byte) {
+    extern uint32_t g_debug_current_func_addr;
+    extern uint32_t g_debug_last_store_pc;
+    extern uint32_t i_mask;
+    extern uint64_t psx_get_cycle_count(void);
+    SioCardHandoffEntry *e = &s_card_handoff[s_card_handoff_idx];
+    e->kind  = kind;
+    e->byte  = byte;
+    e->imask = (uint16_t)(i_mask & 0x7FFu);
+    e->pc    = g_debug_last_store_pc;
+    e->func  = g_debug_current_func_addr;
+    e->ctrl = sio_ctrl;
+    e->stat = sio_stat;
+    e->card_state = (uint32_t)mc_state;
+    e->cyc   = psx_get_cycle_count();
+    s_card_handoff_idx = (s_card_handoff_idx + 1) % CARD_HANDOFF_CAP;
+    s_card_handoff_count++;
+}
+
+/* Diagnostic only: guest writes own the interrupt mask. */
+void sio_card_handoff_on_imask(uint32_t old_mask, uint32_t new_mask) {
+    if (!s_card_handoff_armed) return;
+    if (!(old_mask & 0x80u) && (new_mask & 0x80u))
+        card_handoff_push(2, 0);
+    else if ((old_mask & 0x80u) && !(new_mask & 0x80u))
+        card_handoff_push(3, 0);
+}
+
+const SioCardHandoffEntry *sio_get_card_handoff(int *idx_out, int *count_out) {
+    if (idx_out) *idx_out = s_card_handoff_idx;
+    if (count_out) *count_out = s_card_handoff_count;
+    return s_card_handoff;
+}
+int sio_card_handoff_cap(void) { return CARD_HANDOFF_CAP; }
+int sio_card_handoff_armed(void) { return s_card_handoff_armed; }
+
+int sio_hold_present_for_card(void) {
+    /* NTSC VBlank period — matches interrupts.c VBLANK_CYCLES. */
+    enum { SIO_PRESENT_HOLD_STALE_VB = 10 };
+    static const uint64_t stale_cycles =
+        564480ull * (uint64_t)SIO_PRESENT_HOLD_STALE_VB;
+    static uint32_t s_hold_seq;
+    static uint64_t s_hold_progress_cyc;
+    static int s_hold_armed;
+    uint32_t seq;
+    uint64_t now;
+
+    if (!sio_card_protocol_active()) {
+        s_hold_armed = 0;
+        return 0;
+    }
+    extern uint64_t psx_get_cycle_count(void);
+    seq = sio_get_seq();
+    now = psx_get_cycle_count();
+    if (!s_hold_armed || seq != s_hold_seq) {
+        s_hold_seq = seq;
+        s_hold_progress_cyc = now;
+        s_hold_armed = 1;
+    }
+    if (now - s_hold_progress_cyc >= stale_cycles)
+        return 0; /* stale: allow present drain */
+    return 1;
 }
 
 /* Forward decl: defined below sio_get_freeze_diag. */
@@ -317,10 +619,10 @@ static void sr_record(uint8_t kind, uint8_t tx, uint8_t rx) {
 
 
 /* ---- Card transaction ring buffer ---- */
-static SioTxnEntry sio_txn_buf[SIO_TXN_CAP];
+static PSX_BSS SioTxnEntry sio_txn_buf[SIO_TXN_CAP];
 static int       sio_txn_idx = 0;        /* next-write slot */
 static uint32_t  sio_txn_seq = 0;        /* monotonic id of next-to-close */
-static int       sio_txn_open = 0;       /* 1 when a txn is in progress */
+static int sio_txn_open = 0;
 static SioTxnEntry sio_txn_cur;          /* in-progress txn, flushed on close */
 
 uint32_t sio_get_card_txns(const SioTxnEntry **buf_out, int *write_idx_out, int *open_out) {
@@ -369,6 +671,14 @@ static void txn_close(uint8_t end_reason, uint8_t terminal_state, uint32_t func)
     sio_txn_cur.end_reason     = end_reason;
     sio_txn_cur.terminal_state = terminal_state;
     sio_txn_cur.end_func       = func;
+    /* Short read-presence probe: 81 52 00 + SELECT abort. Record the
+     * following interrupt-mask and card traffic without altering it. */
+    if (end_reason == SIO_TXN_END_ABORT_OTHER &&
+        sio_txn_cur.byte_count == 3 &&
+        sio_txn_cur.tx[0] == 0x81 && sio_txn_cur.tx[1] == 0x52) {
+        s_card_handoff_armed = 1;
+        card_handoff_push(1, 0x52);
+    }
     sio_txn_buf[sio_txn_idx]   = sio_txn_cur;
     sio_txn_idx = (sio_txn_idx + 1) % SIO_TXN_CAP;
     sio_txn_seq++;
@@ -376,7 +686,7 @@ static void txn_close(uint8_t end_reason, uint8_t terminal_state, uint32_t func)
 }
 
 /* ---- SIO IRQ #7 delivery ring ---- */
-static SioIrqEntry sio_irq_buf[SIO_IRQ_RING_CAP];
+static PSX_BSS SioIrqEntry sio_irq_buf[SIO_IRQ_RING_CAP];
 static int       sio_irq_idx = 0;
 static uint32_t  sio_irq_seq = 0;
 
@@ -541,11 +851,27 @@ void sio_init(void) {
     pad_response_len = 0;
     pad_response_idx = 0;
     pad_current_cmd = 0;
-    pad_buttons[0] = pad_buttons[1] = 0xFFFF;
-    pad_in_config[0] = pad_in_config[1] = 0;   /* clear stale config latch on reset */
-    pad_type_req[0]  = pad_type_req[1]  = -1;  /* no pending host type change */
-    analog_mode_locked[0] = analog_mode_locked[1] = 0;  /* unlocked on reset */
+    pad_active_logical = 0;
+    memset(pad_rumble_map, 0xFF, sizeof(pad_rumble_map));
+    memset(pad_rumble_small, 0, sizeof(pad_rumble_small));
+    memset(pad_rumble_large, 0, sizeof(pad_rumble_large));
+    memset(pad_jogcon_last_steering, 0, sizeof(pad_jogcon_last_steering));
+    memset(pad_jogcon_motor_command, 0, sizeof(pad_jogcon_motor_command));
+    memset(pad_jogcon_motor_strength, 0, sizeof(pad_jogcon_motor_strength));
+    memset(pad_negcon_analog, 0, sizeof(pad_negcon_analog));
+    for (int i = 0; i < PSX_MAX_PLAYERS; i++) {
+        pad_analog_device[i] = SIO_PAD_DUALSHOCK;
+        pad_buttons[i] = 0xFFFF;
+        pad_analog[i] = 0;
+        pad_stick[i][0] = pad_stick[i][1] = pad_stick[i][2] = pad_stick[i][3] = 0x80;
+        pad_in_config[i] = 0;
+        pad_type_req[i] = -1;
+        analog_mode_locked[i] = 0;
+        pad_supports_config[i] = 1;
+    }
     pad_connected = 0;
+    /* Multitap enable/port are host preferences — leave them alone across
+     * sio_init so a soft reset does not drop the tap configuration. */
     mc_state = MC_IDLE;
     for (int i = 0; i < 2; i++) {
         mc_slots[i].state = MC_IDLE;
@@ -601,23 +927,180 @@ uint32_t sio_cycles_to_irq(uint32_t i_mask) {
     return best;
 }
 
+void sio_set_multitap(int enabled) {
+#if PSX_MAX_PLAYERS >= 5
+    sio_multitap_enabled = enabled ? 1 : 0;
+    if (!enabled) {
+        mtap_next_mode[0] = mtap_next_mode[1] = MTAP_NEXT_SLOT_A;
+        mtap_req_this[0] = mtap_req_this[1] = 0;
+        mtap_returned[0] = mtap_returned[1] = MTAP_NEXT_SLOT_A;
+    }
+#else
+    (void)enabled;
+    sio_multitap_enabled = 0;
+#endif
+}
+
+int sio_get_multitap(void) {
+    return sio_multitap_active();
+}
+
+void sio_set_multitap_port(int phys_port) {
+#if PSX_MAX_PLAYERS >= 5
+    sio_multitap_port = (phys_port == 1) ? 1 : 0;
+    mtap_next_mode[0] = mtap_next_mode[1] = MTAP_NEXT_SLOT_A;
+    mtap_req_this[0] = mtap_req_this[1] = 0;
+    mtap_returned[0] = mtap_returned[1] = MTAP_NEXT_SLOT_A;
+#else
+    (void)phys_port;
+    sio_multitap_port = 0;
+#endif
+}
+
+int sio_get_multitap_port(void) {
+#if PSX_MAX_PLAYERS >= 5
+    return sio_multitap_port;
+#else
+    return 0;
+#endif
+}
+
+void sio_set_multitap_analog(int enabled) {
+    sio_multitap_analog_hack = enabled ? 1 : 0;
+}
+
+int sio_get_multitap_analog(void) {
+    return sio_multitap_analog_hack;
+}
+
+int sio_pad_on_multitap(int logical_slot) {
+#if PSX_MAX_PLAYERS >= 5
+    if (!sio_multitap_active()) return 0;
+    if (logical_slot < 0 || logical_slot >= PSX_MAX_PLAYERS) return 0;
+    /* Dual tap: every seat is a tap pad. Single tap: opposite-port lone pad
+     * may stay DualShock; every other slot is on the tap. */
+    if (sio_dual_multitap()) return 1;
+    return (logical_slot == mtap_standalone_logical()) ? 0 : 1;
+#else
+    (void)logical_slot;
+    return 0;
+#endif
+}
+
+/* Tap seat that must stay digital unless the analog hack is armed. */
+static int sio_tap_force_digital(int logical_slot) {
+    return sio_pad_on_multitap(logical_slot) && !sio_multitap_analog_hack;
+}
+
 void sio_connect_pad(int slot) {
-    if (slot >= 0 && slot <= 1)
-        pad_connected |= (1 << slot);
+    if (slot >= 0 && slot < PSX_MAX_PLAYERS)
+        pad_connected |= (uint8_t)(1u << slot);
+}
+
+void sio_netplay_canonicalize_session_pads(int slot_count)
+{
+    int i;
+    if (slot_count < 2)
+        slot_count = 2;
+    if (slot_count > PSX_MAX_PLAYERS)
+        slot_count = PSX_MAX_PLAYERS;
+
+    if (slot_count >= 3)
+        sio_set_multitap(1);
+    else
+        sio_set_multitap(0);
+
+    /* Idle the pad bus — dig0 snaps otherwise capture mid-poll FSM / response
+     * bytes that differ when peers finish present dig at different host times. */
+    pad_state = PAD_IDLE;
+    selected_slot = 0;
+    pad_active_logical = 0;
+    pad_response_len = 0;
+    pad_response_idx = 0;
+    pad_current_cmd = 0;
+    pad_mtap_addr = 0x01;
+    memset(pad_response, 0, sizeof(pad_response));
+    mtap_next_mode[0] = mtap_next_mode[1] = MTAP_NEXT_SLOT_A;
+    mtap_returned[0] = mtap_returned[1] = MTAP_NEXT_SLOT_A;
+    mtap_req_this[0] = mtap_req_this[1] = 0;
+    if (active_device == DEV_PAD)
+        active_device = DEV_NONE;
+
+    for (i = 0; i < PSX_MAX_PLAYERS; i++) {
+        if (i < slot_count) {
+            sio_connect_pad(i);
+            /* Immediate digital — sio_request_pad_type is deferred and left
+             * rematch hosts (local DualShock seed) analog=1 through dig0. */
+            sio_set_pad_analog(i, 0, 0x80, 0x80, 0x80, 0x80);
+            sio_set_pad_state_slot(i, 0xFFFFu);
+            {
+                const int force_dig =
+                    sio_pad_on_multitap(i) && !sio_get_multitap_analog();
+                sio_set_pad_config_capable(i, force_dig ? 0 : 1);
+            }
+            pad_in_config[i] = 0;
+            analog_mode_locked[i] = 0;
+            pad_analog_device[i] = SIO_PAD_DUALSHOCK;
+            pad_type_req[i] = -1;
+            memset(pad_rumble_map[i], 0xFF, sizeof(pad_rumble_map[i]));
+            pad_rumble_small[i] = 0;
+            pad_rumble_large[i] = 0;
+        } else {
+            sio_set_pad_connected(i, 0);
+            sio_set_pad_analog(i, 0, 0x80, 0x80, 0x80, 0x80);
+            sio_set_pad_state_slot(i, 0xFFFFu);
+            pad_in_config[i] = 0;
+            pad_type_req[i] = -1;
+        }
+    }
 }
 
 void sio_set_pad_connected(int slot, int connected) {
-    if (slot < 0 || slot > 1) return;
-    if (connected) pad_connected |=  (uint8_t)(1 << slot);
-    else           pad_connected &= (uint8_t)~(1 << slot);
+    if (slot < 0 || slot >= PSX_MAX_PLAYERS) return;
+    if (connected) {
+        pad_connected |= (uint8_t)(1u << slot);
+    } else {
+        pad_connected &= (uint8_t)~(1u << slot);
+        pad_rumble_small[slot] = 0;
+        pad_rumble_large[slot] = 0;
+        pad_jogcon_last_steering[slot] = 0;
+        pad_jogcon_motor_command[slot] = 0;
+        pad_jogcon_motor_strength[slot] = 0;
+    }
 }
 
 void sio_set_pad_config_capable(int slot, int capable) {
-    if (slot < 0 || slot > 1) return;
+    if (slot < 0 || slot >= PSX_MAX_PLAYERS) return;
+    if (sio_tap_force_digital(slot)) capable = 0;
     pad_supports_config[slot] = capable ? 1 : 0;
     /* A plain digital pad can never be in config mode; clear any stale latch so
      * the next poll reports the digital id (0x41), not the config id (0xF3). */
-    if (!capable) pad_in_config[slot] = 0;
+    if (!capable) {
+        pad_in_config[slot] = 0;
+        pad_rumble_small[slot] = 0;
+        pad_rumble_large[slot] = 0;
+    }
+}
+
+void sio_get_pad_jogcon_motor(int slot, uint8_t *command, uint8_t *strength) {
+    uint8_t c = 0, s = 0;
+    if (slot >= 0 && slot < PSX_MAX_PLAYERS && (pad_connected & (1u << slot)) &&
+        pad_analog[slot] == SIO_PAD_JOGCON) {
+        c = pad_jogcon_motor_command[slot];
+        s = pad_jogcon_motor_strength[slot];
+    }
+    if (command) *command = c;
+    if (strength) *strength = s;
+}
+
+void sio_get_pad_rumble(int slot, uint8_t *small, uint8_t *large) {
+    uint8_t s = 0, l = 0;
+    if (slot >= 0 && slot < PSX_MAX_PLAYERS && (pad_connected & (1u << slot))) {
+        s = pad_rumble_small[slot];
+        l = pad_rumble_large[slot];
+    }
+    if (small) *small = s;
+    if (large) *large = l;
 }
 
 void sio_set_pad_state(uint16_t buttons) {
@@ -625,7 +1108,37 @@ void sio_set_pad_state(uint16_t buttons) {
 }
 
 void sio_set_pad_state_slot(int slot, uint16_t buttons) {
-    if (slot >= 0 && slot <= 1) pad_buttons[slot] = buttons;
+    if (slot >= 0 && slot < PSX_MAX_PLAYERS) pad_buttons[slot] = buttons;
+}
+
+/* Entering or leaving NeGcon swaps the controller on the port; it is not the
+ * DualShock analog button. The NeGcon is a pre-DualShock device with no config
+ * mode, mode lock or motors, so the swap clears the config latch, the 0x44 mode
+ * lock and the rumble map/motors exactly as unplugging one pad and plugging in
+ * another would. A game-locked analog mode therefore never pins a DualShock in
+ * place of a requested NeGcon (the lock belongs to the device that left), and a
+ * DualShock that returns powers up unlocked with an unassigned motor map. */
+static int pad_type_is_device_swap(uint8_t from, uint8_t to) {
+    return (from == SIO_PAD_NEGCON) != (to == SIO_PAD_NEGCON);
+}
+
+static void pad_commit_type(int slot, uint8_t type) {
+    const uint8_t from = pad_analog[slot];
+    if (from != type) {
+        pad_jogcon_last_steering[slot] = 0;
+        pad_jogcon_motor_command[slot] = 0;
+        pad_jogcon_motor_strength[slot] = 0;
+    }
+    if (pad_type_is_device_swap(from, type)) {
+        pad_in_config[slot] = 0;
+        analog_mode_locked[slot] = 0;
+        memset(pad_rumble_map[slot], 0xFF, sizeof(pad_rumble_map[slot]));
+        pad_rumble_small[slot] = 0;
+        pad_rumble_large[slot] = 0;
+    }
+    if (type == SIO_PAD_DUALSHOCK || type == SIO_PAD_JOGCON)
+        pad_analog_device[slot] = type;
+    pad_analog[slot] = type;
 }
 
 /* Direct set of pad type + sticks. Used at boot/hotplug (refresh_player_devices)
@@ -633,28 +1146,70 @@ void sio_set_pad_state_slot(int slot, uint16_t buttons) {
  * no handshake is in flight. Per-frame input must NOT use this for the type —
  * use sio_set_pad_sticks + sio_request_pad_type so the type change is applied
  * coherently (see pad_type_req[] above). */
-void sio_set_pad_analog(int slot, int enabled,
-                        uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry) {
-    if (slot < 0 || slot > 1) return;
-    pad_analog[slot]   = enabled ? 1 : 0;
+void sio_set_pad_type(int slot, int type,
+                      uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry) {
+    if (slot < 0 || slot >= PSX_MAX_PLAYERS) return;
+    if (sio_tap_force_digital(slot)) {
+        type = SIO_PAD_DIGITAL;
+        lx = ly = rx = ry = 0x80;
+    }
+    if (type < SIO_PAD_DIGITAL || type > SIO_PAD_NEGCON)
+        type = SIO_PAD_DIGITAL;
+    if (type == SIO_PAD_JOGCON)
+        pad_supports_config[slot] = 1;
+    pad_commit_type(slot, (uint8_t)type);
     pad_type_req[slot] = -1;   /* explicit set supersedes any pending request */
     pad_stick[slot][0] = lx; pad_stick[slot][1] = ly;
     pad_stick[slot][2] = rx; pad_stick[slot][3] = ry;
 }
 
+void sio_set_pad_analog(int slot, int enabled,
+                        uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry) {
+    sio_set_pad_type(slot, enabled ? SIO_PAD_DUALSHOCK : SIO_PAD_DIGITAL,
+                     lx, ly, rx, ry);
+}
+
 /* Per-frame stick update (does not touch the reported pad type). */
 void sio_set_pad_sticks(int slot, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry) {
-    if (slot < 0 || slot > 1) return;
+    if (slot < 0 || slot >= PSX_MAX_PLAYERS) return;
     pad_stick[slot][0] = lx; pad_stick[slot][1] = ly;
     pad_stick[slot][2] = rx; pad_stick[slot][3] = ry;
 }
 
-/* Per-frame type request (the emulated DualShock "analog button"). The flip is
+void sio_set_pad_negcon(int slot, uint8_t i, uint8_t ii, uint8_t l) {
+    if (slot < 0 || slot >= PSX_MAX_PLAYERS) return;
+    pad_negcon_analog[slot][0] = i;
+    pad_negcon_analog[slot][1] = ii;
+    pad_negcon_analog[slot][2] = l;
+}
+
+void sio_get_pad_negcon(int slot, uint8_t out[3]) {
+    if (!out) return;
+    if (slot < 0 || slot >= PSX_MAX_PLAYERS) {
+        out[0] = out[1] = out[2] = 0;
+        return;
+    }
+    memcpy(out, pad_negcon_analog[slot], 3);
+}
+
+int sio_get_pad_mode_locked(int slot) {
+    return (slot >= 0 && slot < PSX_MAX_PLAYERS) ? analog_mode_locked[slot] : 0;
+}
+
+/* Per-frame type request (the emulated controller type). The flip is
  * deferred and applied atomically at the next idle, non-config boundary, so it
  * can never split a poll or a config handshake. A no-op if already that type. */
-void sio_request_pad_type(int slot, int analog) {
-    if (slot < 0 || slot > 1) return;
-    int want = analog ? 1 : 0;
+void sio_request_pad_type(int slot, int type) {
+    if (slot < 0 || slot >= PSX_MAX_PLAYERS) return;
+    if (sio_tap_force_digital(slot)) type = SIO_PAD_DIGITAL;
+    if (type < SIO_PAD_DIGITAL || type > SIO_PAD_NEGCON)
+        type = SIO_PAD_DIGITAL;
+    /* A JogCon is a config-capable controller even when its type is selected
+     * through this deferred per-frame path (debug injection / hot selection).
+     * Otherwise it reports ID 0xE3 to 0x42 but silently ignores R4's 0x43
+     * setup transaction, leaving the game with a half-initialized device. */
+    if (type == SIO_PAD_JOGCON) pad_supports_config[slot] = 1;
+    int want = type;
     pad_type_req[slot] = (pad_analog[slot] == want) ? -1 : (int8_t)want;
 }
 
@@ -663,21 +1218,21 @@ uint16_t sio_get_pad_buttons(void) {
 }
 
 uint16_t sio_get_pad_buttons_slot(int slot) {
-    return (slot >= 0 && slot <= 1) ? pad_buttons[slot] : 0xFFFF;
+    return (slot >= 0 && slot < PSX_MAX_PLAYERS) ? pad_buttons[slot] : 0xFFFF;
 }
 
 int sio_get_pad_connected(int slot) {
-    if (slot < 0 || slot > 1) return 0;
-    return (pad_connected & (1 << slot)) ? 1 : 0;
+    if (slot < 0 || slot >= PSX_MAX_PLAYERS) return 0;
+    return (pad_connected & (1u << slot)) ? 1 : 0;
 }
 
 int sio_get_pad_analog(int slot) {
-    return (slot >= 0 && slot <= 1) ? pad_analog[slot] : 0;
+    return (slot >= 0 && slot < PSX_MAX_PLAYERS) ? pad_analog[slot] : 0;
 }
 
 void sio_get_pad_sticks(int slot, uint8_t out[4]) {
     if (!out) return;
-    if (slot < 0 || slot > 1) {
+    if (slot < 0 || slot >= PSX_MAX_PLAYERS) {
         out[0] = out[1] = out[2] = out[3] = 0x80;
         return;
     }
@@ -744,7 +1299,8 @@ void sio_set_legacy_cfg(int v) {
     g_pad_legacy_cfg = v ? 1 : 0;
     /* Clear any in-flight config latch so a mid-session toggle can't carry a
      * stale 0xF3/8-byte poll into the other mode's dispatch. */
-    pad_in_config[0] = pad_in_config[1] = 0;
+    for (int s = 0; s < PSX_MAX_PLAYERS; s++)
+        pad_in_config[s] = 0;
 }
 
 static void pad_process_byte(uint8_t tx_byte) {
@@ -754,19 +1310,33 @@ static void pad_process_byte(uint8_t tx_byte) {
      * handshake — a hybrid stick/d-pad flip can never desync the game's driver
      * mid-transaction. A request raised during config stays pending until exit. */
     if (pad_state == PAD_IDLE) {
-        for (int s = 0; s < 2; s++) {
+        for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
             /* A game-LOCKED analog mode (0x44 ..03) ignores the physical analog
              * button — and our hybrid auto-flip IS that button — so a locked slot
-             * drops the pending host request instead of applying it. */
-            if (pad_type_req[s] >= 0 && !pad_in_config[s] && !analog_mode_locked[s]) {
-                pad_analog[s] = (uint8_t)pad_type_req[s];
+             * holds the pending host request instead of applying it. A device
+             * swap (into or out of NeGcon) is not that button: it replaces the
+             * locked device and applies regardless (see pad_commit_type). */
+            if (pad_type_req[s] >= 0 && !pad_in_config[s] &&
+                (!analog_mode_locked[s] ||
+                 pad_type_is_device_swap(pad_analog[s], (uint8_t)pad_type_req[s]))) {
+                pad_commit_type(s, (uint8_t)pad_type_req[s]);
                 pad_type_req[s] = -1;
             }
         }
     }
     switch (pad_state) {
     case PAD_IDLE:
-        if (tx_byte == 0x01 && (pad_connected & (1 << selected_slot))) {
+        /* Standard address 01h selects Slot A (or the standalone pad). With a
+         * multitap, 02h..04h select pads B–D on that port (psx-spx method 2). */
+        if (tx_byte == 0x01 && pad_port_has_device(selected_slot)) {
+            pad_active_logical = pad_logical_for_port(selected_slot);
+            pad_mtap_addr = 0x01;
+            pad_state = PAD_WAIT_ACCESS;
+            sio_rx_data = 0xFF;
+            sio_stat |= SIO_STAT_ACK;
+        } else if (selected_is_mtap_port() && tx_byte >= 0x02 && tx_byte <= 0x04) {
+            pad_active_logical = mtap_slot_a_logical() + (int)(tx_byte - 1);
+            pad_mtap_addr = tx_byte;
             pad_state = PAD_WAIT_ACCESS;
             sio_rx_data = 0xFF;
             sio_stat |= SIO_STAT_ACK;
@@ -778,31 +1348,98 @@ static void pad_process_byte(uint8_t tx_byte) {
     case PAD_WAIT_ACCESS:
         pad_current_cmd = tx_byte;
         pad_response_idx = 1;
+        if (selected_slot >= 0 && selected_slot <= 1)
+            mtap_req_this[selected_slot] = 0;
+        /* SCPH-1070 method 1: only when address was 01h AND a prior transfer
+         * latched REQ=1. Otherwise Slot A (or garbage) — never force bulk on
+         * every 0x42 (that breaks P1 when the tap is present with one pad). */
+        if (selected_is_mtap_port() && pad_mtap_addr == 0x01 && tx_byte == 0x42 &&
+            mtap_next_mode[selected_slot] == MTAP_NEXT_BULK) {
+            const int base = mtap_slot_a_logical();
+            pad_response[0] = 0x80;
+            pad_response[1] = 0x5A;
+            for (int i = 0; i < 4; i++)
+                pad_fill_status8(base + i, &pad_response[2 + i * 8]);
+            pad_response_len = PAD_RESPONSE_MAX;
+            mtap_returned[selected_slot] = MTAP_NEXT_BULK;
+            pad_state = PAD_SEND_RESPONSE;
+            sio_rx_data = pad_response[0];
+            sio_stat |= SIO_STAT_ACK;
+            break;
+        }
+        if (selected_is_mtap_port() && pad_mtap_addr == 0x01 && tx_byte == 0x42 &&
+            mtap_next_mode[selected_slot] == MTAP_NEXT_GARBAGE) {
+            /* HiZ,80h,5Ah,LSB(Slot A id) then abort (psx-spx). */
+            const int a = mtap_slot_a_logical();
+            const uint8_t id = (!(pad_connected & (1u << a))) ? 0xFFu
+                               : pad_protocol_id(a);
+            pad_response[0] = 0x80;
+            pad_response[1] = 0x5A;
+            pad_response[2] = id;
+            pad_response_len = 3;
+            mtap_returned[selected_slot] = MTAP_NEXT_GARBAGE;
+            pad_state = PAD_SEND_RESPONSE;
+            sio_rx_data = pad_response[0];
+            sio_stat |= SIO_STAT_ACK;
+            break;
+        }
+        if (selected_is_mtap_port() && pad_mtap_addr == 0x01 && tx_byte == 0x42)
+            mtap_returned[selected_slot] = MTAP_NEXT_SLOT_A;
+        /* Single-pad path (standalone port / Slot A / method-2 pad / non-0x42). */
+        {
+        const int lp = pad_active_logical;
+        if (lp < 0 || lp >= PSX_MAX_PLAYERS || !(pad_connected & (1u << lp))) {
+            /* No pad on this logical slot (e.g. empty multitap A during a
+             * non-bulk command): hi-z, end transaction. */
+            pad_state = PAD_IDLE;
+            pad_response_len = 0;
+            pad_response_idx = 0;
+            pad_current_cmd = 0;
+            sio_rx_data = 0xFF;
+            break;
+        }
         /* Controller ID reported as the first response byte. Real hardware
          * reports the config ID (0xF3) ONLY while in config mode; otherwise the
-         * normal mode ID (0x41 digital / 0x73 analog). */
-        {
-        const uint8_t cur_id = pad_in_config[selected_slot] ? 0xF3
-                               : (pad_analog[selected_slot] ? 0x73 : 0x41);
+         * normal mode ID (0x41 digital / 0x73 DualShock / 0xE3 JogCon). */
+        const uint8_t cur_id = pad_protocol_id(lp);
         /* A plain digital controller (SCPH-1080) answers ONLY the 0x42 poll; it
          * ignores every config-mode command (returns hi-z, no ACK). A driver
          * that probes with 0x43 to detect a DualShock then classifies it as
          * digital-only and just polls. Gate all config branches on this so a
          * digital-mode pad behaves like real hardware (see pad_supports_config). */
-        const int ds = pad_supports_config[selected_slot];
-        if (tx_byte == 0x42) {
+        const int ds = pad_supports_config[lp];
+        if (pad_analog[lp] == SIO_PAD_NEGCON) {
+            /* NeGcon answers only the 0x42 poll. Its ID byte goes out with any
+             * command, but for anything else it does not ACK and the
+             * transaction ends (Mednafen negcon.cpp phase 1). */
+            pad_fill_negcon_poll(lp, pad_response);
+            sio_rx_data = pad_response[0];
+            if (tx_byte == 0x42) {
+                pad_response_len = 8;
+                pad_state = PAD_SEND_RESPONSE;
+                sio_stat |= SIO_STAT_ACK;
+            } else {
+                pad_state = PAD_IDLE;
+                pad_response_len = 0;
+                pad_response_idx = 0;
+                pad_current_cmd = 0;
+            }
+        } else if (tx_byte == 0x42) {
             /* Read poll. Analog (or in-config) uses the 8-byte format with the
              * four stick axes; a plain digital pad uses the 4-byte format. */
-            const uint16_t btn = pad_buttons[selected_slot];
+            const uint16_t btn = pad_buttons[lp];
             pad_response[0] = cur_id;
             pad_response[1] = 0x5A;
             pad_response[2] = (uint8_t)(btn & 0xFF);
             pad_response[3] = (uint8_t)(btn >> 8);
-            if (pad_analog[selected_slot] || pad_in_config[selected_slot]) {
-                pad_response[4] = pad_stick[selected_slot][2]; /* right X */
-                pad_response[5] = pad_stick[selected_slot][3]; /* right Y */
-                pad_response[6] = pad_stick[selected_slot][0]; /* left X */
-                pad_response[7] = pad_stick[selected_slot][1]; /* left Y */
+            if (pad_analog[lp] == SIO_PAD_JOGCON) {
+                pad_fill_jogcon_poll(lp, cur_id, pad_response);
+                pad_response_len = 8;
+            } else if (pad_analog[lp] || pad_in_config[lp]) {
+                pad_response[4] = pad_stick[lp][2]; /* right X */
+                pad_response[5] = pad_stick[lp][3]; /* right Y */
+                pad_response[6] = pad_stick[lp][0]; /* left X */
+                pad_response[7] = pad_stick[lp][1]; /* left Y */
                 pad_response_len = 8;
             } else {
                 pad_response_len = 4;
@@ -814,7 +1451,7 @@ static void pad_process_byte(uint8_t tx_byte) {
             /* Enter/exit config mode. The ID byte reflects the CURRENT mode; the
              * enter(0x01)/exit(0x00) flag is the second data byte, latched in
              * PAD_SEND_RESPONSE so it takes effect after this transaction. */
-            const uint16_t btn = pad_buttons[selected_slot];
+            const uint16_t btn = pad_buttons[lp];
             pad_response[1] = 0x5A;
             if (g_pad_legacy_cfg) {
                 /* LEGACY (pre-98aa688): always config ID 0xF3, zero frame, no
@@ -824,7 +1461,7 @@ static void pad_process_byte(uint8_t tx_byte) {
                 pad_response[4] = 0x00; pad_response[5] = 0x00;
                 pad_response[6] = 0x00; pad_response[7] = 0x00;
                 pad_response_len = 8;
-            } else if (!pad_in_config[selected_slot]) {
+            } else if (!pad_in_config[lp]) {
                 /* ENTER attempt (normal mode): a real DualShock transmits the LIVE
                  * poll frame here — identical framing to 0x42 (dualshock.cpp:471-490)
                  * — and only latches config entry from the 0x01 data byte AFTERWARD.
@@ -835,11 +1472,14 @@ static void pad_process_byte(uint8_t tx_byte) {
                 pad_response[0] = cur_id;
                 pad_response[2] = (uint8_t)(btn & 0xFF);
                 pad_response[3] = (uint8_t)(btn >> 8);
-                if (pad_analog[selected_slot]) {
-                    pad_response[4] = pad_stick[selected_slot][2]; /* right X */
-                    pad_response[5] = pad_stick[selected_slot][3]; /* right Y */
-                    pad_response[6] = pad_stick[selected_slot][0]; /* left X */
-                    pad_response[7] = pad_stick[selected_slot][1]; /* left Y */
+                if (pad_analog[lp] == SIO_PAD_JOGCON) {
+                    pad_fill_jogcon_poll(lp, cur_id, pad_response);
+                    pad_response_len = 8;
+                } else if (pad_analog[lp]) {
+                    pad_response[4] = pad_stick[lp][2]; /* right X */
+                    pad_response[5] = pad_stick[lp][3]; /* right Y */
+                    pad_response[6] = pad_stick[lp][0]; /* left X */
+                    pad_response[7] = pad_stick[lp][1]; /* left Y */
                     pad_response_len = 8;
                 } else {
                     pad_response_len = 4;
@@ -876,12 +1516,12 @@ static void pad_process_byte(uint8_t tx_byte) {
             /* 0x45 status byte must report the LIVE analog mode, not a fixed
              * analog-on (dualshock.cpp:743) — see fix below for the modern path. */
             if (tx_byte == 0x45)
-                pad_response[3] = pad_analog[selected_slot] ? 0x01 : 0x00;
+                pad_response[3] = pad_analog[lp] ? 0x01 : 0x00;
             pad_response_len = 8;
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
-        } else if (ds && !g_pad_legacy_cfg && pad_in_config[selected_slot] &&
+        } else if (ds && !g_pad_legacy_cfg && pad_in_config[lp] &&
                    (tx_byte == 0x44 || tx_byte == 0x45 || tx_byte == 0x46 ||
                     tx_byte == 0x47 || tx_byte == 0x4C || tx_byte == 0x4D ||
                     tx_byte == 0x4F)) {
@@ -905,8 +1545,38 @@ static void pad_process_byte(uint8_t tx_byte) {
              * Reporting "analog" while we present digital (or vice-versa) makes the
              * driver mis-parse the poll frame length → off-by-frame garbage buttons
              * (axis5_sio_controller.md D8). */
-            if (tx_byte == 0x45)
-                pad_response[3] = pad_analog[selected_slot] ? 0x01 : 0x00;
+            if (tx_byte == 0x45) {
+                if (pad_analog[lp] == SIO_PAD_JOGCON) {
+                    static const uint8_t jogcon_45[8] =
+                        { 0xF3, 0x5A, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00 };
+                    memcpy(pad_response, jogcon_45, sizeof(jogcon_45));
+                } else {
+                    pad_response[3] = pad_analog[lp] ? 0x01 : 0x00;
+                }
+            }
+            /* JogCon config commands are not the DualShock's canned tables:
+             * 0x46/0x47/0x4C select values using their first data byte. The
+             * outgoing tail is adjusted later, when that byte arrives, just as
+             * the device does on the wire. */
+            if (pad_analog[lp] == SIO_PAD_JOGCON) {
+                if (tx_byte == 0x46) {
+                    static const uint8_t jogcon_46[8] =
+                        { 0xF3, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+                    memcpy(pad_response, jogcon_46, sizeof(jogcon_46));
+                } else if (tx_byte == 0x47) {
+                    static const uint8_t jogcon_47[8] =
+                        { 0xF3, 0x5A, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00 };
+                    memcpy(pad_response, jogcon_47, sizeof(jogcon_47));
+                } else if (tx_byte == 0x4C) {
+                    static const uint8_t jogcon_4c[8] =
+                        { 0xF3, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+                    memcpy(pad_response, jogcon_4c, sizeof(jogcon_4c));
+                }
+            }
+            /* 0x4D returns the previous six-byte motor map while latching the
+             * replacement bytes later in this same transaction. */
+            if (tx_byte == 0x4D)
+                memcpy(&pad_response[2], pad_rumble_map[lp], 6);
             pad_response_len = 8;
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
@@ -924,40 +1594,103 @@ static void pad_process_byte(uint8_t tx_byte) {
         break;
 
     case PAD_SEND_RESPONSE:
+        /* TAP/REQ (third command byte, paired with idhi/5Ah at idx==1): does not
+         * change *this* response; it arms the next 0x42 on the multitap port. */
+        if (selected_is_mtap_port() && pad_current_cmd == 0x42 &&
+            pad_mtap_addr == 0x01 && pad_response_idx == 1 &&
+            selected_slot >= 0 && selected_slot <= 1)
+            mtap_req_this[selected_slot] = (tx_byte == 0x01) ? 1 : 0;
+        /* DualShock rumble: index by the active logical pad (multitap-aware). */
+        {
+            const int rs = (pad_active_logical >= 0 && pad_active_logical < PSX_MAX_PLAYERS)
+                               ? pad_active_logical
+                               : selected_slot;
+            if (rs >= 0 && rs < PSX_MAX_PLAYERS) {
+                if (pad_analog[rs] == SIO_PAD_JOGCON &&
+                    pad_response_idx == 2) {
+                    if (pad_current_cmd == 0x46) {
+                        if (tx_byte == 0x00) {
+                            pad_response[4] = 0x01; pad_response[5] = 0x02;
+                            pad_response[6] = 0x00; pad_response[7] = 0x0A;
+                        } else if (tx_byte == 0x01) {
+                            pad_response[4] = 0x01; pad_response[5] = 0x01;
+                            pad_response[6] = 0x01; pad_response[7] = 0x14;
+                        }
+                    } else if (pad_current_cmd == 0x47 && tx_byte != 0x00) {
+                        pad_response[4] = pad_response[5] = 0x00;
+                        pad_response[6] = pad_response[7] = 0x00;
+                    } else if (pad_current_cmd == 0x4C) {
+                        if (tx_byte == 0x00) pad_response[5] = 0x04;
+                        else if (tx_byte == 0x01) pad_response[4] = 0x03;
+                    }
+                }
+                /* The six data bytes after 0x42's leading 0x00 occupy response
+                 * indexes 2..7. Route each through the map negotiated by 0x4D. */
+                if (pad_current_cmd == 0x42 && pad_analog[rs] != SIO_PAD_NEGCON &&
+                    pad_response_idx >= 2 && pad_response_idx < 8) {
+                    const unsigned map_index = (unsigned)pad_response_idx - 2u;
+                    const uint8_t motor = pad_rumble_map[rs][map_index];
+                    if (pad_analog[rs] == SIO_PAD_JOGCON && motor == 0x00) {
+                        pad_jogcon_motor_command[rs] = (uint8_t)(tx_byte >> 4);
+                        pad_jogcon_motor_strength[rs] = (uint8_t)(tx_byte & 0x0Fu);
+                    } else if (motor == 0x00)
+                        pad_rumble_small[rs] = tx_byte;
+                    else if (motor == 0x01)
+                        pad_rumble_large[rs] = tx_byte;
+                }
+                /* 0x4D uses the same six wire positions. pad_response[] was
+                 * populated with the old values before the transaction, so
+                 * updating the live map here preserves echo-before-write. */
+                if (pad_current_cmd == 0x4D &&
+                    pad_response_idx >= 2 && pad_response_idx < 8) {
+                    const unsigned map_index = (unsigned)pad_response_idx - 2u;
+                    pad_rumble_map[rs][map_index] = tx_byte;
+                }
+            }
+        }
         /* For 0x43 (enter/exit config), the data byte selecting enter(0x01)/
          * exit(0x00) arrives paired with response index 2. Latch the new config
          * state; it takes effect from the next transaction (the ID byte already
          * reported the mode that was current at the start of this one). */
-        if (!g_pad_legacy_cfg && pad_current_cmd == 0x43 && pad_response_idx == 2)
-            pad_in_config[selected_slot] = (tx_byte == 0x01) ? 1 : 0;
+        if (!g_pad_legacy_cfg && pad_current_cmd == 0x43 && pad_response_idx == 2 &&
+            pad_active_logical >= 0 && pad_active_logical < PSX_MAX_PLAYERS)
+            pad_in_config[pad_active_logical] = (tx_byte == 0x01) ? 1 : 0;
         /* 0x44 set-mode (game owns the analog/digital mode): the mode byte rides
          * in the same slot as 0x43's enter/exit flag (data position 3). 0x01 =>
          * analog (0x73), 0x00 => digital (0x41). Honouring it makes the pad
          * coherent — the type the game just selected is the type it then polls,
          * instead of the host hybrid silently winning. Drop any stale host
          * request so it can't immediately undo the game's choice. */
-        if (!g_pad_legacy_cfg && pad_current_cmd == 0x44 && pad_response_idx == 2) {
-            pad_analog[selected_slot] = (tx_byte == 0x01) ? 1 : 0;
-            pad_type_req[selected_slot] = -1;
+        if (!g_pad_legacy_cfg && pad_current_cmd == 0x44 && pad_response_idx == 2 &&
+            pad_active_logical >= 0 && pad_active_logical < PSX_MAX_PLAYERS) {
+            /* Analog selects the analog mode of the device in the port (a JogCon
+             * stays a JogCon after a digital round trip), never a new device. */
+            pad_analog[pad_active_logical] =
+                (tx_byte == 0x01) ? pad_analog_device[pad_active_logical]
+                                  : (uint8_t)SIO_PAD_DIGITAL;
+            pad_type_req[pad_active_logical] = -1;
         }
         /* 0x44 lock byte (data position 4, the byte after the mode byte): 0x03 =>
          * lock analog mode, 0x02 => unlock (dualshock.cpp:714-725). A locked slot
          * ignores the host hybrid auto-flip (see analog_mode_locked). */
-        if (!g_pad_legacy_cfg && pad_current_cmd == 0x44 && pad_response_idx == 3) {
-            if      (tx_byte == 0x03) analog_mode_locked[selected_slot] = 1;
-            else if (tx_byte == 0x02) analog_mode_locked[selected_slot] = 0;
+        if (!g_pad_legacy_cfg && pad_current_cmd == 0x44 && pad_response_idx == 3 &&
+            pad_active_logical >= 0 && pad_active_logical < PSX_MAX_PLAYERS) {
+            if      (tx_byte == 0x03) analog_mode_locked[pad_active_logical] = 1;
+            else if (tx_byte == 0x02) analog_mode_locked[pad_active_logical] = 0;
         }
         if (pad_response_idx < pad_response_len) {
             sio_rx_data = pad_response[pad_response_idx++];
             if (pad_response_idx < pad_response_len) {
                 sio_stat |= SIO_STAT_ACK;
             } else {
+                mtap_finish_42();
                 pad_state = PAD_IDLE;
                 pad_response_len = 0;
                 pad_response_idx = 0;
                 pad_current_cmd = 0;
             }
         } else {
+            mtap_finish_42();
             pad_state = PAD_IDLE;
             pad_response_len = 0;
             pad_response_idx = 0;
@@ -1002,12 +1735,9 @@ static void mc_process_byte(uint8_t tx_byte) {
             mc_state = MC_ID1;
             sio_rx_data = mc_flag;
             sio_stat |= SIO_STAT_ACK;
-            /* no$psx: FLAG byte is 0x08 only after newly-inserted/changed-battery
-             * card; cleared on first read or write. Without this clear, the BIOS
-             * sees 0x08 forever, treats every read as a fresh-card probe, and
-             * resets the chain counter (v0=-1 + 0x7520=1 path in BFC152E0).
-             * Beetle's card sim returns 0x00 in steady-state — match that. */
-            mc_flag = 0x00;
+            /* FLAG.3 survives reads and ID queries.  Original cards clear it
+             * only after a write; BIOS card initialization normally performs
+             * a dummy write to sector 003Fh for exactly that purpose. */
         } else {
             mc_state = MC_IDLE;
             sio_rx_data = 0xFF;
@@ -1460,6 +2190,7 @@ uint32_t sio_read(uint32_t addr) {
 uint16_t sio_peek_stat(void) { return sio_stat; }
 uint16_t sio_peek_ctrl(void) { return sio_ctrl; }
 uint8_t  sio_peek_rx_data(void) { return sio_rx_data; }
+int      sio_peek_ack_visible_reads(void) { return (int)sio_ack_visible_reads; }
 
 void sio_write(uint32_t addr, uint32_t value) {
     sio_debug_poll_maybe();
@@ -1477,6 +2208,15 @@ void sio_write(uint32_t addr, uint32_t value) {
         sio_tx_data = (uint8_t)value;
         sio_tx_writes++;
         sio_last_ctrl_on_tx = sio_ctrl;
+        {
+            uint8_t hb = (uint8_t)value;
+            /* Arm handoff on any card select so probe ACKs are visible too. */
+            if (hb == 0x81 && (sio_ctrl & SIO_CTRL_SELECT))
+                s_card_handoff_armed = 1;
+            if (s_card_handoff_armed &&
+                (hb == 0x81 || hb == 0x52 || hb == 0x57 || hb == 0x53))
+                card_handoff_push(4, hb);
+        }
         if (!(sio_ctrl & SIO_CTRL_TX_EN)) {
             sio_tx_gated++;
             sr_record(SR_EVT_TX_DATA_WRITE, (uint8_t)value, 0);
@@ -1486,7 +2226,29 @@ void sio_write(uint32_t addr, uint32_t value) {
         /* Cycle-paced TX. Pad and card share single bus. */
         {
             uint8_t b = (uint8_t)value;
-            int pad_fast_path =
+            /* FAITHFUL pad RX pacing (fixes dead pads under OpenBIOS). The pad
+             * "fast path" below processes the byte SYNCHRONOUSLY at the TX
+             * write: RX_RDY asserts instantly, while the ACK IRQ is scheduled
+             * BAUD+ACK (1088+170) cycles out. Real hardware asserts RX_RDY only
+             * when the byte has SHIFTED (~1088 cycles); the /ACK pulse lands
+             * ~170 cycles after that. A driver that waits on RXRDY (absorbing
+             * the shift time) and then spins a SHORT bounded loop on I_STAT.7 —
+             * OpenBIOS readPad's 0x50-iteration wait — starts that spin ~1000
+             * cycles early against the synchronous model and TIMES OUT: every
+             * poll aborts with padBuffer[0]=0xFF and the game sees a dead pad
+             * (byte 1 survived only by its extra busyloops; byte 2 aborted —
+             * sio_trace showed exactly 0x01,0x42 then abandon, one ack/poll).
+             * Default: route pads through the same cycle-paced shifter the
+             * memcard uses (RX_RDY at shift-complete, ack +170 after). Total
+             * ack-IRQ latency is UNCHANGED (1088+170), so the SCPH1001
+             * pad-detect phase the constants were tuned for is preserved.
+             * A/B: PSX_SIO_PAD_SYNC_RX=1 restores the legacy synchronous path. */
+            static int s_pad_sync_rx = -1;
+            if (s_pad_sync_rx < 0) {
+                const char *e = getenv("PSX_SIO_PAD_SYNC_RX");
+                s_pad_sync_rx = (e && e[0] == '1') ? 1 : 0;
+            }
+            int pad_fast_path = s_pad_sync_rx &&
                 active_device != DEV_MEMCARD &&
                 (active_device == DEV_PAD ||
                  sio_bus_owner == SIO_OWNER_PAD ||
@@ -1704,6 +2466,8 @@ void sio_write(uint32_t addr, uint32_t value) {
          *            buffer; harmless to retain since the next read
          *            overwrites it). */
         if ((old_ctrl & SIO_CTRL_SELECT) && !(value & SIO_CTRL_SELECT)) {
+            /* SELECT deassertion cancels the device's pending DSR pulse.
+             * It cannot create an ACK or preserve one for later delivery. */
             if (active_device == DEV_MEMCARD && mc_state != MC_IDLE && sio_txn_open) {
                 extern uint32_t g_debug_current_func_addr;
                 txn_close(SIO_TXN_END_ABORT_OTHER, mc_state, g_debug_current_func_addr);
@@ -1902,18 +2666,36 @@ static int sio_consume_ack_event(void) {
 }
 
 static void sio_fire_ack_irq(void) {
+    /* I_STAT sources are owned per device: an SIO0 card ACK may only raise
+     * bit 7. It must never clear SPU (bit 9) — a pending SPU IRQ stays
+     * pending until the guest performs the SPU/INTC acknowledgement. The
+     * prior netplay-parity experiment that dropped bit 9 here consumed the
+     * SPU interrupt during card scans and silenced SPU-IRQ-driven audio. */
+    int card_ack = (sio_irq_pending_source == SIO_IRQ_SRC_CARD_ACK ||
+                    active_device == DEV_MEMCARD);
+
     sio_stat |= SIO_STAT_ACK;
     sio_ack_visible_reads = 2;
     sr_record(SR_EVT_ACK_FIRE, 0, 0);
     int irq_enabled = sio_pending_ack_irq_en
                    || ((sio_ctrl & SIO_CTRL_ACK_IRQ_EN) ? 1 : 0);
+    if (!irq_enabled) {
+        sio_pending_ack_irq_en = 0;
+        return;
+    }
+
+    /* The device IRQ latch is independent of INTC acknowledgement. Do not
+     * queue an ACK for replay when the guest later clears I_STAT.7. */
     sio_pending_ack_irq_en = 0;
-    if (!irq_enabled) return;
     sio_stat |= SIO_STAT_IRQ;
 
     uint32_t i_stat_before = i_stat;
     psx_irq_raise(IRQ_SIO0, 0); /* SIO ACK IRQ */
     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_SIO, 0u); /* SIO ACK IRQ fired */
+    if (card_ack) {
+        if (s_card_handoff_armed)
+            card_handoff_push(5, 0);
+    }
 
     extern uint32_t g_debug_current_func_addr;
     extern uint8_t psx_read_byte(uint32_t addr);
@@ -1997,25 +2779,23 @@ static uint64_t s_sio_advance_with_work = 0;
 uint64_t sio_get_advance_called(void)    { return s_sio_advance_called; }
 uint64_t sio_get_advance_with_work(void) { return s_sio_advance_with_work; }
 
-void sio_advance(uint32_t cycles) {
-    if (cycles == 0) return;
-    s_sio_advance_called++;
-    if (!g_sio_timing_active) return;
-    s_sio_advance_with_work++;
-
-    int remaining = (int)cycles;
-    int transitions = 0;
-    const int MAX_TRANSITIONS = 8;
-    while (remaining > 0 && transitions < MAX_TRANSITIONS) {
+/* Consume every elapsed device deadline. Device time cannot stop after one
+ * transition merely to space interrupts for a particular guest handler. */
+static void sio_pace_walk(int cycles) {
+    int remaining = cycles;
+    while (remaining > 0 ||
+           (sio_shift_active && sio_shift_remaining <= 0) ||
+           (sio_pending_ack && sio_ack_remaining <= 0)) {
         int dt = remaining;
         int next_event = -1;
         if (sio_shift_active && sio_shift_remaining > 0
-            && sio_shift_remaining < dt) {
+            && sio_shift_remaining <= dt) {
             dt = sio_shift_remaining;
             next_event = 0;
         }
         if (sio_pending_ack && sio_ack_remaining > 0
-            && sio_ack_remaining < dt) {
+            && (sio_ack_remaining < dt ||
+                (sio_ack_remaining == dt && next_event < 0))) {
             dt = sio_ack_remaining;
             next_event = 1;
         }
@@ -2029,15 +2809,21 @@ void sio_advance(uint32_t cycles) {
         remaining -= dt;
         if (next_event == 0) {
             sio_handle_shift_complete();
-            transitions++;
         } else if (next_event == 1) {
             sio_pending_ack = 0;
             sio_fire_ack_irq();
-            transitions++;
         } else {
             break;
         }
     }
+}
+
+void sio_advance(uint32_t cycles) {
+    if (cycles == 0) return;
+    s_sio_advance_called++;
+    if (!g_sio_timing_active) return;
+    s_sio_advance_with_work++;
+    sio_pace_walk((int)cycles);
 }
 #else
 /* Macro=0: stubs for ABI symmetry. */
@@ -2048,48 +2834,14 @@ uint64_t sio_get_advance_with_work(void) { return 0; }
 
 void sio_tick(int cycles) {
 #if SIO_MODEL_CYCLE_PACED
-    /* Cycle-paced advance. In 1.0c-v2 sio_shift_active and
-     * sio_pending_ack are never set (TX path still synchronous), so this
-     * loop finds no events and returns immediately. Plus, the dispatch
-     * caller is gated by g_sio_timing_active so this function isn't even
-     * called when nothing is pending. */
-    if (cycles > 0) {
-        int remaining = cycles;
-        int transitions = 0;
-        const int MAX_TRANSITIONS = 8;
-        while (remaining > 0 && transitions < MAX_TRANSITIONS) {
-            int dt = remaining;
-            int next_event = -1;
-            if (sio_shift_active && sio_shift_remaining > 0
-                && sio_shift_remaining < dt) {
-                dt = sio_shift_remaining;
-                next_event = 0;
-            }
-            if (sio_pending_ack && sio_ack_remaining > 0
-                && sio_ack_remaining < dt) {
-                dt = sio_ack_remaining;
-                next_event = 1;
-            }
-            if (sio_shift_active && sio_shift_remaining <= 0) {
-                dt = 0; next_event = 0;
-            } else if (sio_pending_ack && sio_ack_remaining <= 0) {
-                dt = 0; next_event = 1;
-            }
-            if (sio_shift_active) sio_shift_remaining -= dt;
-            if (sio_pending_ack)  sio_ack_remaining   -= dt;
-            remaining -= dt;
-            if (next_event == 0) {
-                sio_handle_shift_complete();
-                transitions++;
-            } else if (next_event == 1) {
-                sio_pending_ack = 0;
-                sio_fire_ack_irq();
-                transitions++;
-            } else {
-                break;
-            }
-        }
-    }
+    /* Access-paced callers (I_STAT / SIO MMIO) pass 0. Master never walked
+     * the cycle-paced shifter on those edges. Flushing overdue shift/ack
+     * from sio_tick(0) can raise the next card ACK inside the ISR that is
+     * still clearing the previous one.
+     * EXPERIMENT: was netplay-only MMIO flush (MotK peer parity); always
+     * skip tick(0) flush here for TM4 netplay desync testing. */
+    if (cycles > 0)
+        sio_pace_walk(cycles);
 #else
     (void)cycles;
 #endif
@@ -2133,6 +2885,7 @@ void sio_tick(int cycles) {
             sio_irq_seq++;
         }
     }
+
 }
 
 void sio_tick_quantum(void) {
@@ -2165,71 +2918,326 @@ void sio_get_pace_state(uint64_t out[16]) {
 #endif
 }
 
-/* ---- boot snapshot: complete SIO hardware/FSM state (see boot_state.h) ----
- *
- * Serializes ALL functional SIO state needed to faithfully resume a transfer
- * mid-flight: the six SIO registers, the pad-config FSM (incl. per-slot config
- * latches + pending type requests + the in-flight response buffer), the working
- * memcard FSM vars AND the authoritative per-slot mc_slots[] (the working vars
- * are saved back into mc_slots[] and zeroed whenever the bus switches device or
- * SELECT drops, so a card transfer suspended on a deselected slot lives ONLY in
- * mc_slots[]), the active-device selector, the cycle-paced shifter/buffer/ACK
- * scheduler state, the g_sio_timing_active scheduler gate, and the access-paced
- * pending-IRQ context. Pure diagnostics (trace/txn/irq rings, probe/abort/arm/
- * burst/pace counters, host-resampled pad_buttons/pad_stick) are NOT serialized.
- *
- * The cycle-paced fields and g_sio_timing_active are guarded by
- * SIO_MODEL_CYCLE_PACED so the serialized byte count matches the build that
- * wrote it; a snapshot written by one model can never load into the other
- * because boot_state's integrity key (codegen hash/ABI/ver) rejects it first,
- * and sio_snapshot_read additionally length-checks. */
-#if SIO_MODEL_CYCLE_PACED
-#define SIO_SNAP_PACED_FIELDS(X) \
-    X(g_sio_timing_active) \
-    X(sio_shift_active) X(sio_shift_byte) X(sio_shift_remaining) \
-    X(sio_tx_buffered) X(sio_tx_buffer) \
-    X(sio_shift_ack_irq_en) X(sio_tx_buffer_ack_irq_en) \
-    X(sio_pending_ack) X(sio_ack_remaining) X(sio_pending_ack_irq_en) \
-    X(sio_bus_owner) X(sio_bus_byte_index)
-#else
-#define SIO_SNAP_PACED_FIELDS(X)
-#endif
+/* ---- boot snapshot (LE field wire; McSlotState has host padding) ---- */
+#include "pst_wire.h"
 
-#define SIO_SNAP_FIELDS(X) \
-    /* SIO registers */ \
-    X(sio_tx_data) X(sio_rx_data) X(sio_stat) X(sio_mode) X(sio_ctrl) X(sio_baud) \
-    /* pad-config FSM */ \
-    X(pad_analog) X(pad_connected) X(pad_state) X(selected_slot) \
-    X(pad_response) X(pad_response_len) X(pad_response_idx) X(pad_current_cmd) \
-    X(pad_in_config) X(pad_type_req) \
-    /* memcard working FSM vars */ \
-    X(mc_state) X(mc_slot) X(mc_cmd) X(mc_sector) X(mc_sector_msb) X(mc_sector_lsb) \
-    X(mc_data) X(mc_data_idx) X(mc_checksum) X(mc_flag) \
-    /* memcard authoritative per-slot state */ \
-    X(mc_slots) \
-    /* active device selector */ \
-    X(active_device) \
-    /* cycle-paced shifter/buffer/ACK scheduler (model-gated) */ \
-    SIO_SNAP_PACED_FIELDS(X) \
-    /* access-paced pending-IRQ context */ \
-    X(sio_irq_pending) X(sio_irq_countdown) X(sio_ack_visible_reads) \
-    X(sio_irq_pending_source) X(sio_irq_pending_slot) X(sio_irq_pending_delay) \
-    X(sio_irq_pending_mc_state) X(sio_irq_pending_byte_seq)
-
-uint32_t sio_snapshot_bytes(void){ uint32_t n=0;
-#define X(f) n += (uint32_t)sizeof(f);
-    SIO_SNAP_FIELDS(X)
-#undef X
-    return n; }
-
-void sio_snapshot_write(uint8_t *p){
-#define X(f) memcpy(p,(const void*)&(f),sizeof(f)); p+=sizeof(f);  /* cast: some fields are volatile */
-    SIO_SNAP_FIELDS(X)
-#undef X
+static int sio_w_mcslot(PstW *w, const McSlotState *s) {
+    return pst_w_u32(w, (uint32_t)s->state) && pst_w_u8(w, s->cmd) &&
+           pst_w_u16(w, s->sector) && pst_w_u8(w, s->sector_msb) &&
+           pst_w_u8(w, s->sector_lsb) && pst_w_bytes(w, s->data, 128) &&
+           pst_w_i32(w, (int32_t)s->data_idx) && pst_w_u8(w, s->checksum) &&
+           pst_w_u8(w, s->flag);
+}
+static int sio_r_mcslot(PstR *r, McSlotState *s) {
+    uint32_t st = 0;
+    int32_t di = 0;
+    if (!pst_r_u32(r, &st) || !pst_r_u8(r, &s->cmd) || !pst_r_u16(r, &s->sector) ||
+        !pst_r_u8(r, &s->sector_msb) || !pst_r_u8(r, &s->sector_lsb) ||
+        !pst_r_bytes(r, s->data, 128) || !pst_r_i32(r, &di) ||
+        !pst_r_u8(r, &s->checksum) || !pst_r_u8(r, &s->flag))
+        return 0;
+    s->state = (McState)st;
+    s->data_idx = (int)di;
+    return 1;
 }
 
-int sio_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=sio_snapshot_bytes()) return 0;
-#define X(f) memcpy((void*)&(f),p,sizeof(f)); p+=sizeof(f);  /* cast: some fields are volatile */
-    SIO_SNAP_FIELDS(X)
-#undef X
-    return 1; }
+/* Snapshot wire is emitted in four sections so netplay diags can CRC each
+ * independently (regs / pads / memcard / shift+irq FSM) — a single SIO digest
+ * could not say WHICH subsystem forked a resim. Order and bytes unchanged. */
+static int sio_snap_emit_regs(PstW *w) {
+    return pst_w_u8(w, sio_tx_data) && pst_w_u8(w, sio_rx_data) &&
+           pst_w_u16(w, sio_stat) && pst_w_u16(w, sio_mode) &&
+           pst_w_u16(w, sio_ctrl) && pst_w_u16(w, sio_baud);
+}
+
+static int sio_snap_emit_pads(PstW *w) {
+    /* Pad arrays sized by PSX_MAX_PLAYERS. Default MAX=2 keeps the historical
+     * 2-pad snap layout byte-identical. pad_response runtime buffer is larger
+     * for multitap bulk (34); snap still stores the first 8 bytes. */
+    if (!pst_w_bytes(w, pad_analog, PSX_MAX_PLAYERS) || !pst_w_u8(w, pad_connected) ||
+        !pst_w_u32(w, (uint32_t)pad_state) || !pst_w_i32(w, (int32_t)selected_slot) ||
+        !pst_w_bytes(w, pad_response, 8) || !pst_w_u8(w, pad_response_len) ||
+        !pst_w_u8(w, pad_response_idx) || !pst_w_u8(w, pad_current_cmd) ||
+        !pst_w_bytes(w, pad_in_config, PSX_MAX_PLAYERS))
+        return 0;
+    for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
+        if (!pst_w_i16(w, (int16_t)pad_type_req[s]))
+            return 0;
+    }
+    return 1;
+}
+
+static int sio_snap_emit_mc(PstW *w) {
+    if (!pst_w_u32(w, (uint32_t)mc_state) || !pst_w_i32(w, (int32_t)mc_slot) ||
+        !pst_w_u8(w, mc_cmd) || !pst_w_u16(w, mc_sector) ||
+        !pst_w_u8(w, mc_sector_msb) || !pst_w_u8(w, mc_sector_lsb) ||
+        !pst_w_bytes(w, mc_data, 128) || !pst_w_i32(w, (int32_t)mc_data_idx) ||
+        !pst_w_u8(w, mc_checksum) || !pst_w_u8(w, mc_flag))
+        return 0;
+    if (!sio_w_mcslot(w, &mc_slots[0]) || !sio_w_mcslot(w, &mc_slots[1]))
+        return 0;
+    return pst_w_u32(w, (uint32_t)active_device);
+}
+
+/* Load-bearing pacing state (guest-visible IRQ timing). */
+static int sio_snap_emit_fsm_pace(PstW *w) {
+#if SIO_MODEL_CYCLE_PACED
+    if (!pst_w_i32(w, (int32_t)g_sio_timing_active) ||
+        !pst_w_i32(w, (int32_t)sio_shift_active) || !pst_w_u8(w, sio_shift_byte) ||
+        !pst_w_i32(w, (int32_t)sio_shift_remaining) ||
+        !pst_w_i32(w, (int32_t)sio_tx_buffered) || !pst_w_u8(w, sio_tx_buffer) ||
+        !pst_w_i32(w, (int32_t)sio_shift_ack_irq_en) ||
+        !pst_w_i32(w, (int32_t)sio_tx_buffer_ack_irq_en) ||
+        !pst_w_i32(w, (int32_t)sio_pending_ack) ||
+        !pst_w_i32(w, (int32_t)sio_ack_remaining) ||
+        !pst_w_i32(w, (int32_t)sio_pending_ack_irq_en) ||
+        !pst_w_u32(w, (uint32_t)sio_bus_owner) || !pst_w_u32(w, sio_bus_byte_index))
+        return 0;
+#endif
+    return pst_w_i32(w, (int32_t)sio_irq_pending) &&
+           pst_w_i32(w, (int32_t)sio_irq_countdown) &&
+           pst_w_i32(w, (int32_t)sio_ack_visible_reads);
+}
+
+/* Audit/diag metadata — must not drive netplay digests (byte_seq tracks the
+ * host-local sio_trace_seq counter, which is not itself a guest register). */
+static int sio_snap_emit_fsm_meta(PstW *w) {
+    return pst_w_u8(w, sio_irq_pending_source) && pst_w_u8(w, sio_irq_pending_slot) &&
+           pst_w_u8(w, sio_irq_pending_delay) && pst_w_u8(w, sio_irq_pending_mc_state) &&
+           pst_w_u32(w, sio_irq_pending_byte_seq);
+}
+
+/* DualShock rumble map/motors — appended after meta so pre-rumble snapshots
+ * remain loadable and netplay digests that stop at fsm_pace stay stable. */
+static int sio_snap_emit_rumble(PstW *w) {
+    return pst_w_bytes(w, pad_rumble_map, sizeof(pad_rumble_map)) &&
+           pst_w_bytes(w, pad_rumble_small, sizeof(pad_rumble_small)) &&
+           pst_w_bytes(w, pad_rumble_large, sizeof(pad_rumble_large));
+}
+
+static int sio_snap_emit_jogcon(PstW *w) {
+    return pst_w_bytes(w, pad_jogcon_last_steering,
+                       sizeof(pad_jogcon_last_steering)) &&
+           pst_w_bytes(w, pad_jogcon_motor_command,
+                       sizeof(pad_jogcon_motor_command));
+}
+
+/* 0x44 mode lock and the analog-capable device behind each port. Both are set
+ * by the guest (0x44) or by a device swap, so rollback/rewind must restore
+ * them; appended after JogCon so older snapshots stay loadable. */
+static int sio_snap_emit_pad_mode(PstW *w) {
+    return pst_w_bytes(w, analog_mode_locked, sizeof(analog_mode_locked)) &&
+           pst_w_bytes(w, pad_analog_device, sizeof(pad_analog_device));
+}
+
+static void sio_pad_mode_legacy_defaults(void) {
+    for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
+        analog_mode_locked[s] = 0;
+        pad_analog_device[s] = pad_analog[s] == SIO_PAD_JOGCON
+                                   ? (uint8_t)SIO_PAD_JOGCON
+                                   : (uint8_t)SIO_PAD_DUALSHOCK;
+    }
+}
+
+static int sio_snap_emit_fsm(PstW *w) {
+    return sio_snap_emit_fsm_pace(w) && sio_snap_emit_fsm_meta(w);
+}
+
+static int sio_snap_emit(PstW *w) {
+    return sio_snap_emit_regs(w) && sio_snap_emit_pads(w) &&
+           sio_snap_emit_mc(w) && sio_snap_emit_fsm(w) && sio_snap_emit_rumble(w) &&
+           sio_snap_emit_jogcon(w) && sio_snap_emit_pad_mode(w);
+}
+
+/* Cumulative section end offsets in the snapshot wire:
+ * out[0]=regs, out[1]=pads, out[2]=memcard, out[3]=fsm_pace (netplay),
+ * out[4]=full including fsm metadata, rumble, JogCon and pad-mode state. */
+void sio_snapshot_section_ends(uint32_t out[5]) {
+    PstW w;
+    pst_w_init(&w, NULL, 0);
+    (void)sio_snap_emit_regs(&w);
+    out[0] = (uint32_t)w.written;
+    (void)sio_snap_emit_pads(&w);
+    out[1] = (uint32_t)w.written;
+    (void)sio_snap_emit_mc(&w);
+    out[2] = (uint32_t)w.written;
+    (void)sio_snap_emit_fsm_pace(&w);
+    out[3] = (uint32_t)w.written;
+    (void)sio_snap_emit_fsm_meta(&w);
+    (void)sio_snap_emit_rumble(&w);
+    (void)sio_snap_emit_jogcon(&w);
+    (void)sio_snap_emit_pad_mode(&w);
+    out[4] = (uint32_t)w.written;
+}
+
+static int sio_snap_parse(PstR *r) {
+    uint32_t u;
+    int32_t i;
+    int16_t tr;
+    if (!pst_r_u8(r, &sio_tx_data) || !pst_r_u8(r, &sio_rx_data) ||
+        !pst_r_u16(r, &sio_stat) || !pst_r_u16(r, &sio_mode) ||
+        !pst_r_u16(r, &sio_ctrl) || !pst_r_u16(r, &sio_baud))
+        return 0;
+    if (!pst_r_bytes(r, pad_analog, PSX_MAX_PLAYERS) || !pst_r_u8(r, &pad_connected) ||
+        !pst_r_u32(r, &u) || !pst_r_i32(r, &i) ||
+        !pst_r_bytes(r, pad_response, 8) || !pst_r_u8(r, &pad_response_len) ||
+        !pst_r_u8(r, &pad_response_idx) || !pst_r_u8(r, &pad_current_cmd) ||
+        !pst_r_bytes(r, pad_in_config, PSX_MAX_PLAYERS))
+        return 0;
+    pad_state = (PadState)u;
+    selected_slot = (int)i;
+    pad_active_logical = pad_logical_for_port(selected_slot);
+    /* Multitap bulk responses are 34 bytes; snap only stores 8. Abort an
+     * in-flight bulk restore rather than feed a truncated frame. */
+    if (pad_response_len > 8) {
+        pad_state = PAD_IDLE;
+        pad_response_len = 0;
+        pad_response_idx = 0;
+        pad_current_cmd = 0;
+    }
+    for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
+        if (!pst_r_i16(r, &tr))
+            return 0;
+        pad_type_req[s] = (int8_t)tr;
+    }
+    if (!pst_r_u32(r, &u) || !pst_r_i32(r, &i) || !pst_r_u8(r, &mc_cmd) ||
+        !pst_r_u16(r, &mc_sector) || !pst_r_u8(r, &mc_sector_msb) ||
+        !pst_r_u8(r, &mc_sector_lsb) || !pst_r_bytes(r, mc_data, 128))
+        return 0;
+    mc_state = (McState)u;
+    mc_slot = (int)i;
+    if (!pst_r_i32(r, &i) || !pst_r_u8(r, &mc_checksum) || !pst_r_u8(r, &mc_flag))
+        return 0;
+    mc_data_idx = (int)i;
+    if (!sio_r_mcslot(r, &mc_slots[0]) || !sio_r_mcslot(r, &mc_slots[1]))
+        return 0;
+    if (!pst_r_u32(r, &u)) return 0;
+    active_device = (ActiveDevice)u;
+#if SIO_MODEL_CYCLE_PACED
+    if (!pst_r_i32(r, &i)) return 0;
+    g_sio_timing_active = (int)i;
+    if (!pst_r_i32(r, &i) || !pst_r_u8(r, &sio_shift_byte)) return 0;
+    sio_shift_active = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_shift_remaining = (int)i;
+    if (!pst_r_i32(r, &i) || !pst_r_u8(r, &sio_tx_buffer)) return 0;
+    sio_tx_buffered = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_shift_ack_irq_en = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_tx_buffer_ack_irq_en = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_pending_ack = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_ack_remaining = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_pending_ack_irq_en = (int)i;
+    if (!pst_r_u32(r, &u) || !pst_r_u32(r, &sio_bus_byte_index)) return 0;
+    sio_bus_owner = (SioBusOwner)u;
+#endif
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_irq_pending = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_irq_countdown = (int)i;
+    if (!pst_r_i32(r, &i)) return 0;
+    sio_ack_visible_reads = (int)i;
+    if (!pst_r_u8(r, &sio_irq_pending_source) || !pst_r_u8(r, &sio_irq_pending_slot) ||
+        !pst_r_u8(r, &sio_irq_pending_delay) || !pst_r_u8(r, &sio_irq_pending_mc_state) ||
+        !pst_r_u32(r, &sio_irq_pending_byte_seq))
+        return 0;
+    /* sio_trace_seq is host-local and not on the wire; reseat it from the
+     * restored byte_seq so the next TX does not stamp a peer-divergent
+     * seq into sio_irq_pending_byte_seq (was forking fsm digests alone). */
+    sio_trace_seq = sio_irq_pending_byte_seq;
+    /* Pre-rumble snapshots end here. A mid-game legacy state cannot tell us
+     * the negotiated map, so assume the standard 0x00/0x01 layout used by
+     * commercial DualShock games while leaving both motors stopped. */
+    if (r->p == r->end) {
+        memset(pad_rumble_map, 0xFF, sizeof(pad_rumble_map));
+        memset(pad_rumble_small, 0, sizeof(pad_rumble_small));
+        memset(pad_rumble_large, 0, sizeof(pad_rumble_large));
+        memset(pad_jogcon_last_steering, 0, sizeof(pad_jogcon_last_steering));
+        memset(pad_jogcon_motor_command, 0, sizeof(pad_jogcon_motor_command));
+        memset(pad_jogcon_motor_strength, 0, sizeof(pad_jogcon_motor_strength));
+        for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
+            pad_rumble_map[s][0] = 0x00;
+            pad_rumble_map[s][1] = 0x01;
+        }
+        sio_pad_mode_legacy_defaults();
+        return 1;
+    }
+    if (!pst_r_bytes(r, pad_rumble_map, sizeof(pad_rumble_map)) ||
+        !pst_r_bytes(r, pad_rumble_small, sizeof(pad_rumble_small)) ||
+        !pst_r_bytes(r, pad_rumble_large, sizeof(pad_rumble_large)))
+        return 0;
+    /* JogCon state was appended after existing rumble fields to keep older
+     * snapshots readable. Pre-extension snapshots restore a neutral wheel. */
+    if (r->p == r->end) {
+        memset(pad_jogcon_last_steering, 0, sizeof(pad_jogcon_last_steering));
+        memset(pad_jogcon_motor_command, 0, sizeof(pad_jogcon_motor_command));
+        memset(pad_jogcon_motor_strength, 0, sizeof(pad_jogcon_motor_strength));
+        sio_pad_mode_legacy_defaults();
+        return 1;
+    }
+    if (!pst_r_bytes(r, pad_jogcon_last_steering,
+                     sizeof(pad_jogcon_last_steering)) ||
+        !pst_r_bytes(r, pad_jogcon_motor_command,
+                     sizeof(pad_jogcon_motor_command)))
+        return 0;
+    /* Pre-pad-mode snapshots: unlocked, device inferred from the type. */
+    if (r->p == r->end) {
+        sio_pad_mode_legacy_defaults();
+        return 1;
+    }
+    if (!pst_r_bytes(r, analog_mode_locked, sizeof(analog_mode_locked)) ||
+        !pst_r_bytes(r, pad_analog_device, sizeof(pad_analog_device)))
+        return 0;
+    for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
+        analog_mode_locked[s] = analog_mode_locked[s] ? 1 : 0;
+        if (pad_analog_device[s] != SIO_PAD_JOGCON)
+            pad_analog_device[s] = SIO_PAD_DUALSHOCK;
+    }
+    if (r->p != r->end) return 0;
+    return 1;
+}
+
+uint32_t sio_snapshot_bytes(void) {
+    PstW w;
+    pst_w_init(&w, NULL, 0);
+    (void)sio_snap_emit(&w);
+    return (uint32_t)w.written;
+}
+
+void sio_snapshot_write(uint8_t *p) {
+    PstW w;
+    uint32_t n = sio_snapshot_bytes();
+    pst_w_init(&w, p, n);
+    (void)sio_snap_emit(&w);
+}
+
+/* Non-mutating pre-check for boot_state's two-pass load: a section that passes
+ * cannot fail sio_snapshot_read (the parser only reads fixed-width fields, and
+ * both accepted lengths end exactly where one of its two layouts ends). */
+int sio_snapshot_validate(const uint8_t *p, uint32_t len) {
+    const uint32_t current = sio_snapshot_bytes();
+    const uint32_t rumble_bytes = (uint32_t)(sizeof(pad_rumble_map) +
+                                  sizeof(pad_rumble_small) +
+                                  sizeof(pad_rumble_large));
+    const uint32_t jogcon_bytes = (uint32_t)(sizeof(pad_jogcon_last_steering) +
+                                  sizeof(pad_jogcon_motor_command));
+    const uint32_t mode_bytes = (uint32_t)(sizeof(analog_mode_locked) +
+                                sizeof(pad_analog_device));
+    return p && (len == current ||
+                 (len < current && len + mode_bytes == current) ||
+                 (len < current && len + mode_bytes + jogcon_bytes == current) ||
+                 (len < current &&
+                  len + mode_bytes + jogcon_bytes + rumble_bytes == current));
+}
+
+int sio_snapshot_read(const uint8_t *p, uint32_t len) {
+    PstR r;
+    if (!sio_snapshot_validate(p, len))
+        return 0;
+    pst_r_init(&r, p, len);
+    return sio_snap_parse(&r);
+}
