@@ -189,6 +189,7 @@ button:hover { background-color: #232d3c; }
 .set-ctl { flex: 1 1 auto; display: flex; flex-direction: row; align-items: center; }
 .toggle { width: 132dp; text-align: center; }
 .toggle.wide { width: 164dp; }
+.toggle:disabled { opacity: 0.45; }
 .value { color: #ffffff; font-weight: bold; }
 .exp-tag { display: inline-block; font-size: 10dp; color: #d29922; background-color: #2a2410;
 	border: 1dp #5c4a12; border-radius: 4dp; padding: 0dp 5dp; margin-left: 8dp; font-weight: bold; }
@@ -603,6 +604,10 @@ button:hover { background-color: #232d3c; }
 				<button class="toggle" data-event-click="toggle_low_latency_input"><span class="value" data-if="low_latency_input">On</span><span class="value" data-if="low_latency_input == false">Off</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Show FPS</span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_show_fps"><span class="value" data-if="show_fps">On</span><span class="value" data-if="show_fps == false">Off</span></button></span></div>
+			<div class="set-row"><span class="set-lbl">Show Bezel</span><span class="set-ctl">
+				<button class="toggle" data-if="bezel_supported" data-event-click="toggle_show_bezel"><span class="value" data-if="show_bezel">On</span><span class="value" data-if="show_bezel == false">Off</span></button>
+				<button class="toggle" data-if="bezel_supported == false" disabled="disabled"><span class="value">Off</span></button>
+				<span class="ws-hint" data-if="bezel_supported == false">Only 16:9 resolutions</span></span></div>
 		</div>
 		<div class="panel" data-if="lang_menu">
 			<div class="eyebrow">LOCALIZATION</div>

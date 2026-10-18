@@ -38,12 +38,14 @@ void vk_renderer_present_cpu(const uint32_t*p,int w,int h,int l,int f){(void)p;(
 void vk_renderer_present_blank(void){}
 void vk_renderer_sync_cpu(void){}
 void vk_renderer_set_present_mode(int m){(void)m;}
+int vk_renderer_set_bezel(const unsigned char *p,int w,int h){(void)p;(void)w;(void)h;return 0;}
 int  vk_perf_json(char *out,int cap,int count){(void)count; return cap>2?snprintf(out,cap,"[]"):0;}
 const GpuRenderBackend *vk_backend_get(void) { return 0; }
 
 #else  /* PSX_HAVE_VULKAN */
 
 #include <SDL.h>
+#include "video_bezel.h"
 #include <SDL_vulkan.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -164,6 +166,9 @@ VK_DEVICE_FUNCS(DECL_FP)
 
 /* ---- state ------------------------------------------------------------- */
 static SDL_Window      *s_win;
+static VkImage          s_bezel_img = VK_NULL_HANDLE;
+static VkDeviceMemory   s_bezel_mem = VK_NULL_HANDLE;
+static int              s_bezel_w = 0, s_bezel_h = 0;
 static VkInstance       s_instance;
 static VkSurfaceKHR     s_surface;
 static VkPhysicalDevice s_phys;
@@ -1310,6 +1315,10 @@ void vk_renderer_shutdown(void) {
     if (!s_dev) return;
     p_vkDeviceWaitIdle(s_dev);
     vk_gpu_sync_internal();   /* reclaim deferred staging before tearing down */
+    if (s_bezel_img) p_vkDestroyImage(s_dev, s_bezel_img, NULL);
+    if (s_bezel_mem) p_vkFreeMemory(s_dev, s_bezel_mem, NULL);
+    s_bezel_img = VK_NULL_HANDLE; s_bezel_mem = VK_NULL_HANDLE;
+    s_bezel_w = s_bezel_h = 0;
     cpres_cache_free();       /* FMV CPU-present cached image + staging */
     wide_free_all();          /* native-wide surfaces (color + DS + framebuffers) */
     for (int i = 0; i < PIPE_CACHE_N; i++)
@@ -1366,6 +1375,64 @@ void vk_renderer_shutdown(void) {
 }
 
 void vk_renderer_set_present_mode(int mode) { s_present_mode_req = mode; }
+
+int vk_renderer_set_bezel(const unsigned char *rgba, int w, int h) {
+    if (!s_ctx_ok || !rgba || w <= 0 || h <= 0) return 0;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    void *map = NULL;
+    if (!make_staging((VkDeviceSize)w * h * 4, &buf, &mem, &map)) {
+        if (mem) p_vkFreeMemory(s_dev, mem, NULL);
+        return 0;
+    }
+    if (!make_image(VK_FORMAT_R8G8B8A8_UNORM, w, h,
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, &s_bezel_img, &s_bezel_mem, NULL)) {
+        if (buf) p_vkDestroyBuffer(s_dev, buf, NULL);
+        if (mem) p_vkFreeMemory(s_dev, mem, NULL);
+        if (s_bezel_img) p_vkDestroyImage(s_dev, s_bezel_img, NULL);
+        if (s_bezel_mem) p_vkFreeMemory(s_dev, s_bezel_mem, NULL);
+        s_bezel_img = VK_NULL_HANDLE; s_bezel_mem = VK_NULL_HANDLE;
+        return 0;
+    }
+    memcpy(map, rgba, (size_t)w * h * 4);
+    VkCommandBuffer cb = begin_oneshot();
+    img_barrier(cb, s_bezel_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy copy = {0};
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent.width = w; copy.imageExtent.height = h; copy.imageExtent.depth = 1;
+    p_vkCmdCopyBufferToImage(cb, buf, s_bezel_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    img_barrier(cb, s_bezel_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    end_oneshot(cb);
+    gpu_sync(); /* upload once, then reclaim staging */
+    p_vkDestroyBuffer(s_dev, buf, NULL); p_vkFreeMemory(s_dev, mem, NULL);
+    s_bezel_w = w; s_bezel_h = h;
+    return 1;
+}
+
+/* Paint the background first; the game blit then replaces its centre. */
+static void bezel_background(VkCommandBuffer cb, VkImage sc) {
+    int w = (int)s_sc_extent.width, h = (int)s_sc_extent.height;
+    if (!s_bezel_img || !video_bezel_visible(s_win, w, h)) return;
+    img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkImageBlit blit = {0};
+    blit.srcSubresource.aspectMask = blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.srcSubresource.layerCount = blit.dstSubresource.layerCount = 1;
+    blit.srcOffsets[1].x = s_bezel_w; blit.srcOffsets[1].y = s_bezel_h; blit.srcOffsets[1].z = 1;
+    blit.dstOffsets[1].x = w; blit.dstOffsets[1].y = h; blit.dstOffsets[1].z = 1;
+    p_vkCmdBlitImage(cb, s_bezel_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+}
 
 /* ---- present ----------------------------------------------------------- */
 /* Acquire a swapchain image, run `record` (which leaves it in
@@ -1441,6 +1508,7 @@ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
     VkClearColorValue black = {{0,0,0,1}};
     VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
+    bezel_background(cb, sc);
 
     VkOffset3D dst[2];
     letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
@@ -1480,6 +1548,7 @@ void vk_renderer_present_blank(void) {
     VkClearColorValue black = {{0,0,0,1}};
     VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
+    bezel_background(cb, sc);
     img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -1554,6 +1623,7 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
     VkClearColorValue black = {{0,0,0,1}};
     VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
+    bezel_background(cb, sc);
 
     VkOffset3D dst[2];
     letterbox((int)s_sc_extent.width, (int)s_sc_extent.height, 4, 3, dst);
@@ -1599,6 +1669,7 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
     VkClearColorValue black = {{0, 0, 0, 1}};
     VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
+    bezel_background(cb, sc);
 
     img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 

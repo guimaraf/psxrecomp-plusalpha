@@ -1167,6 +1167,10 @@ UserSettings load_user_settings(const fs::path& path) {
             s.low_latency_input = toml::find<bool>(v, "low_latency_input");
             s.has_low_latency_input = true;
         });
+        if (v.contains("show_bezel")) try_get([&]{
+            s.show_bezel = toml::find<bool>(v, "show_bezel");
+            s.has_show_bezel = true;
+        });
         if (v.contains("show_fps")) try_get([&]{
             s.show_fps = toml::find<bool>(v, "show_fps");
             s.has_show_fps = true;
@@ -1344,6 +1348,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "exclusive_fullscreen = " << (s.exclusive_fullscreen ? "true" : "false") << "\n";
     if (s.has_low_latency_input)
         f << "low_latency_input = " << (s.low_latency_input ? "true" : "false") << "\n";
+    if (s.has_show_bezel)
+        f << "show_bezel        = " << (s.show_bezel ? "true" : "false") << "\n";
     if (s.has_show_fps)
         f << "show_fps          = " << (s.show_fps ? "true" : "false") << "\n";
     if (s.has_vsync)

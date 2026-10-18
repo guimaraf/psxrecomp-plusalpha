@@ -50,6 +50,9 @@ void vk_renderer_sync_cpu(void);
  * unsupported modes fall back to FIFO (always available). */
 void vk_renderer_set_present_mode(int mode);
 
+/* Upload an opaque RGBA8 bezel once; only drawn in 16:9 fullscreen. */
+int vk_renderer_set_bezel(const unsigned char *rgba, int w, int h);
+
 #ifdef __cplusplus
 }
 #endif

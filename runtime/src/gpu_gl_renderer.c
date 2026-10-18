@@ -66,6 +66,7 @@
 #include "gpu_render.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
+#include "video_bezel.h"
 #include "latency_ring.h"
 
 #include <SDL.h>
@@ -307,6 +308,9 @@ static int           s_swap_interval = 1; /* SDL_GL swap interval (vsync mode) *
 static int           s_scale = 1;          /* internal-res scale (hr FBO) */
 static int           s_req_scale = 1;      /* requested before context init */
 
+static GLuint        s_bezel_tex = 0;
+static int           s_bezel_output_w = 0, s_bezel_output_h = 0;
+static Uint32        s_bezel_window_flags = 0;
 static GLuint        s_present_tex = 0;    /* CPU-readout present path (24bpp) */
 static int           s_present_w = 0, s_present_h = 0;
 static GLuint        s_present_prog = 0, s_present_vao = 0;
@@ -2295,6 +2299,84 @@ int gl_renderer_init_context(SDL_Window *win) {
     return 1;
 }
 
+/* Called once on the main context before the shared interpolation context. */
+int gl_renderer_set_bezel(const unsigned char *rgba, int w, int h) {
+    if (!s_ctx || !rgba || w <= 0 || h <= 0) return 0;
+    GLint bound = 0, unpack = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack);
+    if (s_bezel_tex) glDeleteTextures(1, &s_bezel_tex);
+    glGenTextures(1, &s_bezel_tex);
+    glBindTexture(GL_TEXTURE_2D, s_bezel_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    GLenum error = glGetError();
+    glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, unpack);
+    if (error != GL_NO_ERROR) {
+        fprintf(stderr, "psxrecomp: bezel: OpenGL upload failed (0x%x)\n", (unsigned)error);
+        glDeleteTextures(1, &s_bezel_tex); s_bezel_tex = 0;
+        return 0;
+    }
+    glFlush(); /* publish the immutable texture to the shared context */
+    return s_bezel_tex != 0;
+}
+
+/* A resize/fullscreen switch must defeat the unchanged-frame shortcut. */
+static void bezel_check_window_changed(void) {
+    if (!s_bezel_tex) return;
+    int w = 0, h = 0;
+    SDL_GL_GetDrawableSize(s_win, &w, &h);
+    Uint32 flags = SDL_GetWindowFlags(s_win) & SDL_WINDOW_FULLSCREEN_DESKTOP;
+    if (w != s_bezel_output_w || h != s_bezel_output_h || flags != s_bezel_window_flags)
+        s_last_present_path = -1;
+    s_bezel_output_w = w; s_bezel_output_h = h; s_bezel_window_flags = flags;
+}
+
+/* Clip the art to the margins: it never paints over the game's image. */
+static void bezel_draw(int ww, int wh, int lx, int lw, GLuint vao) {
+    if (!s_bezel_tex || !video_bezel_visible(s_win, ww, wh) || (lx <= 0 && lx + lw >= ww)) return;
+    GLint viewport[4], clip[4], texture = 0;
+    GLboolean mask[4];
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean blend = glIsEnabled(GL_BLEND), stencil = glIsEnabled(GL_STENCIL_TEST);
+    GLboolean depth = glIsEnabled(GL_DEPTH_TEST);
+    glGetIntegerv(GL_VIEWPORT, viewport); glGetIntegerv(GL_SCISSOR_BOX, clip);
+    glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    glDisable(GL_BLEND); glDisable(GL_STENCIL_TEST); glDisable(GL_DEPTH_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_SCISSOR_TEST);
+    glViewport(0, 0, ww, wh);
+    glBindTexture(GL_TEXTURE_2D, s_bezel_tex);
+    p_glUseProgram(s_present_prog);
+    p_glUniform1i(s_present_uTex, 0);
+    p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
+    p_glBindVertexArray(vao);
+    if (lx > 0) {
+        glScissor(0, 0, lx, wh);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    if (lx + lw < ww) {
+        glScissor(lx + lw, 0, ww - lx - lw, wh);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    p_glBindVertexArray(0); p_glUseProgram(0);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    glScissor(clip[0], clip[1], clip[2], clip[3]);
+    if (!scissor) glDisable(GL_SCISSOR_TEST);
+    if (blend) glEnable(GL_BLEND);
+    if (stencil) glEnable(GL_STENCIL_TEST);
+    if (depth) glEnable(GL_DEPTH_TEST);
+    glColorMask(mask[0], mask[1], mask[2], mask[3]);
+}
+
 /* Set the GL swap interval (vsync mode): 1=vsync, 0=immediate, -1=adaptive.
  * Safe to call before or after context creation; applies live when a context
  * exists. Adaptive falls back to vsync if unsupported. */
@@ -2335,6 +2417,10 @@ void gl_renderer_shutdown(void) {
             }
         }
         ensure_cpu();
+        if (s_bezel_tex) glDeleteTextures(1, &s_bezel_tex);
+        s_bezel_tex = 0;
+        s_bezel_output_w = s_bezel_output_h = 0;
+        s_bezel_window_flags = 0;
         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
     }
     if (s_interp_mutex) {
@@ -2385,6 +2471,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glUniform4f(s_present_uUvRect, 0.f, 0.f, 1.f, 1.f);
     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0); p_glUseProgram(0);
+    bezel_draw(ww, wh, lx, lw, s_present_vao);
     pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
     gl_sync_frame_fence();
     latency_ring_mark(LAT_SWAP_BEGIN);
@@ -2399,6 +2486,9 @@ void gl_renderer_present_blank(void) {
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh); glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+    int bx, by, bw, bh;
+    letterbox_rect_aspect(ww, wh, 4, 3, &bx, &by, &bw, &bh);
+    bezel_draw(ww, wh, bx, bw, s_present_vao);
     pres_record(GL_PRES_BLANK, 0, 0, 0, 0, 0, 0, ww, wh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
@@ -3203,6 +3293,7 @@ static int interp_present(void) {
         glClear(GL_COLOR_BUFFER_BIT);
     }
     interp_draw_quad((float)a, lx, ly, lw, lh);
+    bezel_draw(ww, wh, lx, lw, s_interp_thread_vao);
     if (s_interp_draw_fence) p_glDeleteSync(s_interp_draw_fence);
     s_interp_draw_fence = p_glFenceSync(PSXGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
@@ -3286,6 +3377,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     if (!s_ctx || !s_raster_ok) return;
     flush_tex_batch();
     flush_cpu_upload();
+    bezel_check_window_changed();
     if (s_last_present_path == GL_PRES_VRAM &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == w && s_last_dh == h &&
@@ -3319,6 +3411,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     }
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh);
+    bezel_draw(ww, wh, lx, lw, s_present_vao);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     gl_sync_frame_fence();
     latency_ring_mark(LAT_SWAP_BEGIN);
@@ -3380,6 +3473,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     if (!fbo) return 0;
     flush_tex_batch();
     flush_cpu_upload();
+    bezel_check_window_changed();
     if (s_last_present_path == GL_PRES_WIDE &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == g_wide_w && s_last_dh == disp_h &&
@@ -3412,6 +3506,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     }
     present_target_quad(tex, g_wide_w, VRAM_H,
                         0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh);
+    bezel_draw(ww, wh, lx, lw, s_present_vao);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
     gl_sync_frame_fence();
     latency_ring_mark(LAT_SWAP_BEGIN);

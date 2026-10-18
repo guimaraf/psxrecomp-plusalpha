@@ -6,6 +6,7 @@
 // is a later phase.
 
 #include "launcher.h"
+#include "video_bezel.h"
 
 #include "config_loader.h"
 #include "disc_identity.h"
@@ -137,6 +138,8 @@ struct LauncherModel {
     int  vsync           = 1;     // 0=immediate, 1=vsync, -1=adaptive
     bool low_latency_input = true;
     bool show_fps = true;
+    bool show_bezel = false; // saved preference, retained on incompatible displays
+    bool bezel_supported = false;
     bool frame_interpolation = false;
     int  frame_interpolation_fps = 0; // 0 = current display refresh
     bool opengl_renderer = false;
@@ -911,6 +914,8 @@ Result run(SDL_Window* window, void* gl_context,
     m.vsync          = io.has_vsync ? io.vsync : 1;
     m.low_latency_input = io.has_low_latency_input ? io.low_latency_input : true;
     m.show_fps = io.has_show_fps ? io.show_fps : true;
+    m.show_bezel = io.has_show_bezel ? io.show_bezel : false;
+    m.bezel_supported = video_bezel_display_supported(window);
     m.frame_interpolation = false;
     m.frame_interpolation_fps = 0;
     m.skip_launcher  = io.skip_launcher;
@@ -1041,6 +1046,8 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("vsync_label",    &m.vsync_label);
     c.Bind("low_latency_input", &m.low_latency_input);
     c.Bind("show_fps", &m.show_fps);
+    c.Bind("show_bezel", &m.show_bezel);
+    c.Bind("bezel_supported", &m.bezel_supported);
     c.Bind("frame_interpolation", &m.frame_interpolation);
     c.Bind("interpolation_fps_label", &m.interpolation_fps_label);
     c.Bind("opengl_renderer", &m.opengl_renderer);
@@ -1378,6 +1385,12 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.low_latency_input = !m.low_latency_input;
             handle.DirtyVariable("low_latency_input");
+        });
+    c.BindEventCallback("toggle_show_bezel",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            if (!m.bezel_supported) return;
+            m.show_bezel = !m.show_bezel;
+            handle.DirtyVariable("show_bezel");
         });
     c.BindEventCallback("toggle_show_fps",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -1945,6 +1958,11 @@ Result run(SDL_Window* window, void* gl_context,
     Result result = Result::Quit;
     bool running = true;
     while (running) {
+        const bool bezel_supported = video_bezel_display_supported(window);
+        if (m.bezel_supported != bezel_supported) {
+            m.bezel_supported = bezel_supported;
+            handle.DirtyVariable("bezel_supported");
+        }
         SDL_Event ev;
         bool controllers_dirty = false;
         while (SDL_PollEvent(&ev)) {
@@ -2111,6 +2129,7 @@ Result run(SDL_Window* window, void* gl_context,
         io.vsync = m.vsync;                   io.has_vsync = true;
         io.low_latency_input = m.low_latency_input; io.has_low_latency_input = true;
         io.show_fps = m.show_fps;             io.has_show_fps = true;
+        io.show_bezel = m.show_bezel;         io.has_show_bezel = true;
         io.frame_interpolation = false;
         io.has_frame_interpolation = true;
         io.frame_interpolation_fps = 0;

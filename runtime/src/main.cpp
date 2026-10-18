@@ -60,6 +60,8 @@
 #endif
 #include "game_core.h"
 #include <SDL.h>
+#include "video_bezel.h"
+#include "../launcher/third_party/stb_image.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -321,6 +323,10 @@ static int           g_fmv_skip_no_xa_hold  = 4;
  * it trims the display-side scanout latency the CPU-side ring can't see. */
 static int           g_low_latency_input = 1;
 static bool          g_show_fps = true;
+static bool          g_show_bezel = false;
+static SDL_Texture*  g_bezel_texture = nullptr;
+static std::filesystem::path g_bezel_asset_path;
+static bool          g_bezel_window_changed = false;
 static int           g_video_vsync        = 1;
 static int           g_frame_interpolation = 0;
 static int           g_frame_interpolation_fps = 0;
@@ -402,6 +408,81 @@ extern "C" int psx_ws_get_native_wide(void) { return g_ws_native_wide; }
 
 static bool          g_gl_active = false;    /* GL context live -> GL present path */
 static bool          g_vk_active = false;    /* Vulkan context live -> VK present path */
+
+static void initialize_video_bezel(const std::filesystem::path& path) {
+    if (!g_show_bezel || !sdl_window) return;
+    g_bezel_asset_path = path;
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    const auto size = input ? input.tellg() : std::streampos(-1);
+    if (size <= 0 || size > 32 * 1024 * 1024) {
+        std::fprintf(stderr, "psxrecomp: bezel: cannot read sfexp.png next to the executable\n");
+        return;
+    }
+    std::vector<unsigned char> png(static_cast<size_t>(size));
+    input.seekg(0);
+    if (!input.read(reinterpret_cast<char*>(png.data()), static_cast<std::streamsize>(png.size()))) {
+        std::fprintf(stderr, "psxrecomp: bezel: PNG read failed\n");
+        return;
+    }
+    int w = 0, h = 0, comp = 0;
+    unsigned char* rgba = stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &w, &h, &comp, 4);
+    if (!rgba || w != 1920 || h != 1080) {
+        std::fprintf(stderr, "psxrecomp: bezel: sfexp.png must be a valid 1920x1080 PNG\n");
+        stbi_image_free(rgba);
+        return;
+    }
+    /* Composite transparency on black once. The game is drawn over the centre. */
+    for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+        const unsigned a = rgba[i * 4 + 3];
+        for (int c = 0; c < 3; ++c)
+            rgba[i * 4 + c] = static_cast<unsigned char>(rgba[i * 4 + c] * a / 255);
+        rgba[i * 4 + 3] = 255;
+    }
+    bool ready = false;
+    if (g_gl_active) {
+        ready = gl_renderer_set_bezel(rgba, w, h) != 0;
+    } else if (g_vk_active) {
+        ready = vk_renderer_set_bezel(rgba, w, h) != 0;
+    } else if (sdl_renderer) {
+        SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormatFrom(rgba, w, h, 32, w * 4, SDL_PIXELFORMAT_RGBA32);
+        if (surface) {
+            g_bezel_texture = SDL_CreateTextureFromSurface(sdl_renderer, surface);
+            SDL_FreeSurface(surface);
+        }
+        if (g_bezel_texture) {
+            SDL_SetTextureBlendMode(g_bezel_texture, SDL_BLENDMODE_NONE);
+            SDL_SetTextureScaleMode(g_bezel_texture, SDL_ScaleModeLinear);
+            ready = true;
+        }
+    }
+    stbi_image_free(rgba);
+    if (!ready) std::fprintf(stderr, "psxrecomp: bezel: texture creation failed (%s)\n", SDL_GetError());
+}
+
+static void draw_sdl_bezel_background(void) {
+    if (!g_show_bezel || !g_bezel_texture || !sdl_renderer) return;
+    int w = 0, h = 0;
+    if (SDL_GetRendererOutputSize(sdl_renderer, &w, &h) != 0 ||
+        !video_bezel_visible(sdl_window, w, h)) return;
+    int logical_w = 0, logical_h = 0;
+    float sx = 1.f, sy = 1.f;
+    SDL_Rect viewport, clip;
+    const SDL_bool clipped = SDL_RenderIsClipEnabled(sdl_renderer);
+    SDL_RenderGetLogicalSize(sdl_renderer, &logical_w, &logical_h);
+    SDL_RenderGetViewport(sdl_renderer, &viewport);
+    SDL_RenderGetScale(sdl_renderer, &sx, &sy);
+    SDL_RenderGetClipRect(sdl_renderer, &clip);
+    SDL_RenderSetLogicalSize(sdl_renderer, 0, 0);
+    SDL_RenderSetViewport(sdl_renderer, nullptr);
+    SDL_RenderSetScale(sdl_renderer, 1.f, 1.f);
+    SDL_RenderSetClipRect(sdl_renderer, nullptr);
+    SDL_RenderCopy(sdl_renderer, g_bezel_texture, nullptr, nullptr);
+    SDL_RenderSetLogicalSize(sdl_renderer, logical_w, logical_h);
+    SDL_RenderSetScale(sdl_renderer, sx, sy);
+    SDL_RenderSetViewport(sdl_renderer, &viewport);
+    SDL_RenderSetClipRect(sdl_renderer, clipped ? &clip : nullptr);
+}
+
 /* Present straight from the FBO (fast, no readback). Set PSX_GL_FORCE_CPU_PRESENT=1
  * to force the software readout path instead — a diagnostic/fallback that also
  * keeps CPU VRAM current every frame (so screenshots reflect the screen). */
@@ -2314,6 +2395,14 @@ static void sdl_vblank_present(void) {
         /* Pump SDL events to prevent window freeze. */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            if (g_show_bezel && ev.type == SDL_WINDOWEVENT)
+                g_bezel_window_changed = true;
+            if (ev.type == SDL_RENDER_DEVICE_RESET && !g_gl_active && !g_vk_active) {
+                SDL_DestroyTexture(g_bezel_texture);
+                g_bezel_texture = nullptr;
+                initialize_video_bezel(g_bezel_asset_path);
+                g_bezel_window_changed = true;
+            }
             if (ev.type == SDL_QUIT) {
                 psx_crash_trace_set_exit_origin("sdl_window_close");
                 shutdown_runtime();
@@ -2345,6 +2434,7 @@ static void sdl_vblank_present(void) {
                                    (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP);
                     Uint32 fs_mode = g_exclusive_fullscreen ? SDL_WINDOW_FULLSCREEN : SDL_WINDOW_FULLSCREEN_DESKTOP;
                     SDL_SetWindowFullscreen(sdl_window, is_fs ? 0 : fs_mode);
+                    g_bezel_window_changed = true;
                 }
             }
         }
@@ -2561,7 +2651,8 @@ static void sdl_vblank_present(void) {
             present_ring_commit(PRES_PATH_BLANK, (uint16_t)di.width,
                                 (uint16_t)di.height, 0);
 #ifndef PSX_SDL_NO_RENDER
-            if (!disabled_frame_presented) {
+            if (!disabled_frame_presented || g_bezel_window_changed) {
+                g_bezel_window_changed = false;
                 disabled_frame_presented = true;
                 if (g_gl_active) {
                     gl_renderer_present_blank();
@@ -2570,6 +2661,7 @@ static void sdl_vblank_present(void) {
                 } else {
                     SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
                     SDL_RenderClear(sdl_renderer);
+                    draw_sdl_bezel_background();
                     SDL_RenderPresent(sdl_renderer);
                 }
             }
@@ -2788,6 +2880,7 @@ static void sdl_vblank_present(void) {
     int dst_w = pin_43 ? 640 * g_video_scale : g_logical_w;
     SDL_Rect dst = { (g_logical_w - dst_w) / 2, 0, dst_w, 480 * g_video_scale };
     SDL_RenderClear(sdl_renderer);
+    draw_sdl_bezel_background();
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
 
     /* Vsync self-heal. The renderer is created with PRESENTVSYNC for
@@ -3363,6 +3456,7 @@ int main(int argc, char** argv) {
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_show_fps)          g_show_fps = us.show_fps;
+        if (us.has_show_bezel)        g_show_bezel = us.show_bezel;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
         if (us.has_frame_interpolation)
             g_frame_interpolation = us.frame_interpolation ? 1 : 0;
@@ -3499,6 +3593,7 @@ int main(int argc, char** argv) {
             seed.fullscreen = (g_fullscreen != 0);        seed.has_fullscreen = true;
             seed.exclusive_fullscreen = (g_exclusive_fullscreen != 0); seed.has_exclusive_fullscreen = true;
             seed.show_fps = g_show_fps;                   seed.has_show_fps = true;
+            seed.show_bezel = g_show_bezel;               seed.has_show_bezel = true;
             seed.frame_interpolation = (g_frame_interpolation != 0);
             seed.has_frame_interpolation = true;
             seed.frame_interpolation_fps = g_frame_interpolation_fps;
@@ -3588,6 +3683,7 @@ int main(int argc, char** argv) {
                 g_fullscreen      = seed.fullscreen ? 1 : 0;
                 g_exclusive_fullscreen = seed.exclusive_fullscreen ? 1 : 0;
                 g_show_fps = seed.show_fps;
+                g_show_bezel = seed.show_bezel;
                 g_frame_interpolation = seed.frame_interpolation ? 1 : 0;
                 g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;
@@ -3954,8 +4050,6 @@ int main(int argc, char** argv) {
          * (which uses gr_scale()) matches it — otherwise sdl_pixel_buf is
          * undersized and the wide readback overflows it. */
         g_video_scale = gr_scale();
-        gl_renderer_set_interpolation(g_frame_interpolation, g_host_refresh_hz,
-                                      (double)g_frame_interpolation_fps);
     }
     /* Vulkan backend: create the instance/device/swapchain on the
      * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init
@@ -4048,6 +4142,13 @@ int main(int argc, char** argv) {
                             g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
   }
   }
+
+    if (!g_headless) {
+        initialize_video_bezel(exe_dir_from_argv(argv[0]) / "sfexp.png");
+        if (g_gl_active)
+            gl_renderer_set_interpolation(g_frame_interpolation, g_host_refresh_hz,
+                                          (double)g_frame_interpolation_fps);
+    }
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
@@ -4331,6 +4432,9 @@ int main(int argc, char** argv) {
 
     shutdown_runtime();
     if (g_gl_active) gl_renderer_shutdown();
+    if (g_vk_active) vk_renderer_shutdown();
+    SDL_DestroyTexture(g_bezel_texture);
+    g_bezel_texture = nullptr;
     SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
     SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
     SDL_DestroyWindow(sdl_window);

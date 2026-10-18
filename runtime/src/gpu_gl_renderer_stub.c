@@ -32,6 +32,11 @@ int gl_renderer_init_context(struct SDL_Window *win)
 }
 
 void gl_renderer_set_swap_interval(int interval) { (void)interval; }
+int gl_renderer_set_bezel(const unsigned char *rgba, int w, int h)
+{
+    (void)rgba; (void)w; (void)h;
+    return 0;
+}
 void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz)
 {
     (void)enabled;

@@ -666,6 +666,7 @@ struct UserSettings {
     // display latency, may tear), -1=adaptive.
     bool has_low_latency_input = false; bool low_latency_input = true;
     bool has_show_fps          = false; bool show_fps          = true;
+    bool has_show_bezel        = false; bool show_bezel        = false;
     bool has_vsync             = false; int  vsync             = 1;
     bool has_frame_interpolation = false; bool frame_interpolation = false;
     bool has_frame_interpolation_fps = false; int frame_interpolation_fps = 0;

@@ -513,13 +513,15 @@ function(psxrecomp_add_runtime_target target)
         target_compile_definitions(${target} PRIVATE PSX_COSIM=1 PSX_NO_DEBUG_TOOLS=1)
     endif()
 
+    # PNG decoder shared by the game bezel and the launcher.
+    target_sources(${target} PRIVATE ${PSXRECOMP_ROOT}/runtime/launcher/stb_image_impl.cpp)
+
     # Integrated RmlUi launcher (not in the oracle build — that's headless).
     if(PSX_LAUNCHER AND NOT PSXRT_ORACLE)
         psxrecomp_ensure_launcher_libs()
         target_sources(${target} PRIVATE
             ${PSXRECOMP_ROOT}/runtime/launcher/launcher.cpp
             ${PSXRECOMP_ROOT}/runtime/launcher/disc_extractor.cpp
-            ${PSXRECOMP_ROOT}/runtime/launcher/stb_image_impl.cpp
             ${PSXRECOMP_ROOT}/lib/RmlUi/Backends/RmlUi_Platform_SDL.cpp
             ${PSXRECOMP_ROOT}/lib/RmlUi/Backends/RmlUi_Renderer_GL3.cpp
         )
