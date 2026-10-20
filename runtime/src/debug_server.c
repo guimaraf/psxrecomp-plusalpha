@@ -27,6 +27,7 @@
 #include "psx_bss.h"
 #include "nd_intro_ot.h"
 #include "latency_ring.h"
+#include "input_response_probe.h"
 #include "overlay_loader.h"
 #include "overlay_capture.h"
 #include "code_provider.h"
@@ -11472,6 +11473,10 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     /* Render passes are rolled back; keep them out of the live timeline's
      * fingerprints and write traces (docs/RENDER_PASSES.md). */
     if (g_psx_render_pass_active) return;
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (g_input_response_active)
+        input_response_write(phys, old_val, new_val, width, g_debug_last_store_pc);
+#endif
     if (s_fmv_quiet) {
         if (psx_fp_write_eligible(phys, psx_ram_live_bytes())) psx_fp_note_quiet(&s_fp);
         return;
@@ -15918,7 +15923,59 @@ static void handle_warm_cd_route(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}\n", id, body);
 }
 
+#ifndef PSX_NO_DEBUG_TOOLS
+static uint32_t response_u32(const char *json, const char *key, uint32_t fallback) {
+    char value[32];
+    if (json_get_str(json, key, value, sizeof(value))) return hex_to_u32(value);
+    return (uint32_t)json_get_int(json, key, (int)fallback);
+}
+static void handle_input_response_status(int id, const char *json) {
+    (void)json;
+    char body[2048]; input_response_status(body, sizeof(body));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+static void handle_input_response_arm(int id, const char *json) {
+    InputResponseConfig c; memset(&c, 0, sizeof(c));
+    c.discovery = json_get_int(json, "discovery", 1) != 0;
+    c.port = json_get_int(json, "port", 0);
+    c.warmup_ms = response_u32(json, "warmup_ms", 5000);
+    c.capture_ms = response_u32(json, "capture_ms", 5000);
+    c.button_mask = response_u32(json, "button_mask", 0);
+    c.lo = response_u32(json, "lo", 0) & 0x1FFFFFFFu;
+    c.hi = response_u32(json, "hi", psx_ram_live_bytes()) & 0x1FFFFFFFu;
+    c.state_addr = response_u32(json, "state_addr", 0) & 0x1FFFFFFFu;
+    c.state_width = response_u32(json, "state_width", 0);
+    c.idle_value = response_u32(json, "idle_value", 0);
+    c.attack_value = response_u32(json, "attack_value", 0);
+    c.state_pc = response_u32(json, "state_pc", 0);
+    c.input_addr = response_u32(json, "input_addr", 0) & 0x1FFFFFFFu;
+    c.input_width = response_u32(json, "input_width", 0);
+    c.input_mask = response_u32(json, "input_mask", 0);
+    c.input_value = response_u32(json, "input_value", 0);
+    c.input_pc = response_u32(json, "input_pc", 0);
+    if (!input_response_arm(&c)) {
+        send_err(id, "response probe refused: offline only, valid config required, or capture already active");
+        return;
+    }
+    handle_input_response_status(id, json);
+}
+static void handle_input_response_stop(int id, const char *json) {
+    input_response_stop(); handle_input_response_status(id, json);
+}
+static void handle_input_response_dump(int id, const char *json) {
+    char body[32768];
+    input_response_page(body, sizeof(body), (unsigned)json_get_int(json, "cursor", 0),
+                         json_get_int(json, "events", 0));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+#endif
 static const CmdEntry s_commands[] = {
+#ifndef PSX_NO_DEBUG_TOOLS
+    { "input_response_arm", handle_input_response_arm },
+    { "input_response_status", handle_input_response_status },
+    { "input_response_stop", handle_input_response_stop },
+    { "input_response_dump", handle_input_response_dump },
+#endif
     { "phase_profile",     handle_phase_profile },
     { "starv_ring",        handle_starv_ring },
     { "data_shards",       handle_data_shards },
@@ -17017,6 +17074,9 @@ void debug_server_poll(void)
 
 void debug_server_record_frame(void)
 {
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (g_input_response_active) input_response_frame();
+#endif
     if (s_fmv_quiet) {
         s_history_count = s_frame_count + 1;
         s_frame_count++;

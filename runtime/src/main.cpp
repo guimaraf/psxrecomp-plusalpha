@@ -138,6 +138,14 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
 #include "psx_keybinds.h"
 #include "host_overlay.h"
+#include "host_nameplates.h"
+#if defined(__has_include)
+#if __has_include("recomp_ui_psx_nameplates.h")
+#include "recomp_ui_psx_nameplates.h"
+#define PSX_HAS_UI_NAMEPLATES 1
+extern "C" void gl_renderer_nameplate_game_rect(int w, int h, int rect[4]);
+#endif
+#endif
 #include "psx_menu_host.h"     /* optional in-game menu hooks (P1 pause, ...) */    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #include "psx_window_icon.h"
 
@@ -1567,6 +1575,7 @@ static int           g_frame_generation_pref = 0;
 static int           g_present_thread_slots = 3;
 static int           s_render_thread_tried = 0;
 static int           g_video_vsync        = 1;
+static bool          g_player_nameplates_enabled = true;
 static int           g_frame_interpolation = 0;
 static int           g_frame_interpolation_fps = 0;
 /* Graphics presets (docs/QUALITY_PRESETS.md): the decision for this run,
@@ -3965,6 +3974,7 @@ static void log_present_cadence(void) {
 static void netplay_host_present_uncap(void) {
     g_netplay_vsync_forced_off = 1;
     apply_present_cadence();
+    std::printf("psxrecomp: netplay presentation: VSync OFF (swap interval 0)\n");
 }
 
 static void netplay_host_present_restore(void) {
@@ -16918,8 +16928,20 @@ PsxMenuHost g_menu_host = {
     0,
 };
 
+bool g_nameplates_on = false;
 int ovl_sink(const void* ev, void*) { return g_ovl && g_ovl->event ? g_ovl->event(g_ovl->ctx, ev) : 0; }
-void ovl_draw(int w, int h, void*) { if (g_ovl && g_ovl->draw) g_ovl->draw(g_ovl->ctx, w, h); }
+void ovl_draw(int w, int h, void*) {
+#ifdef PSX_HAS_UI_NAMEPLATES
+    if (g_nameplates_on && g_psx_nameplate_provider && g_psx_nameplate_provider->snapshot) {
+        PsxHostNameplates labels{};
+        int rect[4];
+        g_psx_nameplate_provider->snapshot(&labels);
+        gl_renderer_nameplate_game_rect(w, h, rect);
+        recomp_ui_psx_nameplates_draw(&labels, w, h, rect);
+    }
+#endif
+    if (g_ovl && g_ovl->draw) g_ovl->draw(g_ovl->ctx, w, h);
+}
 }  // namespace
 
 /* Main thread, once per GL context (windowed OpenGL only). */
@@ -16931,6 +16953,18 @@ void ovl_draw(int w, int h, void*) { if (g_ovl && g_ovl->draw) g_ovl->draw(g_ovl
 #endif
 
 static void recomp_overlay_setup(const char* argv0, const std::string& title) {
+#ifdef PSX_HAS_UI_NAMEPLATES
+    if (g_gl_active && !g_headless && !g_nameplates_on && g_psx_nameplate_provider) {
+        const auto dir = exe_dir_from_argv(argv0);
+        if (g_psx_nameplate_provider->configure(g_player_nameplates_enabled ? 1 : 0)) {
+            g_nameplates_on = recomp_ui_psx_nameplates_init((dir / "assets").string().c_str()) != 0;
+            if (g_nameplates_on) psx_host_overlay_set_draw_cb(ovl_draw, nullptr);
+            else std::fprintf(stderr, "psxrecomp: player nameplates: OpenGL UI initialization failed\n");
+        } else {
+            std::fprintf(stdout, "psxrecomp: player nameplates disabled in settings\n");
+        }
+    }
+#endif
 #if defined(RECOMP_LAUNCHER) && defined(RECOMP_LAUNCHER_HAS_QUALITY_PRESETS)
     /* Main thread: the preset strings and detection the menu publishes, and
      * the display the preset rows are seeded for. Fixed before any provider
@@ -16997,18 +17031,49 @@ extern "C" int psx_debug_menu_host_json(char* out, size_t cap) {
  * draw hook is removed first (it waits for an in-flight draw), then the
  * provider frees its GL objects. setup attaches again on the next context. */
 static void recomp_overlay_detach(void) {
-    if (!g_ovl_on) return;
+    if (!g_ovl_on && !g_nameplates_on) return;
     psx_host_overlay_set_draw_cb(nullptr, nullptr);
     psx_host_set_input_sink(nullptr, nullptr);
     psx_host_set_ui_capture(0);
     if (g_ovl_pause_held) { psx_host_pause_pop(); g_ovl_pause_held = false; }
     g_ovl_pause_wanted = 0;
-    if (g_ovl->detach) g_ovl->detach(g_ovl->ctx);
+    if (g_ovl && g_ovl->detach) g_ovl->detach(g_ovl->ctx);
+#ifdef PSX_HAS_UI_NAMEPLATES
+    recomp_ui_psx_nameplates_release();
+#endif
+    g_nameplates_on = false;
     g_ovl = nullptr;
     g_ovl_on = false;
 }
 
+/* Copy session identity once, outside the render/present path. Never use the
+ * local player's name as a substitute for slot zero on both peers. */
+static void nameplates_set_session_names(void) {
+    if (!g_nameplates_on || !g_psx_nameplate_provider ||
+        !g_psx_nameplate_provider->set_names) return;
+    std::string names[2];
+#if defined(RECOMP_LAUNCHER) && defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
+    if (ae_np_use_lan_members()) {
+        AeLanLobbyState state;
+        if (ae_np_read_lan_state(&state)) {
+            for (int slot = 0; slot < 2 && slot < state.max_slots; ++slot)
+                names[slot] = state.slot_name[slot];
+        }
+    } else {
+        for (int i = 0, count = psx_lobby_member_count(); i < count; ++i) {
+            PsxLobbyMember member{};
+            if (psx_lobby_member_get(i, &member) && !member.is_spectator &&
+                member.slot >= 0 && member.slot < 2)
+                names[member.slot] = member.display_name;
+        }
+    }
+#endif
+    g_psx_nameplate_provider->set_names(names[0].c_str(), names[1].c_str());
+}
+
 static void host_pause_service(void) {
+    if (g_nameplates_on && g_psx_nameplate_provider && g_psx_nameplate_provider->tick)
+        g_psx_nameplate_provider->tick(s_frame_count);
     if (!g_ovl_on) return;
     mh_refresh_snapshot();
     psx_host_set_ui_capture(ovl_open());
@@ -18319,6 +18384,7 @@ int main(int argc, char** argv) {
         if (us.has_present_thread)    g_present_thread    = us.present_thread ? 1 : 0;
         if (us.has_frame_generation)  g_frame_generation  = us.frame_generation ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
+        if (us.has_player_nameplates) g_player_nameplates_enabled = us.player_nameplates;
         if (us.has_frame_interpolation)
             g_frame_interpolation = us.frame_interpolation ? 1 : 0;
         if (us.has_frame_interpolation_fps)
@@ -18848,6 +18914,8 @@ int main(int argc, char** argv) {
             seed.hotkey_pad_fast_forward_toggle = g_hotkey_pad_fast_forward_toggle;
             seed.has_hotkey_pad_fast_forward_toggle = true;
             seed.skip_launcher = skip_launcher_setting;   seed.has_skip_launcher = true;
+            seed.player_nameplates = g_player_nameplates_enabled;
+            seed.has_player_nameplates = g_psx_nameplate_provider != nullptr;
             if (has_netplay_player_name) {
                 seed.netplay_player_name = netplay_player_name;
                 seed.has_netplay_player_name = true;
@@ -18992,6 +19060,10 @@ int main(int argc, char** argv) {
             ls.msu1_dir[0]    = '\0';
             std::snprintf(ls.netplay_player_name, sizeof(ls.netplay_player_name), "%s",
                           has_netplay_player_name ? netplay_player_name.c_str() : "");
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_NAMEPLATES)
+            ls.player_nameplates = g_psx_nameplate_provider
+                ? (g_player_nameplates_enabled ? 1 : -1) : 0;
+#endif
             /* aspect_index: 0 = 4:3, 1 = 16:9, 2 = 21:9 (see RecompLauncherCSettings). */
             ls.aspect_index   = (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
                                  (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
@@ -19291,6 +19363,13 @@ int main(int argc, char** argv) {
             if (lr == 0 || lr == 1) {
                 seed.netplay_player_name = ls.netplay_player_name;
                 seed.has_netplay_player_name = true;
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_NAMEPLATES)
+                if (ls.player_nameplates != 0) {
+                    g_player_nameplates_enabled = ls.player_nameplates > 0;
+                    seed.player_nameplates = g_player_nameplates_enabled;
+                    seed.has_player_nameplates = true;
+                }
+#endif
                 if (lr == 0 && rui_out_disc[0]) {
                     seed.disc_path = rui_out_disc;
                     seed.has_disc_path = true;
@@ -21049,6 +21128,10 @@ session_reboot:
             netplay_soft_exit("netplay_start_failed");
             g_netplay_exit_reason_text = why;
         } else {
+            /* Apply before tick-0 admission, for host and client alike. The
+             * persisted offline preference remains available after leaving. */
+            netplay_host_present_uncap();
+            nameplates_set_session_names();
             apply_netplay_local_viewport_aspect(net_cfg.enabled);
             std::printf("psxrecomp: netplay transport=%s slot=%d input_player=%d delay=%d "
                         "force_turn=%d bind=%s peer=%s session=%u\n",
@@ -21384,7 +21467,6 @@ session_reboot:
         netplay_barrier_admit(-1);
         if (psx_return_to_lobby_requested())
             goto soft_return_lobby;
-        netplay_host_present_uncap();
         /* Idle-skip advances guest cycles without CD/device aging in lockstep —
          * force off so both peers share the same CD FSM (dig_c folds CD). */
         {
@@ -21622,6 +21704,10 @@ soft_return_lobby:
         }
         std::snprintf(ls.netplay_player_name, sizeof(ls.netplay_player_name), "%s",
                       psx_lobby_display_name());
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_NAMEPLATES)
+        ls.player_nameplates = g_psx_nameplate_provider
+            ? (g_player_nameplates_enabled ? 1 : -1) : 0;
+#endif
         /* Soft-return shows the durable preference (bios.cfg), not the match
          * session BIOS that may have temporarily overridden boot. */
         {
@@ -21762,6 +21848,19 @@ soft_return_lobby:
         const int rui_rc = recomp_launcher_run_window(
             rui_title.c_str(), &ls, &gi, assets_dir_str.c_str(),
             rui_initial_disc.c_str(), rui_out_disc, sizeof(rui_out_disc));
+
+#if defined(RECOMP_LAUNCHER_HAS_PLAYER_NAMEPLATES)
+        if ((rui_rc == 0 || rui_rc == 1) && ls.player_nameplates != 0) {
+            g_player_nameplates_enabled = ls.player_nameplates > 0;
+            const auto path = exe_dir_from_argv(argv[0]) / "settings.toml";
+            auto us = PSXRecompV4::load_user_settings(path);
+            if (!us.parse_error) {
+                us.player_nameplates = g_player_nameplates_enabled;
+                us.has_player_nameplates = true;
+                (void)PSXRecompV4::save_user_settings(path, us);
+            }
+        }
+#endif
 
         if (rui_rc == 1) {
             /* User closed the launcher — leave the lobby and exit. */

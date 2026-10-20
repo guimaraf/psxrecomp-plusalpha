@@ -16,6 +16,7 @@
 #include "psx_bss.h"
 #include "memcard.h"
 #include "debug_server.h"
+#include "input_response_probe.h"
 #include "event_ring.h"
 #include <stdlib.h>
 #include <string.h>
@@ -1105,10 +1106,18 @@ void sio_get_pad_rumble(int slot, uint8_t *small, uint8_t *large) {
 
 void sio_set_pad_state(uint16_t buttons) {
     pad_buttons[0] = buttons;
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (g_input_response_active) input_response_pad(0, buttons);
+#endif
 }
 
 void sio_set_pad_state_slot(int slot, uint16_t buttons) {
-    if (slot >= 0 && slot < PSX_MAX_PLAYERS) pad_buttons[slot] = buttons;
+    if (slot >= 0 && slot < PSX_MAX_PLAYERS) {
+        pad_buttons[slot] = buttons;
+#ifndef PSX_NO_DEBUG_TOOLS
+        if (g_input_response_active) input_response_pad(slot, buttons);
+#endif
+    }
 }
 
 /* Entering or leaving NeGcon swaps the controller on the port; it is not the

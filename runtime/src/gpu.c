@@ -11,6 +11,7 @@
  */
 
 #include "gpu.h"
+#include "host_nameplates.h"
 #include "gpu_gl_renderer.h"
 #include "mod_texture_banks.h"
 #include "display_scanout.h"
@@ -7200,6 +7201,9 @@ static void gp0_execute_command(void) {
         ws_note_backdrop(opcode);   /* ...and its finite-backdrop veto */
     }
 
+    /* Optional title-owned presentation observer; never changes guest commands. */
+    if (g_psx_nameplate_provider && g_psx_nameplate_provider->observe_gp0)
+        g_psx_nameplate_provider->observe_gp0(gp0_cmd_buf, (unsigned)gp0_words_needed);
     /* Categorize for diagnostics */
     if (opcode <= 0x01) gp0_nop_count++;
     else if (opcode == 0x02) gp0_fill_count++;

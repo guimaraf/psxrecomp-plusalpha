@@ -3076,6 +3076,10 @@ UserSettings load_user_settings(const fs::path& path) {
             s.frame_generation = toml::find<bool>(v, "frame_generation");
             s.has_frame_generation = true;
         });
+        if (v.contains("player_nameplates")) try_get([&]{
+            s.player_nameplates = toml::find<bool>(v, "player_nameplates");
+            s.has_player_nameplates = true;
+        });
         if (v.contains("vsync")) try_get([&]{
             const auto m = toml::find<std::string>(v, "vsync");
             if      (m == "on"  || m == "vsync")    { s.vsync = 1;  s.has_vsync = true; }
@@ -3464,6 +3468,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     if (s.has_vsync)
         f << "vsync             = \"" << (s.vsync == 0 ? "immediate" : s.vsync < 0 ? "adaptive"
                                          : s.vsync == 2 ? "vrr" : "on") << "\"\n";
+    if (s.has_player_nameplates)
+        f << "player_nameplates = " << (s.player_nameplates ? "true" : "false") << "\n";
     if (s.has_frame_interpolation)
         f << "frame_interpolation = " << (s.frame_interpolation ? "true" : "false") << "\n";
     if (s.has_frame_interpolation_fps)

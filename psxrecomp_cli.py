@@ -862,6 +862,33 @@ def regen_bios_profile(
     if not profile.is_file():
         raise FileNotFoundError(f"BIOS profile not found: {profile}")
     bios_tool = find_psxrecomp_bios(project_root)
+    # Use the same fingerprint implementation as runtime.cmake. The CLI calls
+    # the emitter directly (not regen_bios.sh), so it must own the stamp too.
+    cmake = _cmake_for_build_dir(bios_tool.parent)
+    fingerprint_script = fw / "tools" / "bios_emitter_fingerprint.cmake"
+
+    def fingerprint() -> str:
+        result = subprocess.run(
+            [str(cmake), f"-DROOT={fw.as_posix()}",
+             f"-DPROFILE={profile.as_posix()}", "-P", str(fingerprint_script)],
+            cwd=str(fw), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        digest = result.stdout.strip()
+        if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError(f"BIOS fingerprint failed for {profile_rel}: {result.stderr}")
+        return digest
+
+    generation_fingerprint = fingerprint()
+    output = load_sections(profile).get("recompiler", {})
+    stem = str(output.get("out_stem", "")).strip()
+    if not stem or Path(stem).name != stem or "/" in stem or "\\" in stem:
+        raise ValueError(f"Invalid BIOS out_stem in {profile_rel}")
+    out_dir = fw / str(output.get("out_dir", "generated"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = out_dir / f"{stem}.emitter.sha"
+    # A partial/failed regeneration must not retain an earlier valid stamp.
+    stamp.unlink(missing_ok=True)
     progress.log(f"regen BIOS via {bios_tool.name} --config {profile_rel}")
     (fw / "generated").mkdir(parents=True, exist_ok=True)
     # Pass a framework-relative config path and cwd=fw so toml paths like
@@ -882,6 +909,21 @@ def regen_bios_profile(
         raise RuntimeError(
             f"psxrecomp-bios failed for {profile_rel} (exit {proc.returncode})"
         )
+    if not all((out_dir / f"{stem}_{part}.c").is_file()
+               for part in ("dispatch", "full")):
+        raise RuntimeError(f"BIOS generation did not produce the backend for {stem}")
+    if fingerprint() != generation_fingerprint:
+        raise RuntimeError("BIOS emitter inputs changed during generation; regenerate again")
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="ascii", dir=out_dir, suffix=".emitter.tmp", delete=False,
+    ) as temp:
+        temp.write(generation_fingerprint + "\n")
+        temp_path = Path(temp.name)
+    try:
+        temp_path.replace(stamp)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    progress.log(f"Wrote BIOS fingerprint: {stamp}")
 
 
 def load_sections(config: Path) -> dict[str, dict[str, Any]]:

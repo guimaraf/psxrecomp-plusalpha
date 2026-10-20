@@ -5860,6 +5860,12 @@ static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
     letterbox_rect_aspect(ww, wh, s_aspect_num, s_aspect_den, x, y, w, h);
 }
 
+/* GL-thread-only: same fit as the game image, expressed top-left for host UI. */
+void gl_renderer_nameplate_game_rect(int ww, int wh, int rect[4]) {
+    letterbox_rect(ww, wh, &rect[0], &rect[1], &rect[2], &rect[3]);
+    rect[1] = wh - rect[1] - rect[3];
+}
+
 static GLuint make_tex(GLenum internal, int w, int h, GLenum fmt, GLenum type) {
     GLuint t = 0;
     glGenTextures(1, &t);

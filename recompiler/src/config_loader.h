@@ -1594,6 +1594,7 @@ struct UserSettings {
     bool has_present_thread   = false; bool present_thread   = false;
     bool has_frame_generation = false; bool frame_generation = false;
     bool has_vsync             = false; int  vsync             = 1;
+    bool has_player_nameplates = false; bool player_nameplates = true;
     bool has_frame_interpolation = false; bool frame_interpolation = false;
     bool has_frame_interpolation_fps = false; int frame_interpolation_fps = 0;
     // [video] quality_* (docs/QUALITY_PRESETS.md): the graphics preset in

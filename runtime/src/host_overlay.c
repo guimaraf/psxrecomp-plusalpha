@@ -1,9 +1,14 @@
 /* host_overlay.c -- see host_overlay.h. */
 #include "host_overlay.h"
+#include "host_nameplates.h"
 
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdlib.h>
+const PsxHostNameplateProvider *g_psx_nameplate_provider = NULL;
+void psx_host_nameplates_register(const PsxHostNameplateProvider *provider) {
+    g_psx_nameplate_provider = provider;
+}
 #if defined(_WIN32)
 #include <windows.h>
 #else
