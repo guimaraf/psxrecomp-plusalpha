@@ -184,6 +184,8 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <cerrno>
 #include <mutex>
 #include <thread>
+#include <future>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -10960,10 +10962,54 @@ namespace {
          * serial is -- see netplay_expect_for_disc(). */
         const PSXRecompV4::NetplayDiscExpect np_expect =
             netplay_expect_for_disc(std::filesystem::path(disc_path));
-        PSXRecompV4::DiscIdentity id = PSXRecompV4::identify_disc(
-            disc_path, expect_serial, g_lnch_expected_crc,
-            g_lnch_has_crc, /*compute_crc*/ g_lnch_has_crc,
-            g_lnch_netplay_available ? &np_expect : nullptr);
+        /* The full-image CRC must not block model initialization / first draw.
+         * The worker owns only copied inputs; lobby/UI state is published here
+         * on the main thread once the result is ready. Return 2 while pending. */
+        static std::future<PSXRecompV4::DiscIdentity> verify_job;
+        static std::string verify_key;
+        static PSXRecompV4::DiscIdentity verify_result;
+        static bool verify_ready = false;
+        const auto resolved_verify = PSXRecompV4::resolve_disc_path(disc_path);
+        std::string key = std::string(disc_path) + "|" + expect_serial + "|" +
+                          std::to_string(g_lnch_expected_crc) + "|" +
+                          std::to_string(g_lnch_has_crc);
+        for (const auto& file : {resolved_verify.data, resolved_verify.mount}) {
+            std::error_code ec;
+            const auto size = std::filesystem::file_size(file, ec);
+            key += "|" + file.string() + ":" + (ec ? "missing" : std::to_string(size));
+            ec.clear();
+            const auto stamp = std::filesystem::last_write_time(file, ec);
+            key += ":" + (ec ? std::string("missing") :
+                          std::to_string(stamp.time_since_epoch().count()));
+        }
+        if (verify_job.valid()) {
+            if (verify_job.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                return 2;
+            try { verify_result = verify_job.get(); }
+            catch (...) { verify_result = PSXRecompV4::DiscIdentity{}; }
+            verify_ready = true;
+        }
+        if (!verify_ready || verify_key != key) {
+            verify_key = key;
+            verify_ready = false;
+            const std::string path_copy = disc_path;
+            const uint32_t crc = g_lnch_expected_crc;
+            const bool has_crc = g_lnch_has_crc;
+            try {
+                verify_job = std::async(std::launch::async,
+                    [path_copy, expect_serial, crc, has_crc]() {
+                        return PSXRecompV4::identify_disc(path_copy, expect_serial,
+                            crc, has_crc, /*compute_crc*/has_crc, nullptr);
+                    });
+            } catch (...) {
+                out->verdict = 3;
+                return 1;
+            }
+            return 2;
+        }
+        PSXRecompV4::DiscIdentity id = verify_result;
+        if (g_lnch_netplay_available)
+            PSXRecompV4::apply_netplay_disc_expect(id, np_expect);
         const std::string& serial = !id.detected_serial.empty()
             ? id.detected_serial : expect_serial;
         std::snprintf(out->serial, sizeof(out->serial), "%s", serial.c_str());
@@ -14136,6 +14182,9 @@ namespace {
                     ae_np_lan_udp_sendto(from, "MOTK1 ERR\nbad_password\n");
                     continue;
                 }
+                /* JOIN is also the guest's periodic lobby refresh. Treat an
+                 * already seated identity idempotently, including after PLAY. */
+                const bool new_guest = ae_np_lan_find_slot_by_id(st, player_id) < 0;
                 const int slot = ae_np_lan_seat_guest(st, player_id, name);
                 if (slot < 0) {
                     ae_np_lan_udp_sendto(from, "MOTK1 ERR\nfull\n");
@@ -14157,12 +14206,13 @@ namespace {
                 }
                 if (slot >= 0 && slot < kAeLanMaxSlots)
                     g_lnch_lan_slot_memcard[slot] = mc_offer;
-                st.started = false;
+                if (new_guest) st.started = false;
                 ae_np_lan_sync_legacy_names(st);
                 if (!ae_np_write_lan_state(st)) continue;
                 ae_np_lan_set_peer_slot(slot, from);
                 ae_np_lan_send_update_to_peers(st);
-                ae_np_lan_chat_announce(st.slot_name[slot].c_str(), "has joined.");
+                if (new_guest)
+                    ae_np_lan_chat_announce(st.slot_name[slot].c_str(), "has joined.");
                 continue;
             }
 
@@ -14188,6 +14238,7 @@ namespace {
                 std::snprintf(synth_id, sizeof(synth_id), "motk1-%08x-%04x",
                               (unsigned)ntohl(from.sin_addr.s_addr),
                               (unsigned)ntohs(from.sin_port));
+                const bool new_guest = ae_np_lan_find_slot_by_id(st, synth_id) < 0;
                 const int slot = ae_np_lan_seat_guest(st, synth_id, name);
                 if (slot < 0) {
                     ae_np_lan_udp_sendto(from, "MOTK1 ERR\nfull\n");
@@ -14195,12 +14246,13 @@ namespace {
                 }
                 /* Legacy MOTK1 JOIN has no bios_offer. */
                 ae_np_lan_clear_slot_bios(slot);
-                st.started = false;
+                if (new_guest) st.started = false;
                 ae_np_lan_sync_legacy_names(st);
                 if (!ae_np_write_lan_state(st)) continue;
                 ae_np_lan_set_peer_slot(slot, from);
                 ae_np_lan_send_update_to_peers(st);
-                ae_np_lan_chat_announce(st.slot_name[slot].c_str(), "has joined.");
+                if (new_guest)
+                    ae_np_lan_chat_announce(st.slot_name[slot].c_str(), "has joined.");
                 continue;
             }
 
@@ -19888,6 +19940,8 @@ int main(int argc, char** argv) {
     std::string disc_path_str = session_disc_path(resolved_disc);
 
 session_reboot:
+    /* Keep the detector disarmed until guest execution actually resumes. */
+    freeze_heartbeat_set_paused(1);
     /* Rematch after lobby soft-return re-enters here with updated net_cfg. */
     static int s_emu_session = 0;
     const bool rematch_session = (++s_emu_session > 1);
@@ -21370,6 +21424,7 @@ session_reboot:
      * Go back to the room; do not boot the game offline. */
     if (psx_return_to_lobby_requested() && g_netplay_from_lobby)
         goto soft_return_lobby;
+    freeze_heartbeat_set_paused(0);
     psx_scheduler_run(&cpu);
     if (psx_return_to_lobby_requested() && g_netplay_from_lobby)
         goto soft_return_lobby;
@@ -21447,6 +21502,8 @@ session_reboot:
     return 0;
 
 soft_return_lobby:
+    /* The lobby intentionally stops guest frames; this is not a freeze. */
+    freeze_heartbeat_set_paused(1);
 #if defined(PSX_GAME_TIME)
     psx_game_time::stop();
     g_play_time_credits = "Tempo de jogo: " + psx_game_time::display(game_time_path, game_id);

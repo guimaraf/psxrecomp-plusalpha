@@ -17,6 +17,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <dbghelp.h>
+#else
+#include <unistd.h>
 #endif
 
 /* State accessors. All defined in other compilation units; declared here
@@ -86,7 +88,15 @@ static DWORD  s_main_thread_id = 0;
 static int    s_sym_initialized = 0;
 #endif
 
-#define HB_FILE        "psx_freeze_heartbeat.json"
+static char s_hb_file[96] = "psx_freeze_heartbeat.json";
+
+static unsigned long heartbeat_process_id(void) {
+#ifdef _WIN32
+    return (unsigned long)GetCurrentProcessId();
+#else
+    return (unsigned long)getpid();
+#endif
+}
 #define HB_INTERVAL_MS 100u
 
 /* Wedge detection.
@@ -527,13 +537,18 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
 #endif
 
     char path[128];
+    char process_backend[80];
+    snprintf(process_backend, sizeof(process_backend), "%s_%lu", s_backend,
+             heartbeat_process_id());
     uint32_t sequence = s_dump_sequence++;
-    if (!freeze_dump_format_path(path, sizeof(path), s_backend, wall, sequence)) {
+    if (!freeze_dump_format_path(path, sizeof(path), process_backend, wall, sequence)) {
         freeze_dump_unlock();
         return 0;
     }
 
-    FILE *f = fopen(path, "wb");
+    char partial_path[144];
+    snprintf(partial_path, sizeof(partial_path), "%s.partial", path);
+    FILE *f = fopen(partial_path, "wb");
     if (!f) { freeze_dump_unlock(); return 0; }
 
     /* Large stdio buffer so multi-MB JSON arrays write efficiently. */
@@ -708,7 +723,8 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     fputs("}\n", f);
     int written = !ferror(f);
     if (fclose(f) != 0) written = 0;
-    if (!written) (void)remove(path);
+    if (written && rename(partial_path, path) != 0) written = 0;
+    if (!written) (void)remove(partial_path);
     freeze_dump_unlock();
     return written;
 }
@@ -1097,8 +1113,8 @@ static void heartbeat_write(void) {
     /* Atomic overwrite via .tmp + rename. Avoids a reader catching a
      * mid-write file and parsing partial JSON. Cheap on Windows
      * (MoveFileEx with REPLACE_EXISTING). */
-    char tmp_path[64];
-    snprintf(tmp_path, sizeof(tmp_path), HB_FILE ".tmp");
+    char tmp_path[112];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", s_hb_file);
 
     FILE *f = fopen(tmp_path, "wb");
     if (!f) return;
@@ -1106,10 +1122,10 @@ static void heartbeat_write(void) {
     fclose(f);
 
 #ifdef _WIN32
-    MoveFileExA(tmp_path, HB_FILE,
+    MoveFileExA(tmp_path, s_hb_file,
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 #else
-    rename(tmp_path, HB_FILE);
+    rename(tmp_path, s_hb_file);
 #endif
 }
 
@@ -1131,6 +1147,8 @@ void freeze_heartbeat_start(const char *backend_label) {
      * one extra thread — small enough to keep in production builds for
      * crash forensics. */
     if (s_started) return;
+    snprintf(s_hb_file, sizeof(s_hb_file), "psx_freeze_heartbeat_%lu.json",
+             heartbeat_process_id());
     if (backend_label && backend_label[0]) {
         size_t n = strlen(backend_label);
         if (n >= sizeof(s_backend)) n = sizeof(s_backend) - 1;

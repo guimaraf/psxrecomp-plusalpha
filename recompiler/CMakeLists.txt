@@ -984,6 +984,13 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/../tools/tests/test_cli_generate_aot_static.py
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        # Nested title layouts resolve their sibling framework without seeding
+        # a second partial SDK inside the game project.
+        add_test(
+            NAME cli_framework_layout
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/tests/test_cli_framework_layout.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
         # psxrecomp_cli.py rebuild: the pre-build mtime clamp works without
         # lutimes (Windows), --cmake-extra wins over the shipping
         # PSX_DEBUG_TOOLS=OFF default, and the build runs the configuring cmake.

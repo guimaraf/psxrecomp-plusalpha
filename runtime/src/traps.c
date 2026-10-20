@@ -572,14 +572,19 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
 
     HostThreadFiber* current = psx_bind_current_host_thread(cpu, current_tcb);
     int saved_current_context = 0;
-    if (psx_tcb_state(cpu, current_tcb) == 0x4000u) {
-        psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
+    uint32_t current_state = psx_tcb_state(cpu, current_tcb);
+    /* SYS(03) commits the outgoing context even after CloseTh marks this
+     * slot free. OpenTh preserves its saved SR when reusing the slot; skipping
+     * this save can restart the new thread with stale interrupt-enable bits.
+     * Only a runnable thread may resume this host stack after the switch. */
+    psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
+    if (current_state == 0x4000u) {
         saved_current_context = 1;
     } else {
         /* 0x1000 is the BIOS closed/free state and must retire the host fiber.
          * Other non-runnable states can still have a suspended generated C
          * stack that must be resumed later. */
-        if (psx_tcb_state(cpu, current_tcb) == 0x1000u) {
+        if (current_state == 0x1000u) {
             current->closed = 1;
         }
         debug_server_log_thread_event(6, cpu, current_tcb, target_tcb, 0);
@@ -679,13 +684,11 @@ static int psx_request_thread_switch(CPUState* cpu, uint32_t target_tcb)
         extern int overlay_loader_shadow_native_thread_switch_bail(void);
         if (overlay_loader_shadow_native_thread_switch_bail()) return -1;
     }
-    /* Commit the yielding thread's context so it can be re-dispatched later.
-     * resume PC = its return address (resume right after the ChangeThread call).
-     * Only a still-running (0x4000) thread keeps a live context; a closed/free
-     * (0x1000) thread is being torn down and must not be saved. */
-    if (psx_tcb_state(cpu, current_tcb) == 0x4000u) {
-        psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
-    }
+    /* Commit SYS(03)'s outgoing context even for a closed/free (0x1000)
+     * slot: OpenTh preserves its saved SR when that slot is reused. This is
+     * guest-visible state, not permission to resume the retired host stack.
+     * Resume PC is the return address after the ChangeThread call. */
+    psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
     psx_set_current_tcb(cpu, target_tcb);
     g_sched_return_tcb        = current_tcb; /* one-level switch-back safety net */
     g_sched_escape.target_tcb = target_tcb;
