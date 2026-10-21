@@ -1,3 +1,4 @@
+#include "input_response_probe.h"
 /* gpu.c — PS1 GPU hardware simulation (Phase 3, Step 1).
  *
  * Implements:
@@ -11,6 +12,7 @@
  */
 
 #include "gpu.h"
+#include "interrupts.h"
 #include "host_nameplates.h"
 #include "gpu_gl_renderer.h"
 #include "mod_texture_banks.h"
@@ -4059,9 +4061,47 @@ static uint16_t rgb888_to_rgb555(uint32_t color24) {
  * on idle sealed resim. Guest VBlank raise / LCF stay immediate. */
 static int s_present_pending;
 static int s_flushing_present;
+static gpu_offline_pacer_cb s_offline_pacer_callback;
+static unsigned s_offline_present_depth;
+int g_gpu_offline_pacer_pending;
+
+void gpu_set_offline_pacer_callback(gpu_offline_pacer_cb cb) {
+    s_offline_pacer_callback = cb;
+    g_gpu_offline_pacer_pending = 0;
+}
+
+void gpu_arm_offline_pacer(int mode) {
+    if (s_offline_pacer_callback && s_offline_present_depth == 1 &&
+        !g_gpu_offline_pacer_pending && (mode >= 1 && mode <= 3))
+        g_gpu_offline_pacer_pending = mode;
+}
+
+void gpu_flush_offline_pacer(int boundary) {
+    extern int psx_netplay_active(void);
+    if (!g_gpu_offline_pacer_pending || s_offline_present_depth ||
+        !psx_offline_pacer_can_wait()) return;
+    /* Mode 2 waits only in the last emulated scanline, after ordinary guest
+     * frame work. No CPU/device cycles are skipped or synthesized to get there.
+     * An idle skip may cross this window; boundary 2 drains before the next
+     * frontend callback and next guest pad polling, never after that polling. */
+    if (g_gpu_offline_pacer_pending == 2 && boundary != 2 &&
+        interrupts_cycles_to_vblank() > g_psx_hblank_cycles) return;
+    /* Mode 3 uses a fixed guest phase, independent of pad/animation markers.
+     * First safe checked return at/after one quarter of the live video period.
+     * As in mode 2, a skip past this phase drains at the next VBlank boundary. */
+    if (g_gpu_offline_pacer_pending == 3 && boundary != 2 &&
+        interrupts_cycles_to_vblank() >
+            g_psx_vblank_cycles - g_psx_vblank_cycles / 4u) return;
+    /* Consume before callback: host polling/load can re-enter or unwind. */
+    g_gpu_offline_pacer_pending = 0;
+    if (!psx_netplay_active() && s_offline_pacer_callback)
+        s_offline_pacer_callback(boundary);
+}
 
 void gpu_vblank_clear_deferred_present(void) {
     s_present_pending = 0;
+    g_gpu_offline_pacer_pending = 0;
+    s_offline_present_depth = 0;
     /* longjmp from flush_resume abandons the flush_present stack frame —
      * must drop the reentrancy guard or every later flush no-ops forever. */
     s_flushing_present = 0;
@@ -4204,7 +4244,25 @@ void gpu_vblank_tick(void) {
             if (s_present_pending < 1)
                 s_present_pending = 1;
         } else {
+            if (g_gpu_offline_pacer_pending == 2 ||
+                g_gpu_offline_pacer_pending == 3) {
+                gpu_flush_offline_pacer(2);
+                if (g_gpu_offline_pacer_pending) {
+                    /* A nested/exception-context VBlank cannot host the wait.
+                     * Cancel the old request; this unsupported callback uses
+                     * its original pacer instead of accumulating stale waits. */
+                    INPUT_RESPONSE_TRACE(IR_PACER_CANCEL, 0, 0,
+                        (uint32_t)g_gpu_offline_pacer_pending, 1, 0);
+                    g_gpu_offline_pacer_pending = 0;
+                }
+            }
+            /* The frontend may itself call guest code. Do not drain a pacer
+             * armed inside it until the whole host callback has returned. */
+            s_offline_present_depth++;
+            INPUT_RESPONSE_TRACE(IR_PRESENT_BEGIN, 0, 0, 0, 0, 0);
             vblank_callback();
+            INPUT_RESPONSE_TRACE(IR_PRESENT_END, 0, 0, 0, 0, 0);
+            if (s_offline_present_depth) s_offline_present_depth--;
         }
     }
 }

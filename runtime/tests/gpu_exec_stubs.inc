@@ -222,6 +222,8 @@ void event_ring_record_aux(uint16_t kind, uint8_t detail, uint32_t aux) {
     (void)kind; (void)detail; (void)aux;
 }
 int psx_get_in_exception(void) { return 0; }
+int psx_offline_pacer_can_wait(void) { return 1; }
+uint32_t interrupts_cycles_to_vblank(void) { return PSX_VBLANK_CYCLES_NTSC; }
 int psx_netplay_active(void) { return 0; }
 int sio_hold_present_for_card(void) { return 0; }
 uint32_t psx_compiled_irq_resume_pc(void) { return 0; }

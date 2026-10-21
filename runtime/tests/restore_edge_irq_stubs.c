@@ -80,6 +80,8 @@ uint32_t sio_get_seq(void) { return 0; }
 int  sio_card_protocol_active(void) { return 0; }
 void gpu_vblank_tick(void) {}
 void gpu_vblank_flush_present(void) {}
+int g_gpu_offline_pacer_pending = 0;
+void gpu_flush_offline_pacer(int irq_serviced) { (void)irq_serviced; }
 void gpu_vblank_clear_deferred_present(void) {}
 void psx_guest_cycle_scale_vblank(void) {}
 void psx_devices_service_to_now(void) {}

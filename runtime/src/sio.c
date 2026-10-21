@@ -596,10 +596,48 @@ static uint64_t s_pace_shift_completes;
 static uint64_t s_pace_ack_fires;
 #endif
 
+/* SIO status register bits */
+#define SIO_STAT_TX_RDY      (1 << 0)
+#define SIO_STAT_RX_RDY      (1 << 1)
+#define SIO_STAT_TX_EMPTY    (1 << 2)
+#define SIO_STAT_ACK         (1 << 7)
+#define SIO_STAT_IRQ         (1 << 9)
+
+/* SIO control register bits */
+#define SIO_CTRL_TX_EN       (1 << 0)
+#define SIO_CTRL_SELECT      (1 << 1)
+#define SIO_CTRL_RX_EN       (1 << 2)
+#define SIO_CTRL_ACK         (1 << 4)
+#define SIO_CTRL_RESET       (1 << 6)
+#define SIO_CTRL_RX_IRQ_EN  (1 << 11)
+#define SIO_CTRL_ACK_IRQ_EN (1 << 12)
+#define SIO_CTRL_SLOT        (1 << 13)
+
 /* ---- Starvation-ring helper -------------------------------------------
  * Fill in current SIO state at every recorded event. */
 #include "starvation_ring.h"
 static void sr_record(uint8_t kind, uint8_t tx, uint8_t rx) {
+#ifndef PSX_NO_DEBUG_TOOLS
+#if SIO_MODEL_CYCLE_PACED
+    if (g_input_response_timing_active) {
+        unsigned ir_kind = 0;
+        switch (kind) {
+        case SR_EVT_SELECT_ASSERT: ir_kind = IR_SIO_SELECT; break;
+        case SR_EVT_SELECT_DEASS: ir_kind = IR_SIO_DESELECT; break;
+        case SR_EVT_SHIFT_START: ir_kind = IR_SIO_SHIFT_BEGIN; break;
+        case SR_EVT_RX_DATA_READ: ir_kind = IR_SIO_RX_READ; break;
+        case SR_EVT_ACK_FIRE: ir_kind = IR_SIO_ACK; break;
+        default: break;
+        }
+        /* selected_slot is latched only when the first byte completes.
+         * SELECT/SHIFT_START must use CTRL's requested port instead. */
+        int trace_port = kind == SR_EVT_SELECT_DEASS ? selected_slot
+            : ((sio_ctrl & SIO_CTRL_SLOT) ? 1 : 0);
+        if (ir_kind) input_response_sio(ir_kind, trace_port, tx, rx,
+            sio_bus_byte_index, sio_ctrl, sio_stat, sio_mode, sio_baud);
+    }
+#endif
+#endif
 #if SIO_MODEL_CYCLE_PACED
     starvation_ring_record(kind, tx, rx,
                            sio_ctrl, sio_stat,
@@ -823,23 +861,6 @@ uint16_t sio_get_last_ctrl_on_tx(void) { return sio_last_ctrl_on_tx; }
 static int sio_irq_pending = 0;
 static int sio_irq_countdown = 0;
 static int sio_ack_visible_reads = 0;
-
-/* SIO status register bits */
-#define SIO_STAT_TX_RDY      (1 << 0)
-#define SIO_STAT_RX_RDY      (1 << 1)
-#define SIO_STAT_TX_EMPTY    (1 << 2)
-#define SIO_STAT_ACK         (1 << 7)
-#define SIO_STAT_IRQ         (1 << 9)
-
-/* SIO control register bits */
-#define SIO_CTRL_TX_EN       (1 << 0)
-#define SIO_CTRL_SELECT      (1 << 1)
-#define SIO_CTRL_RX_EN       (1 << 2)
-#define SIO_CTRL_ACK         (1 << 4)
-#define SIO_CTRL_RESET       (1 << 6)
-#define SIO_CTRL_RX_IRQ_EN  (1 << 11)
-#define SIO_CTRL_ACK_IRQ_EN (1 << 12)
-#define SIO_CTRL_SLOT        (1 << 13)
 
 void sio_init(void) {
     sio_tx_data = 0;
@@ -1437,6 +1458,7 @@ static void pad_process_byte(uint8_t tx_byte) {
             /* Read poll. Analog (or in-config) uses the 8-byte format with the
              * four stick axes; a plain digital pad uses the 4-byte format. */
             const uint16_t btn = pad_buttons[lp];
+            INPUT_RESPONSE_TRACE(IR_SIO_SNAPSHOT, 0x1F801040u, 0, cur_id, btn, (uint32_t)lp);
             pad_response[0] = cur_id;
             pad_response[1] = 0x5A;
             pad_response[2] = (uint8_t)(btn & 0xFF);
@@ -2739,6 +2761,11 @@ static void sio_handle_shift_complete(void) {
     int acked = sio_consume_ack_event();
     sio_shift_active = 0;
     sio_stat |= SIO_STAT_RX_RDY;
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (g_input_response_timing_active)
+        input_response_sio(IR_SIO_RX_READY, selected_slot, b, sio_rx_data,
+            sio_bus_byte_index, sio_ctrl, sio_stat, sio_mode, sio_baud);
+#endif
     s_pace_shift_completes++;
 
     sio_irq_pending_source   = (active_device == DEV_MEMCARD)
@@ -2763,6 +2790,11 @@ static void sio_handle_shift_complete(void) {
         sio_tx_buffer_ack_irq_en = 0;
         sio_stat |= SIO_STAT_TX_EMPTY;
         sio_bus_byte_index++;
+#ifndef PSX_NO_DEBUG_TOOLS
+        if (g_input_response_timing_active)
+            input_response_sio(IR_SIO_SHIFT_BEGIN, selected_slot, sio_shift_byte, 0,
+                sio_bus_byte_index, sio_ctrl, sio_stat, sio_mode, sio_baud);
+#endif
         s_pace_tx_buffer_promoted++;
         if (sio_bus_owner == SIO_OWNER_CARD)
             s_pace_tx_buffer_promoted_during_card++;

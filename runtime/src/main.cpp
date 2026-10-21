@@ -1,3 +1,4 @@
+#include "input_response_probe.h"
 /* main.cpp — Phase 3 runtime entry point.
  *
  * Loads BIOS ROM, initializes CPU state + SDL display, calls into
@@ -50,6 +51,7 @@ static std::string g_play_time_credits;
 #include "autocompile.h"
 #include "code_provider.h"
 extern "C" void psx_event_step_conservative_env_init(void);
+extern "C" int g_dma_exec_depth;
 /* memory.c's last-word-store record for the idle-loop detector. */
 extern "C" int g_psx_track_last_store;
 extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
@@ -1555,6 +1557,11 @@ static int           g_fmv_skip_no_xa_hold  = 4;
  * = 30 Hz / 0.50x with the CPU idle. ~60 Hz panels may use vsync as the clock;
  * otherwise the pacer holds 59.94 Hz and present must not wait on the swap. */
 static int           g_low_latency_input = 1;
+/* Diagnostic-only, opt-in. Never enabled by game.toml or persisted settings. */
+static int           g_offline_post_irq_pacer = 0;
+static int           s_offline_pacer_override = -1, s_offline_pacer_override_p2 = -1;
+static double        s_offline_pacer_period_ms;
+
 /* [video] render_thread (docs/RENDER_THREAD.md): the GL backend runs on its
  * own thread. Started at the first vblank once the context and every startup
  * GL call are done; s_render_thread_tried keeps it to one attempt. */
@@ -8742,6 +8749,53 @@ static bool local_mouse_live(int override_word) {
     return pad_ext_live(&g) != 0;
 }
 
+/* Experiment 1 resumes after IRQ. Experiment 2 resumes near the frame end;
+ * experiment 3 resumes at the first safe point at/after one quarter frame.
+ * An idle skip can defer either phased experiment to the next frontend callback.
+ * Neither changes the guest IRQ handler order or the causal v1 timestamps. */
+static void offline_post_irq_pacer(int boundary) {
+    if (!g_offline_post_irq_pacer || psx_netplay_active() ||
+        psx_selfcheck_input_locked() || psx_selfcheck_resim_active()) return;
+    const int mode = g_offline_post_irq_pacer;
+    const uint32_t remaining = interrupts_cycles_to_vblank();
+    (void)remaining; /* tracing is compiled out in release */
+    INPUT_RESPONSE_TRACE(IR_PACER_RESUME, 0, 0, remaining, (uint32_t)boundary, (uint32_t)mode);
+    auto sample = [](unsigned origin) {
+        (void)origin;
+        if (!g_low_latency_input || psx_netplay_active() ||
+            psx_selfcheck_input_locked() || psx_selfcheck_resim_active()) return;
+        INPUT_RESPONSE_TRACE(IR_HOST_BEGIN, 0, 0, 0, 0, origin);
+        SDL_GameControllerUpdate();
+        SDL_PumpEvents();
+        sample_pad_into_sio(s_offline_pacer_override);
+        apply_input_override_port2(s_offline_pacer_override_p2);
+        env_pad_hold_apply();
+        INPUT_RESPONSE_TRACE(IR_HOST_END, 0, 0, 0, 0, origin);
+    };
+    /* Observe/deliver BEFORE either phased wait too. Otherwise moving the
+     * only sample past a wait could hide that wait from our causal ruler. */
+    if (mode == 2 || mode == 3) sample(mode == 3 ? 6u : 5u);
+    const uint64_t t0 = SDL_GetPerformanceCounter();
+    INPUT_RESPONSE_TRACE(IR_PACER_BEGIN, 0, 0, 0, 0, (uint32_t)mode);
+    frame_pacer_wait(&s_frame_pacer, s_offline_pacer_period_ms);
+    INPUT_RESPONSE_TRACE(IR_PACER_END, 0, 0, 0, 0, (uint32_t)mode);
+    g_frame_report_wait_ticks += SDL_GetPerformanceCounter() - t0;
+    latency_ring_mark(LAT_PACED);
+    sample(mode == 3 ? 7u : (mode == 2 ? 4u : 3u));
+    latency_ring_restamp_input(); /* does not restamp the causal probe */
+}
+
+static bool offline_post_irq_pacer_eligible(void) {
+    return g_offline_post_irq_pacer && fntrace_is_game_started() &&
+        !psx_netplay_active() && !g_headless && g_low_latency_input &&
+        psx_offline_pacer_can_wait() &&
+        !g_render_thread && !g_present_thread && !g_frame_interpolation &&
+        !g_frame_generation && !rt_running() && !g_dynres.active &&
+        !psx_local_mouse_installed() && !savestate_menu_open && !psx_rewind_is_open() &&
+        psx_host_pause_depth() == 0 && !psx_selfcheck_input_locked() &&
+        !psx_selfcheck_resim_active() && !sio_hold_present_for_card();
+}
+
 static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     NetplayVblankEpilogue ep{};
     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
@@ -8902,6 +8956,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* Direct-shortcut claims are settled before any shortcut poll or pad
      * sample this frame (no-op unless a title allowed a direct shortcut). */
     direct_shortcut_claim_update();
+    INPUT_RESPONSE_TRACE(IR_HOST_BEGIN, 0, 0, g_low_latency_input,
+        (g_present_thread ? 1u : 0u) | (g_frame_interpolation ? 2u : 0u) |
+        (rt_running() ? 4u : 0u), 1);
     if (!g_headless) {
         /* Pump SDL events to prevent window freeze. */
         psx_local_mouse_begin(sdl_window, local_mouse_live(override));
@@ -8982,6 +9039,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             apply_input_override_port2(override_p2);
             env_pad_hold_apply();
         }
+        INPUT_RESPONSE_TRACE(IR_HOST_END, 0, 0, 0, 0, 1);
         /* Offline vblank boundary: record/replay/compare (PSX_RB_SELFCHECK).
          * Defer opening a window while multitap arming is still pending —
          * the arm writes SIO once, host-latched, and would not replay. */
@@ -9284,16 +9342,29 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * peer's guest quantum. Self-check replay runs uncapped like netplay
      * resim. */
     if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
+        bool deferred_pacer = false;
         uint64_t perf_start = runtime_perf_section_begin();
-        if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
+        if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace() &&
+            offline_post_irq_pacer_eligible()) {
+            s_offline_pacer_override = override;
+            s_offline_pacer_override_p2 = override_p2;
+            s_offline_pacer_period_ms = g_frame_period_ms;
+            gpu_arm_offline_pacer(g_offline_post_irq_pacer);
+            deferred_pacer = g_gpu_offline_pacer_pending != 0;
+            if (deferred_pacer) INPUT_RESPONSE_TRACE(IR_PACER_DEFER, 0, 0, 0,
+                (uint32_t)g_offline_post_irq_pacer, 0);
+        }
+        if (!deferred_pacer && !manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
             const uint64_t dyn_t0 = SDL_GetPerformanceCounter();
+            INPUT_RESPONSE_TRACE(IR_PACER_BEGIN, 0, 0, 0, 0, 0);
             frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+            INPUT_RESPONSE_TRACE(IR_PACER_END, 0, 0, 0, 0, 0);
             const uint64_t waited = SDL_GetPerformanceCounter() - dyn_t0;
             if (g_dynres.active) g_dynres.pacer_ticks += waited;
             g_frame_report_wait_ticks += waited;
         }
         runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
-        latency_ring_mark(LAT_PACED);
+        if (!deferred_pacer) latency_ring_mark(LAT_PACED);
 
         /* Low-latency input: the early sample above is now ~one pacer-wait old.
          * Refresh the device state and re-sample right before present so the next
@@ -9301,7 +9372,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * vsync-light box). Re-stamp the ring's input mark to measure from here.
          * Self-check record keeps pads boundary-latched (netplay tick
          * semantics) — the mid-frame re-sample would fork the resim. */
-        if (g_low_latency_input && !psx_selfcheck_input_locked()) {
+        if (!deferred_pacer && g_low_latency_input && !psx_selfcheck_input_locked()) {
+            INPUT_RESPONSE_TRACE(IR_HOST_BEGIN, 0, 0, 0, 0, 2);
             SDL_GameControllerUpdate();  /* refresh pad state after the wait */
             if (psx_local_mouse_installed()) {
                 psx_local_mouse_begin(sdl_window, local_mouse_live(override));
@@ -9321,6 +9393,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             sample_pad_into_sio(override);
             apply_input_override_port2(override_p2);
             env_pad_hold_apply();
+            INPUT_RESPONSE_TRACE(IR_HOST_END, 0, 0, 0, 0, 2);
             latency_ring_restamp_input();
         }
     }
@@ -21005,6 +21078,21 @@ session_reboot:
     }
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (const char *e = std::getenv("PSX_OFFLINE_POST_IRQ_PACER")) {
+        const int mode = std::atoi(e);
+        g_offline_post_irq_pacer = (mode >= 1 && mode <= 3) ? mode : 0;
+    }
+#endif
+    if (net_cfg.enabled) g_offline_post_irq_pacer = 0;
+    gpu_set_offline_pacer_callback(g_offline_post_irq_pacer ? offline_post_irq_pacer : nullptr);
+    if (g_offline_post_irq_pacer)
+        std::fprintf(stdout, "psxrecomp: experimental OFFLINE pacer mode %d (%s) requested; "
+                     "baseline fallback for unsupported paths, online unchanged\n",
+                     g_offline_post_irq_pacer,
+                     g_offline_post_irq_pacer == 3 ? "quarter frame" :
+                     (g_offline_post_irq_pacer == 2 ? "frame end" : "post-IRQ; historical experiment"));
+
 
     /* Delay-sync LAN (recomp-net). Menu/lobby UI is later work — CLI/env only.
      * Must start after SDL so local pad capture has devices; before the guest

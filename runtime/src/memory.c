@@ -1,3 +1,4 @@
+#include "input_response_probe.h"
 /* memory.c — Phase 2 PS1 memory system.
  *
  * Physical address routing:
@@ -2505,7 +2506,19 @@ uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t re
     uint32_t phys;
     if (psx_cyc_main_ram_fast_addr(addr, 1u, &phys)) return ram[phys];
 #endif
-    return psx_read_byte(addr);
+    uint8_t value = psx_read_byte(addr);
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (g_input_response_timing_active) {
+        uint32_t phys = psx_phys_addr(addr);
+        if (phys >= 0x1DCA48u && phys < 0x1DCA4Cu) {
+            extern volatile uint32_t g_psx_last_block;
+            /* cpu->pc is a CPS resume point, not an exact instruction PC.
+             * aux is the last observed block, explicitly labelled in export. */
+            INPUT_RESPONSE_TRACE(IR_BUFFER_READ, phys, 0, value, value, g_psx_last_block);
+        }
+    }
+#endif
+    return value;
 }
 
 /* LWC2 (GTE load): §1/DO_LDS done by psx_cyc_step(cpu,0); the GTE deadline stall by

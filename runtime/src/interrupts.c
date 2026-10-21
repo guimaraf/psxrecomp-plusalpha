@@ -1,3 +1,4 @@
+#include "input_response_probe.h"
 /*
  * interrupts.c — v4 interrupt delivery for recompiled BIOS.
  *
@@ -495,6 +496,7 @@ static void fire_vblank_edge(void) {
                           (uint32_t)(psx_get_cycle_count() + g_psx_vblank_cycles));
     psx_irq_raise(IRQ_VBLANK, 0);
     g_vblank_raise_count++;
+    INPUT_RESPONSE_TRACE(IR_VBLANK_EDGE, 0, 0, 0, 0, 0);
     event_ring_record(EV_ISTAT_RAISE, IRQ_VBLANK);
     gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
     /* [timing] guest_cycle_scale_gate: RAM predicates are judged here, at a
@@ -753,6 +755,11 @@ static int same_guest_pc(uint32_t a, uint32_t b) {
 }
 
 int psx_get_in_exception(void) { return in_exception; }
+int psx_offline_pacer_can_wait(void) {
+    extern int g_dma_exec_depth;
+    return !in_exception && !s_defer_switch_pending && !g_dma_exec_depth &&
+        !g_psx_guest_time_frozen && !g_psx_render_pass_active;
+}
 
 /* Co-sim (COSIM_ORACLE.md): fold the GENUINE guest-timing interrupt statics into the
  * state hash. Deliberately EXCLUDES total_checks / dispatch_count / post_exception_
@@ -1161,6 +1168,7 @@ void psx_check_interrupts(CPUState* cpu) {
      * we also skip while a deferred cooperative ChangeThread is pending
      * (Ape memcard fix #2) so finish_frame cannot run on a smeared TCB. */
     int np_present_after_irq = 0;
+    int offline_vblank_serviced = 0;
     if (!in_exception && np_active && !s_defer_switch_pending) {
         gpu_vblank_flush_present(); /* CDA0 / card gates inside; CD54 no-ops */
         if (psx_interrupt_delivery_needed(cpu))
@@ -1169,6 +1177,9 @@ void psx_check_interrupts(CPUState* cpu) {
 #define PSX_CHECK_INTERRUPTS_RETURN() do { \
         if (np_present_after_irq && !s_defer_switch_pending) \
             gpu_vblank_flush_present(); \
+        if (!np_active && !in_exception && !s_defer_switch_pending && \
+            g_gpu_offline_pacer_pending) \
+            gpu_flush_offline_pacer(offline_vblank_serviced); \
         if (g_ls_suppress_record > 0) g_ls_suppress_record--; \
         return; \
     } while (0)
@@ -1541,8 +1552,10 @@ irq_deliver_eval:
         uint32_t take_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
                                                   : s_compiled_interrupt_resume_pc;
         irq_record_outcome(EV_IRQ_DELIVER, 0, take_pc);
+        INPUT_RESPONSE_TRACE(IR_IRQ_DELIVER, 0, take_pc, i_stat, i_mask, cpu->cop0[COP0_SR]);
     }
     g_irq_deliver_count++;
+    offline_vblank_serviced = ((i_stat & i_mask) & (1u << IRQ_VBLANK)) != 0;
     if ((i_stat & i_mask) & (1u << IRQ_VBLANK)) g_vblank_deliver_count++;
     if ((i_stat & i_mask) & (1u << IRQ_CDROM))  g_cdrom_deliver_count++;
     /* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt). Capture, at every IRQ
@@ -2212,6 +2225,9 @@ irq_deliver_eval:
 #endif
     if (np_present_after_irq && !s_defer_switch_pending)
         gpu_vblank_flush_present();
+    if (!np_active && !in_exception && !s_defer_switch_pending &&
+        g_gpu_offline_pacer_pending)
+        gpu_flush_offline_pacer(offline_vblank_serviced);
 #undef PSX_CHECK_INTERRUPTS_RETURN
 }
 

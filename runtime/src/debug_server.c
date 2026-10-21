@@ -2095,6 +2095,8 @@ void debug_server_log_call_entry(uint32_t func_addr) {
      * compared by the caller; these observers are intentionally inert. */
     { extern int g_ls_replay_active; if (g_ls_replay_active) return; }
     g_psx_last_fn_entry = func_addr;
+    if (func_addr == 0x801017F0u)
+        INPUT_RESPONSE_TRACE(IR_CALLBACK_ENTRY, 0, func_addr, 0, 0, 0);
 #ifdef PSX_STACK_GUARD
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
@@ -15936,6 +15938,7 @@ static void handle_input_response_status(int id, const char *json) {
 }
 static void handle_input_response_arm(int id, const char *json) {
     InputResponseConfig c; memset(&c, 0, sizeof(c));
+    c.timing = json_get_int(json, "timing", 0) != 0;
     c.discovery = json_get_int(json, "discovery", 1) != 0;
     c.port = json_get_int(json, "port", 0);
     c.warmup_ms = response_u32(json, "warmup_ms", 5000);

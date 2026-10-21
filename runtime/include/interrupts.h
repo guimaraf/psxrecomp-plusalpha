@@ -109,6 +109,8 @@ uint32_t cycles_to_next_event(void);
 
 /* Query whether we are currently inside an exception handler dispatch. */
 int psx_get_in_exception(void);
+/* Host pacing only: no handler, deferred TCB switch, DMA or frozen pass. */
+int psx_offline_pacer_can_wait(void);
 
 /* Most recent block-leader IRQ-check guest PC / compiled resume latch.
  * Used by the post-savestate freeze probe (vblank-time "where was the game"). */

@@ -170,6 +170,16 @@ typedef void (*gpu_vblank_cb)(void);
 void gpu_set_vblank_callback(gpu_vblank_cb cb);
 void gpu_vblank_flush_present(void);
 void gpu_vblank_clear_deferred_present(void);
+/* Opt-in offline pacer experiment. Separate from netplay deferred presents.
+ * Arm at VBlank, drain only outside exception/scheduler-switch context.
+ * boundary: 0 ordinary checked return, 1 returned from VBlank handler,
+ * 2 next VBlank edge (modes 2/3 fallback when an idle skip crosses the phase).
+ * Pending mode: 0 inactive, 1 post-IRQ, 2 frame-end, 3 quarter-frame experiment. */
+typedef void (*gpu_offline_pacer_cb)(int boundary);
+void gpu_set_offline_pacer_callback(gpu_offline_pacer_cb cb);
+void gpu_arm_offline_pacer(int mode);
+void gpu_flush_offline_pacer(int boundary);
+extern int g_gpu_offline_pacer_pending;
 /* Queue one deferred present (netplay RB resume when I_STAT already has
  * VBlank — snap resync cleared the pending callback). */
 void gpu_vblank_arm_deferred_present(void);

@@ -1,3 +1,4 @@
+#include "input_response_probe.h"
 /* latency_ring.c — always-on input->photon latency ring.  See latency_ring.h. */
 
 #include "latency_ring.h"
@@ -38,6 +39,10 @@ void latency_ring_mark(LatencyStage stage) {
     if (s_head == 0) return;                     /* no frame begun yet */
     LatSlot *s = &s_ring[(s_head - 1) % LAT_RING_SIZE];
     s->ts[stage] = qpc();
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (stage == LAT_SWAP_BEGIN) input_response_swap(IR_SWAP_BEGIN);
+    if (stage == LAT_SWAP_END) input_response_swap(IR_SWAP_END);
+#endif
 }
 
 void latency_ring_restamp_input(void) {
