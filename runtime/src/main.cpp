@@ -83,6 +83,7 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #define PSX_MAX_PLAYERS 2
 #endif
 #include "psx_netplay.h"
+#include "net_sync_trace.h"
 #include "psx_stick.h"       /* radial SDL-stick -> DualShock response transform */
 #include "psx_trigger.h"     /* continuous SDL trigger -> 0..255 magnitude */
 #include "mod_pad_transform.h"
@@ -96,6 +97,7 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "host_time.h"
 #if defined(PSX_HAS_RECOMP_NET)
 #include "recomp_net/auth.h"
+#include "recomp_net/sched.h"
 #include "recomp_netplay_account.h"   /* shared recomp-ui account sync */
 #include "recomp_net/host_relay.h" /* RNetHostRelayStatus for the launcher relay line */
 #include "recomp_net/host_ice.h"   /* RNetHostIceStatus: host relay over ICE waiting-room line */
@@ -1583,6 +1585,7 @@ static int           g_present_thread_slots = 3;
 static int           s_render_thread_tried = 0;
 static int           g_video_vsync        = 1;
 static bool          g_player_nameplates_enabled = true;
+static std::string   g_offline_player_names[2];
 static int           g_frame_interpolation = 0;
 static int           g_frame_interpolation_fps = 0;
 /* Graphics presets (docs/QUALITY_PRESETS.md): the decision for this run,
@@ -6993,8 +6996,85 @@ static uint32_t netplay_admit_stall_ms(void) {
     return ms;
 }
 
+/* Opt-in, fixed-size history. Written and read at emu-thread safe points.
+ * No file writes, allocations or transport pumping in the recording path. */
+static constexpr uint64_t NET_SYNC_TRACE_CAPACITY = 32768;
+static NetSyncTraceEntry s_net_sync_trace[NET_SYNC_TRACE_CAPACITY];
+static uint64_t s_net_sync_total;
+static bool net_sync_trace_enabled() {
+    static const bool enabled = [] {
+        const char *e = std::getenv("PSX_NET_SYNC_TRACE");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+static void net_sync_trace_mark(int stage) {
+    if (!net_sync_trace_enabled() || !psx_netplay_active()) return;
+    NetSyncTraceEntry e{};
+    e.qpc = SDL_GetPerformanceCounter();
+    e.deadline = s_frame_pacer.next_deadline;
+    e.seq = ++s_net_sync_total;
+    e.stage = stage;
+    e.tick = psx_netplay_sim_tick();
+    e.host = psx_netplay_is_host();
+    e.slot = psx_netplay_local_slot();
+    e.delay = psx_netplay_input_delay();
+    e.running = psx_netplay_is_running();
+    e.media = psx_netplay_rb_fmv_media_active();
+    e.xa = cdrom_xa_stream_active();
+    e.resim = psx_netplay_is_resimulating();
+    e.tip_hold = psx_netplay_rb_tip_holding();
+    uint32_t ignored;
+    psx_netplay_admit_wait_info(e.stall, sizeof(e.stall), &ignored, &e.lead);
+#if defined(PSX_HAS_RECOMP_NET)
+    RNetSchedDiagnostic d{};
+    rnet_sched_diagnostic(&d);
+    e.generation = d.generation;
+    e.highest_wire = d.highest_remote_wire;
+    e.packets_rx = d.packets_rx;
+    e.rx_age_ms = d.rx_age_ms;
+    e.timesync_enabled = d.timesync_enabled;
+    e.auto_enabled = d.auto_delay_enabled;
+    e.debt_ms = d.debt_ms;
+    e.debt_added_ms = d.debt_added_ms;
+    e.slice_requested_ms = d.slice_requested_ms;
+    e.mispredicts = d.mispredicts;
+    e.tick_ema_ms = d.tick_ema_ms;
+    e.ahead_streak = d.ahead_streak;
+    e.stall_until_ms = d.stall_until_ms;
+    e.window_ticks = d.window_ticks;
+    e.window_misses = d.window_misses;
+    e.window_late = d.window_late;
+    e.window_lead_min = d.window_lead_min;
+    e.transit_x16 = d.transit_x16;
+    e.auto_eval_ms = d.auto_eval_ms;
+    e.auto_change_ms = d.auto_change_ms;
+    e.auto_target = d.auto_target;
+#endif
+    e.sample_ticks = SDL_GetPerformanceCounter() - e.qpc;
+    s_net_sync_trace[(e.seq - 1) % NET_SYNC_TRACE_CAPACITY] = e;
+}
+extern "C" int psx_net_sync_trace_snapshot(uint64_t after, NetSyncTraceEntry *out,
+        int cap, uint64_t *total, uint64_t *lost, uint64_t *frequency) {
+    *total = s_net_sync_total;
+    *frequency = SDL_GetPerformanceFrequency();
+    const uint64_t oldest = s_net_sync_total >= NET_SYNC_TRACE_CAPACITY
+        ? s_net_sync_total - NET_SYNC_TRACE_CAPACITY + 1 : 1;
+    *lost = after < oldest - 1 ? oldest - 1 - after : 0;
+    if (!net_sync_trace_enabled()) return -1;
+    if (after >= s_net_sync_total) return 0;
+    uint64_t first = after + 1;
+    if (first < oldest) first = oldest;
+    int n = 0;
+    while (first <= s_net_sync_total && n < cap)
+        out[n++] = s_net_sync_trace[(first++ - 1) % NET_SYNC_TRACE_CAPACITY];
+    return n;
+}
+
 static void netplay_barrier_admit(int override) {
     if (!psx_netplay_active()) return;
+    net_sync_trace_mark(1);
+    uint64_t trace_wait_ms = SDL_GetTicks64();
     /* Launcher/game window teardown can leave a queued SDL_QUIT; draining it
      * prevents an instant soft-return before the first frame. */
     SDL_PumpEvents();
@@ -7041,6 +7121,10 @@ static void netplay_barrier_admit(int override) {
          * peer FRAME_COMMIT/INPUT sit in the UDP socket. Checking disconnect
          * first false-killed rematch right after enter-guest. */
         psx_netplay_pump();
+        if (now_ms - trace_wait_ms >= 100) {
+            net_sync_trace_mark(2);
+            trace_wait_ms = now_ms;
+        }
         if (!liveness_rearamed) {
             psx_netplay_touch_peer_liveness();
             liveness_rearamed = 1;
@@ -7266,6 +7350,7 @@ static void netplay_barrier_admit(int override) {
         starvation_watchdog_heartbeat();
     }
 done:
+    net_sync_trace_mark(3);
     freeze_heartbeat_set_paused(0);
 }
 
@@ -10675,7 +10760,9 @@ extern "C" int psx_dynres_status_json(char *out, int cap) {
 
 static void sdl_vblank_present(void) {
     sync_guest_cadence_to_video_standard();
+    net_sync_trace_mark(4);
     NetplayVblankEpilogue ep = sdl_vblank_present_body();
+    net_sync_trace_mark(5);
     render_thread_vblank();
     /* Selfcheck span-end rewind: after present-body C++ RAII, before any
      * further guest progress. Longjmps on success — keeps every resim load
@@ -10697,9 +10784,11 @@ static void sdl_vblank_present(void) {
         psx_netplay_catchup_consume_frame();
         return;
     }
+    net_sync_trace_mark(6);
     uint64_t perf_start = runtime_perf_section_begin();
     if (present_should_wall_pace())
         frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+    net_sync_trace_mark(7);
     runtime_perf_section_end(perf_start, &g_runtime_perf.pacer_ticks);
     latency_ring_mark(LAT_PACED);
 }
@@ -16449,6 +16538,28 @@ namespace {
         g_rui_config_ini_path = (exe / "config.ini").string();
     }
 
+#if defined(RECOMP_LAUNCHER_HAS_OFFLINE_PLAYER_NAMES)
+    int ae_save_offline_player_names(const char* left, const char* right,
+                                     char* error, size_t error_cap) {
+        try {
+            std::string reason;
+            if (g_lnch_settings_path.empty() ||
+                !PSXRecompV4::save_offline_player_names(
+                    g_lnch_settings_path, left ? left : "", right ? right : "", reason)) {
+                std::snprintf(error, error_cap, "%s", reason.empty()
+                    ? "Settings file is unavailable. Please try again." : reason.c_str());
+                return -1;
+            }
+            g_offline_player_names[0] = left ? left : "";
+            g_offline_player_names[1] = right ? right : "";
+            return 0;
+        } catch (const std::exception&) {
+            std::snprintf(error, error_cap, "Could not save offline names. Please try again.");
+            return -1;
+        }
+    }
+#endif
+
     void ae_fill_psx_launcher_game_info(
         RecompLauncherCGameInfo* gi,
         const char* game_name_c,
@@ -16470,6 +16581,10 @@ namespace {
         (void)ws_offered_b;
         (void)ws_ultrawide_offered_b;
         launcher_profile_apply("psx", gi);
+#if defined(RECOMP_LAUNCHER_HAS_OFFLINE_PLAYER_NAMES)
+        gi->save_offline_player_names = g_psx_nameplate_provider
+            ? ae_save_offline_player_names : nullptr;
+#endif
         psx_launcher_texture_filter_catalog(gi);
         gi->name = game_name_c;
         gi->region = region_c;
@@ -17030,6 +17145,16 @@ static void recomp_overlay_setup(const char* argv0, const std::string& title) {
     if (g_gl_active && !g_headless && !g_nameplates_on && g_psx_nameplate_provider) {
         const auto dir = exe_dir_from_argv(argv0);
         if (g_psx_nameplate_provider->configure(g_player_nameplates_enabled ? 1 : 0)) {
+            // Each new session reads the last explicit Save, including when
+            // the launcher was skipped. Netplay supplies its own names later.
+            const auto saved = PSXRecompV4::load_user_settings(dir / "settings.toml");
+            if (!saved.parse_error) {
+                for (int i = 0; i < 2; ++i)
+                    g_offline_player_names[i] = saved.offline_player_names[i];
+            }
+            if (g_psx_nameplate_provider->set_names)
+                g_psx_nameplate_provider->set_names(g_offline_player_names[0].c_str(),
+                                                   g_offline_player_names[1].c_str());
             g_nameplates_on = recomp_ui_psx_nameplates_init((dir / "assets").string().c_str()) != 0;
             if (g_nameplates_on) psx_host_overlay_set_draw_cb(ovl_draw, nullptr);
             else std::fprintf(stderr, "psxrecomp: player nameplates: OpenGL UI initialization failed\n");
@@ -18458,6 +18583,8 @@ int main(int argc, char** argv) {
         if (us.has_frame_generation)  g_frame_generation  = us.frame_generation ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
         if (us.has_player_nameplates) g_player_nameplates_enabled = us.player_nameplates;
+        for (int i = 0; i < 2; ++i)
+            g_offline_player_names[i] = us.offline_player_names[i];
         if (us.has_frame_interpolation)
             g_frame_interpolation = us.frame_interpolation ? 1 : 0;
         if (us.has_frame_interpolation_fps)
@@ -18989,6 +19116,10 @@ int main(int argc, char** argv) {
             seed.skip_launcher = skip_launcher_setting;   seed.has_skip_launcher = true;
             seed.player_nameplates = g_player_nameplates_enabled;
             seed.has_player_nameplates = g_psx_nameplate_provider != nullptr;
+            for (int i = 0; i < 2; ++i) {
+                seed.offline_player_names[i] = g_offline_player_names[i];
+                seed.has_offline_player_names[i] = g_psx_nameplate_provider != nullptr;
+            }
             if (has_netplay_player_name) {
                 seed.netplay_player_name = netplay_player_name;
                 seed.has_netplay_player_name = true;
@@ -19136,6 +19267,11 @@ int main(int argc, char** argv) {
 #if defined(RECOMP_LAUNCHER_HAS_PLAYER_NAMEPLATES)
             ls.player_nameplates = g_psx_nameplate_provider
                 ? (g_player_nameplates_enabled ? 1 : -1) : 0;
+#if defined(RECOMP_LAUNCHER_HAS_OFFLINE_PLAYER_NAMES)
+            for (int i = 0; i < 2; ++i)
+                std::snprintf(ls.offline_player_names[i], sizeof(ls.offline_player_names[i]),
+                              "%s", g_offline_player_names[i].c_str());
+#endif
 #endif
             /* aspect_index: 0 = 4:3, 1 = 16:9, 2 = 21:9 (see RecompLauncherCSettings). */
             ls.aspect_index   = (seed.aspect_num * 9 == seed.aspect_den * 21) ? 2 :
@@ -19441,6 +19577,10 @@ int main(int argc, char** argv) {
                     g_player_nameplates_enabled = ls.player_nameplates > 0;
                     seed.player_nameplates = g_player_nameplates_enabled;
                     seed.has_player_nameplates = true;
+                    for (int i = 0; i < 2; ++i) {
+                        seed.offline_player_names[i] = g_offline_player_names[i];
+                        seed.has_offline_player_names[i] = true;
+                    }
                 }
 #endif
                 if (lr == 0 && rui_out_disc[0]) {
@@ -21206,6 +21346,7 @@ session_reboot:
                         psx_guest_cycle_scale_config(), g_psx_gcs_batch != 0);
         }
         const int nrc = psx_netplay_start(&net_cfg);
+        net_sync_trace_mark(8);
         if (nrc != 0) {
             const char* const why = netplay_start_failure(nrc, net_cfg);
             if (!g_netplay_from_lobby)
@@ -21795,6 +21936,11 @@ soft_return_lobby:
 #if defined(RECOMP_LAUNCHER_HAS_PLAYER_NAMEPLATES)
         ls.player_nameplates = g_psx_nameplate_provider
             ? (g_player_nameplates_enabled ? 1 : -1) : 0;
+#if defined(RECOMP_LAUNCHER_HAS_OFFLINE_PLAYER_NAMES)
+        for (int i = 0; i < 2; ++i)
+            std::snprintf(ls.offline_player_names[i], sizeof(ls.offline_player_names[i]),
+                          "%s", g_offline_player_names[i].c_str());
+#endif
 #endif
         /* Soft-return shows the durable preference (bios.cfg), not the match
          * session BIOS that may have temporarily overridden boot. */

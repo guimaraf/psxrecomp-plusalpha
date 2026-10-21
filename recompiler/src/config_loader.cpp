@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -16,6 +17,7 @@
 
 #include "bios_rom_alias.h"
 #include "../../runtime/include/internal_resolution.h"
+#include "../../runtime/include/offline_player_names.h"
 #include "host_path.h"
 #include "fmt/format.h"
 #include "ps1_exe_parser.h"
@@ -3080,6 +3082,14 @@ UserSettings load_user_settings(const fs::path& path) {
             s.player_nameplates = toml::find<bool>(v, "player_nameplates");
             s.has_player_nameplates = true;
         });
+        const char* offline_name_keys[2] = {"offline_player_1", "offline_player_2"};
+        for (int i = 0; i < 2; ++i) {
+            if (v.contains(offline_name_keys[i])) try_get([&]{
+                s.offline_player_names[i] = psx::offline_player_name(
+                    toml::find<std::string>(v, offline_name_keys[i]));
+                s.has_offline_player_names[i] = true;
+            });
+        }
         if (v.contains("vsync")) try_get([&]{
             const auto m = toml::find<std::string>(v, "vsync");
             if      (m == "on"  || m == "vsync")    { s.vsync = 1;  s.has_vsync = true; }
@@ -3470,6 +3480,15 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
                                          : s.vsync == 2 ? "vrr" : "on") << "\"\n";
     if (s.has_player_nameplates)
         f << "player_nameplates = " << (s.player_nameplates ? "true" : "false") << "\n";
+    for (int i = 0; i < 2; ++i) {
+        if (!s.has_offline_player_names[i]) continue;
+        f << "offline_player_" << i + 1 << " = \"";
+        for (char c : psx::offline_player_name(s.offline_player_names[i])) {
+            if (c == '\\' || c == '"') f << '\\';
+            f << c;
+        }
+        f << "\"\n";
+    }
     if (s.has_frame_interpolation)
         f << "frame_interpolation = " << (s.frame_interpolation ? "true" : "false") << "\n";
     if (s.has_frame_interpolation_fps)
@@ -3604,7 +3623,56 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
             f << "extra_late = " << s.parappa_timing_extra_late << "\n";
     }
 
-    return f.good();
+    f.flush();
+    const bool written = f.good();
+    f.close();
+    return written && !f.fail();
+}
+
+bool save_offline_player_names(const fs::path& path,
+                               const std::string& left, const std::string& right,
+                               std::string& error) {
+    error.clear();
+    const std::string names[2] = {left, right};
+    for (const auto& name : names) {
+        if (psx::offline_player_name(name) != name) {
+            error = "Use up to 8 characters per name, without control characters.";
+            return false;
+        }
+    }
+    auto settings = load_user_settings(path);
+    if (settings.parse_error) {
+        error = "Could not read settings.toml. Fix the file and try again.";
+        return false;
+    }
+    for (int i = 0; i < 2; ++i) {
+        settings.offline_player_names[i] = names[i];
+        settings.has_offline_player_names[i] = true;
+    }
+    auto temp = path;
+    temp += ".offline-names-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()) + ".tmp";
+    std::error_code ec;
+    if (!save_user_settings(temp, settings)) {
+        fs::remove(temp, ec);
+        error = "Could not save settings.toml. Check folder permissions and try again.";
+        return false;
+    }
+    const auto written = load_user_settings(temp);
+    if (written.parse_error || written.offline_player_names[0] != left ||
+        written.offline_player_names[1] != right) {
+        fs::remove(temp, ec);
+        error = "Could not verify saved settings.toml. The original file was kept.";
+        return false;
+    }
+    // Renaming in the same directory replaces the old file atomically.
+    fs::rename(temp, path, ec);
+    if (ec) {
+        fs::remove(temp, ec);
+        error = "Could not replace settings.toml. Check folder permissions and try again.";
+        return false;
+    }
+    return true;
 }
 
 bool upsert_game_toml_controller_bool(const std::filesystem::path& path,

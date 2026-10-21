@@ -1595,6 +1595,8 @@ struct UserSettings {
     bool has_frame_generation = false; bool frame_generation = false;
     bool has_vsync             = false; int  vsync             = 1;
     bool has_player_nameplates = false; bool player_nameplates = true;
+    bool has_offline_player_names[2] = {false, false};
+    std::string offline_player_names[2];
     bool has_frame_interpolation = false; bool frame_interpolation = false;
     bool has_frame_interpolation_fps = false; int frame_interpolation_fps = 0;
     // [video] quality_* (docs/QUALITY_PRESETS.md): the graphics preset in
@@ -1743,6 +1745,12 @@ UserSettings load_user_settings(const std::filesystem::path& path);
 
 // Write settings.toml deterministically. Returns false on I/O failure.
 bool save_user_settings(const std::filesystem::path& path, const UserSettings& s);
+
+// Explicit offline-name Save: validate, preserve other settings, then replace
+// the file only after a complete write. error describes a refused save.
+bool save_offline_player_names(const std::filesystem::path& path,
+                               const std::string& left, const std::string& right,
+                               std::string& error);
 
 // `p` relative to `folder` when it lies inside it; otherwise `p` unchanged.
 // Keeps portable game folders portable once the launcher saves a path.

@@ -1032,12 +1032,10 @@ static int rb_fmv_media_active(void)
         return 1;
     if (mdec_recently_active(RB_FMV_MDEC_HYSTERESIS))
         return 1;
-    /* Real XA audio stream only. Do NOT treat reading+(mode&0x48) alone as
-     * media: MotK boot/LoadExe sets XA mode bits on ordinary CD reads.
-     * Rematch armed invent-lockstep at sim=0 (depth24=0 mdec=0 xa=0,
-     * fmv_pend=1 reading=1 mode=e0) and never presented a frame. */
-    if (cdrom_xa_stream_active())
-        return 1;
+    /* XA audio alone is not a movie: games also stream music during fights.
+     * Treating that as FMV blocks prediction and suspends timesync/auto-delay
+     * for the entire match. Video evidence above also covers silent movies;
+     * MDEC hysteresis bridges brief gaps between decoded frames. */
     return 0;
 }
 

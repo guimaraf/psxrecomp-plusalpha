@@ -795,6 +795,15 @@ if(BUILD_TESTING)
     target_link_libraries(jogcon_ffb_settings_test PRIVATE fmt)
     add_test(NAME jogcon_ffb_settings_test COMMAND jogcon_ffb_settings_test)
 
+    add_executable(offline_player_names_test
+        tests/offline_player_names_test.cpp
+        src/config_loader.cpp
+        src/ps1_exe_parser.cpp)
+    target_include_directories(offline_player_names_test PRIVATE
+        include src lib/fmt/include lib/toml11)
+    target_link_libraries(offline_player_names_test PRIVATE fmt)
+    add_test(NAME offline_player_names_test COMMAND offline_player_names_test)
+
     # Graphics presets: [quality.*] parsing, detection rules, the
     # detect/keep/Custom decision and settings round trip.
     add_executable(quality_presets_test

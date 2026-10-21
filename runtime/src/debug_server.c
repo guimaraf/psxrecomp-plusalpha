@@ -24,6 +24,8 @@
 #include "host_osd.h"
 #include "psx_video_timing.h"
 #include "psx_netplay.h"
+#include "psx_netplay_rb.h"
+#include "net_sync_trace.h"
 #include "psx_bss.h"
 #include "nd_intro_ot.h"
 #include "latency_ring.h"
@@ -8376,14 +8378,62 @@ static void handle_netplay_status(int id, const char *json)
     char out[768];
     snprintf(out, sizeof(out), "{\"id\":%d,\"ok\":true,\"active\":%d,\"host\":%d,"
           "\"rollback\":%d,\"architecture\":\"%s\",\"max_players\":%d,"
+          "\"input_delay\":%d,\"fmv_media_active\":%d,\"xa_stream_active\":%d,"
           "\"players\":%d,\"tick\":%u,\"resolved_through\":%u,"
           "\"stall\":\"%s\",\"remote_lead\":%d,\"desync\":%d,"
           "\"desync_tick\":%u,\"local_hash\":%u,\"remote_hash\":%u}",
           id, psx_netplay_active(), psx_netplay_is_host(),
-          psx_netplay_rollback_mode(), arch, max_players, players, tick,
+          psx_netplay_rollback_mode(), arch, max_players,
+          psx_netplay_input_delay(), psx_netplay_rb_fmv_media_active(), cdrom_xa_stream_active(),
+          players, tick,
           psx_netplay_resolved_through(), stall, lead, desync,
           bad_tick, local_hash, remote_hash);
     debug_server_send_line(out);
+}
+
+/* Read-only incremental history, opted in before process startup. */
+static void handle_net_sync_trace(int id, const char *json)
+{
+    int cursor = json_get_int(json, "after", 0);
+    int count = json_get_int(json, "count", 128);
+    if (cursor < 0) { send_err(id, "after must be nonnegative"); return; }
+    if (count < 1) count = 1;
+    if (count > 512) count = 512;
+    NetSyncTraceEntry *entries = (NetSyncTraceEntry *)calloc((size_t)count, sizeof(*entries));
+    if (!entries) { send_err(id, "alloc failed"); return; }
+    uint64_t total = 0, lost = 0, frequency = 0;
+    int n = psx_net_sync_trace_snapshot((uint64_t)cursor, entries, count,
+                                      &total, &lost, &frequency);
+    size_t cap = 512u + (size_t)count * 1800u;
+    char *out = (char *)malloc(cap);
+    if (!out) { free(entries); send_err(id, "alloc failed"); return; }
+    size_t off = (size_t)snprintf(out, cap,
+        "{\"id\":%d,\"ok\":true,\"schema\":1,\"enabled\":%d,"
+        "\"clock\":\"SDL_performance_counter\",\"frequency\":%llu,"
+        "\"total\":%llu,\"lost\":%llu,\"entries\":[",
+        id, n >= 0, (unsigned long long)frequency,
+        (unsigned long long)total, (unsigned long long)lost);
+    for (int i = 0; i < n; ++i) {
+        const NetSyncTraceEntry *e = &entries[i];
+        char stall[sizeof(e->stall) * 6 + 1];
+        json_escape_string(stall, sizeof(stall), e->stall);
+        off += (size_t)snprintf(out + off, cap - off,
+            "%s{\"seq\":%llu,\"qpc\":%llu,\"deadline\":%llu,\"rx_age_ms\":%llu,\"sample_ticks\":%llu,\"tick\":%u,\"generation\":%u,\"highest_wire\":%u,\"packets_rx\":%u,\"debt_ms\":%u,\"debt_added_ms\":%u,\"slice_requested_ms\":%u,\"mispredicts\":%u,\"tick_ema_ms\":%u,\"ahead_streak\":%u,\"stall_until_ms\":%u,\"window_ticks\":%u,\"window_misses\":%u,\"window_late\":%u,\"transit_x16\":%u,\"auto_eval_ms\":%u,\"auto_change_ms\":%u,\"stage\":%d,\"host\":%d,\"slot\":%d,\"delay\":%d,\"lead\":%d,\"running\":%d,\"media\":%d,\"xa\":%d,\"resim\":%d,\"tip_hold\":%d,\"timesync_enabled\":%d,\"auto_enabled\":%d,\"window_lead_min\":%d,\"auto_target\":%d,\"stall\":\"%s\"}",
+            i ? "," : "",
+            (unsigned long long)e->seq, (unsigned long long)e->qpc, (unsigned long long)e->deadline, (unsigned long long)e->rx_age_ms, (unsigned long long)e->sample_ticks,
+            (unsigned)e->tick, (unsigned)e->generation, (unsigned)e->highest_wire, (unsigned)e->packets_rx,
+            (unsigned)e->debt_ms, (unsigned)e->debt_added_ms, (unsigned)e->slice_requested_ms, (unsigned)e->mispredicts,
+            (unsigned)e->tick_ema_ms, (unsigned)e->ahead_streak, (unsigned)e->stall_until_ms, (unsigned)e->window_ticks,
+            (unsigned)e->window_misses, (unsigned)e->window_late, (unsigned)e->transit_x16, (unsigned)e->auto_eval_ms,
+            (unsigned)e->auto_change_ms, (int)e->stage, (int)e->host, (int)e->slot,
+            (int)e->delay, (int)e->lead, (int)e->running, (int)e->media,
+            (int)e->xa, (int)e->resim, (int)e->tip_hold, (int)e->timesync_enabled,
+            (int)e->auto_enabled, (int)e->window_lead_min, (int)e->auto_target, stall);
+    }
+    snprintf(out + off, cap - off, "]}");
+    debug_server_send_line(out);
+    free(out);
+    free(entries);
 }
 
 /* Startup host work recorded before TCP was initialized; always-on, read-only.
@@ -16028,6 +16078,7 @@ static const CmdEntry s_commands[] = {
     { "host_launch_timings", handle_host_launch_timings },
     { "resident_status",   handle_resident_status },
     { "netplay_status",    handle_netplay_status },
+    { "net_sync_trace",    handle_net_sync_trace },
     { "resident_events",   handle_resident_events },
     { "capture_mark",      handle_capture_mark },
     { "present_image_ring_stats", handle_present_image_ring_stats },

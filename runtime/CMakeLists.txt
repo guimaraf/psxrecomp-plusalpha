@@ -1913,6 +1913,10 @@ if(BUILD_TESTING)
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_restore_edge_irq_check.py)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            add_test(NAME netplay_fmv_media_detection_test
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_fmv_media_detection.py
+                             --compiler ${CMAKE_C_COMPILER})
             add_test(NAME netplay_rb_session_reset_test
                      COMMAND ${Python3_EXECUTABLE}
                              ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_rb_session_reset.py
