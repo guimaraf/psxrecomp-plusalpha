@@ -1082,6 +1082,8 @@ static void post_load_probe_on_vblank(int turbo_active, int present_reached) {
  * restored VRAM — including a blank if display was disabled in the snapshot. */
 static void savestate_input_guard_arm(void);
 extern "C" void psx_frontend_on_savestate_notify(int is_load, int slot, int ok) {
+    if (is_load && ok && g_psx_nameplate_provider && g_psx_nameplate_provider->reset_score)
+        g_psx_nameplate_provider->reset_score();
     char buf[64];
     const int disp = slot + 1;
     if (!is_load && ok)
@@ -4011,6 +4013,8 @@ static void netplay_soft_exit(const char *origin) {
     psx_crash_trace_set_exit_origin(origin);
     netplay_host_present_restore();
     psx_netplay_shutdown(); /* sends BYE so the peer soft-exits too */
+    if (g_psx_nameplate_provider && g_psx_nameplate_provider->reset_score)
+        g_psx_nameplate_provider->reset_score();
     if (g_netplay_from_lobby) {
         std::printf("psxrecomp: netplay ended (%s) — returning to lobby\n",
                     origin ? origin : "?");
@@ -8882,6 +8886,10 @@ static bool offline_post_irq_pacer_eligible(void) {
 }
 
 static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+    /* Title HUD simulation follows guest frames, even in headless/rollback
+     * replay, before netplay records its end-of-frame snapshot. */
+    if (g_psx_nameplate_provider && g_psx_nameplate_provider->simulation_tick)
+        g_psx_nameplate_provider->simulation_tick();
     NetplayVblankEpilogue ep{};
     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
      * by any resume_at (savestate / selfcheck / RB) during that quantum — the
@@ -20285,6 +20293,8 @@ session_reboot:
         std::fflush(stdout);
     }
     memory_init(bios_path_str.c_str());
+    if (g_psx_nameplate_provider && g_psx_nameplate_provider->begin_session)
+        g_psx_nameplate_provider->begin_session();
     if (g_headless_opengl) g_video_renderer = 1;
     if (net_cfg.enabled && !psx_mod_netplay_renderer_allowed(g_video_renderer)) {
         std::fprintf(stderr, "psxrecomp: this title's netplay profile requires OpenGL "

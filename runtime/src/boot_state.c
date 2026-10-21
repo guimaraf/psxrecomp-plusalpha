@@ -1,4 +1,5 @@
 #include "boot_state.h"
+#include "host_nameplates.h"
 #include "execution_profile.h"
 #include "fntrace.h"
 #include "mod_memory.h"
@@ -417,7 +418,8 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = BOOT_STATE_IMPLEMENTATION_KEY;
     h.section_count = 18 + (cpu ? 1u : 0u) + (psx_mod_memory_snapshot_bytes() ? 1u : 0u) +
-                      (psx_guest_cycle_scale_config() != 1u ? 1u : 0u);
+                      (psx_guest_cycle_scale_config() != 1u ? 1u : 0u) +
+                      (g_psx_nameplate_provider && g_psx_nameplate_provider->save_state ? 1u : 0u);
 
     /* Publish deferred cycle charges before ANY section: IRQ (cycles since
      * VBlank) and the root counters were written before the old flush point
@@ -442,6 +444,11 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (ok) ok = write_cpu_section(o, cpu);
     if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        memory_get_ram_bytes());
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
+    if (ok && g_psx_nameplate_provider && g_psx_nameplate_provider->save_state) {
+        uint8_t state[16];
+        g_psx_nameplate_provider->save_state(state);
+        ok = write_section(o, BS_SEC_NAMEPLATES, state, sizeof state);
+    }
     if (ok && psx_mod_memory_snapshot_bytes())
         ok = write_module_section(o, BS_SEC_MODMEM, psx_mod_memory_snapshot_bytes,
                                   psx_mod_memory_snapshot_write);
@@ -628,6 +635,10 @@ int boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
 static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
                          CPUState* cpu, uint32_t entry_pc) {
     switch (tag) {
+    case BS_SEC_NAMEPLATES:
+        if (g_psx_nameplate_provider && g_psx_nameplate_provider->load_state)
+            g_psx_nameplate_provider->load_state(p);
+        return 1;
     case BS_SEC_CPU: {
         PstR r;
         if (len != CPU_REGS_WIRE_BYTES) return 0;
@@ -852,6 +863,10 @@ typedef struct {
 
 static int validate_section(uint32_t tag, const uint8_t* p, uint32_t len) {
     switch (tag) {
+    case BS_SEC_NAMEPLATES:
+        return len == 16u && (!g_psx_nameplate_provider ||
+            !g_psx_nameplate_provider->validate_state ||
+            g_psx_nameplate_provider->validate_state(p, len));
     case BS_SEC_CPU:    return len == CPU_REGS_WIRE_BYTES;
     case BS_SEC_RAM:    return len == memory_get_ram_bytes();
     case BS_SEC_SPAD:   return len == SPAD_SIZE;
@@ -1097,7 +1112,7 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
         }
         s->tag = tag;
         if (!validate_section(tag, s->p, s->len)) { ok = 0; break; }
-        if (tag == BS_SEC_GAME_START && (seen & (1u << tag))) {
+        if ((tag == BS_SEC_GAME_START || tag == BS_SEC_NAMEPLATES) && (seen & (1u << tag))) {
             ok = 0; break;
         }
         if (tag < 32) seen |= (1u << tag);
@@ -1129,6 +1144,12 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     free(sections);
     if (!ok)
         return 0;
+
+    /* Legacy snapshots lack the optional HUD section. Consume any already
+     * completed guest result while clearing the session's external score. */
+    if (!(seen & (1u << BS_SEC_NAMEPLATES)) && g_psx_nameplate_provider &&
+        g_psx_nameplate_provider->reset_score)
+        g_psx_nameplate_provider->reset_score();
 
     /* RAM was memcpy'd; force overlay revalidation before resume. */
     overlay_watch_invalidate_after_ram_restore();

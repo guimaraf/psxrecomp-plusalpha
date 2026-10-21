@@ -3,6 +3,7 @@
 #include "boot_state.c"
 #include "fntrace.c"
 #include <assert.h>
+const PsxHostNameplateProvider *g_psx_nameplate_provider;
 
 static uint8_t ram[2*1024*1024], spad[1024], spuram[512*1024];
 static uint16_t vram[1024*512];
@@ -55,6 +56,18 @@ void gr_vram_transfer_in(int x,int y,int w,int h,const uint16_t* p){(void)x;(voi
 void gr_vram_transfer_out(int x,int y,int w,int h,uint16_t* p){(void)x;(void)y;memcpy(p,vram,(size_t)w*h*2);}
 
 static void u32(uint8_t* p,uint32_t n){PstW w;pst_w_init(&w,p,4);assert(pst_w_u32(&w,n));}
+static uint8_t hud_state[16] = {1};
+static int hud_resets;
+static void hud_save(uint8_t out[16]) { memcpy(out,hud_state,16); }
+static int hud_validate(const uint8_t* p,uint32_t n) {
+    return n==16 && p[0]==1 && p[12]<=1;
+}
+static void hud_load(const uint8_t* p) { memcpy(hud_state,p,16); }
+static void hud_reset(void) { ++hud_resets; memset(hud_state,0,16); hud_state[0]=1; }
+static const PsxHostNameplateProvider hud_provider = {
+    .reset_score=hud_reset, .save_state=hud_save,
+    .validate_state=hud_validate, .load_state=hud_load
+};
 int main(void) {
     CPUState cpu={0};
     fntrace_set_game_range(0x801b0000,0);
@@ -99,6 +112,32 @@ int main(void) {
         assert(cpu.pc==0xdeadbeef && ram[0x100]==0x55 && fntrace_is_game_started()==!started);
         free(duplicate); free(saved);
     }
-    puts("snapshot handoff: cold/warm, BIOS/game, compressed/raw and atomic rejection passed");
+    /* A legacy state remains loadable and clears optional external scores. */
+    uint8_t* legacy=NULL; size_t legacy_len=0;
+    assert(boot_state_save_buffer_raw(&cpu,123,0x801b0000,&legacy,&legacy_len));
+    g_psx_nameplate_provider=&hud_provider;
+    hud_state[4]=3; hud_state[8]=2; hud_state[12]=1;
+    uint8_t* scored=NULL; size_t scored_len=0;
+    assert(boot_state_save_buffer_raw(&cpu,123,0x801b0000,&scored,&scored_len));
+    hud_reset();
+    assert(boot_state_load_buffer(scored,scored_len,123,0x801b0000,&cpu));
+    assert(hud_state[4]==3 && hud_state[8]==2 && hud_state[12]==1);
+    /* Corrupt the optional section: rejection must precede all mutation. */
+    size_t at=BOOT_STATE_HEADER_WIRE_BYTES; int found=0;
+    while (at+16<=scored_len) {
+        PstR r; uint32_t tag,pad; uint64_t bytes;
+        pst_r_init(&r,scored+at,16);
+        assert(pst_r_u32(&r,&tag) && pst_r_u32(&r,&pad) && pst_r_u64(&r,&bytes));
+        if (tag==BS_SEC_NAMEPLATES) { scored[at+16]=99; found=1; break; }
+        at+=16+(size_t)bytes;
+    }
+    assert(found); ram[0x100]=0x55; hud_state[4]=7;
+    assert(!boot_state_load_buffer(scored,scored_len,123,0x801b0000,&cpu));
+    assert(ram[0x100]==0x55 && hud_state[4]==7);
+    int resets_before=hud_resets;
+    assert(boot_state_load_buffer(legacy,legacy_len,123,0x801b0000,&cpu));
+    assert(hud_resets==resets_before+1 && hud_state[4]==0 && hud_state[8]==0);
+    free(legacy); free(scored);
+    puts("snapshot handoff and optional HUD state: restore/legacy/atomic rejection passed");
     return 0;
 }

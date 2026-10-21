@@ -6,6 +6,8 @@
  * built with -ffunction-sections/--gc-sections like mod_memory_snapshot_test)
  * drops whatever the test never reaches. */
 #include "cpu_state.h"
+#include "host_nameplates.h"
+const PsxHostNameplateProvider *g_psx_nameplate_provider;
 
 #include <stdint.h>
 #include <string.h>
