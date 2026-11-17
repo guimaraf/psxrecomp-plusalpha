@@ -16682,6 +16682,8 @@ namespace {
         gi->memcard_inspect = ae_memcard_inspect;
         gi->mods = PSXRecompV4::mod_runtime_launcher_provider();
         gi->bios_verify = ae_bios_verify;
+        /* Required retail BIOS: use the launcher's named-file flow. */
+        if (!s_openbios_allowed) gi->bios_name = "SCPH1001.BIN";
         /* Launcher window icon: the SAME file psx_apply_window_icon() puts on
          * the game window (assets/psxrecomp.png beside the exe, which
          * runtime.cmake stages from APP_ICON's directory). Resolved through
