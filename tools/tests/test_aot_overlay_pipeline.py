@@ -665,6 +665,8 @@ class AotMethodsTest(unittest.TestCase):
     def test_packaged_config_uses_source_project_and_propagates_compile_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / 'source/bios').mkdir(parents=True)
+            (root / 'source/bios/SCPH1001.toml').write_text('')
             failure = pipeline.subprocess.CalledProcessError(2, 'compiler')
             with mock.patch.object(pipeline.subprocess, 'run', side_effect=failure) as run:
                 with self.assertRaises(pipeline.subprocess.CalledProcessError):
@@ -966,6 +968,32 @@ class StaticGenerationTest(unittest.TestCase):
                              ('generated/other.c', 'overlays_static.c'), ('', 'path'), (3, 'path')]:
             with self.subTest(value=value), self.assertRaisesRegex(pipeline.ProfileError, error):
                 pipeline.static_output(dict(static_output=value), root)
+
+    def test_recompiler_project_root_falls_back_to_framework_without_bios_profile(self):
+        self.assertEqual(pipeline.recompiler_project_root(self.root), pipeline.FRAMEWORK)
+        (self.root / 'bios').mkdir()
+        (self.root / 'bios' / 'SCPH1001.toml').write_text('')
+        self.assertEqual(pipeline.recompiler_project_root(self.root), self.root)
+        self.assertEqual(pipeline.recompiler_project_root(None), pipeline.FRAMEWORK)
+
+    def test_build_static_passes_a_root_that_has_the_bios_profile(self):
+        inventory = dict(jobs=[])
+        commands = []
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return mock.Mock(returncode=0)
+        for with_bios in (False, True):
+            if with_bios:
+                (self.root / 'bios').mkdir()
+                (self.root / 'bios' / 'SCPH1001.toml').write_text('')
+            work = self.root / f'work{with_bios}'
+            work.mkdir()
+            with mock.patch.object(pipeline.subprocess, 'run', side_effect=fake_run):
+                pipeline.build_static(inventory, self.root / 'game.toml', Path('rec.exe'), work,
+                                      None, 'gcc', 1, self.root)
+            command = commands[-1]
+            expected = self.root if with_bios else pipeline.FRAMEWORK
+            self.assertEqual(Path(command[command.index('--project-root') + 1]), expected)
 
     def test_disc_mismatch_is_not_applicable_and_names_both_digests(self):
         disc = mock.Mock(binary=self.track)

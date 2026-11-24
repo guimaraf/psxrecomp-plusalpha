@@ -780,6 +780,18 @@ def audit(game_toml, recompiler, cache, inventory, output, static_dispatch=None,
     return json.loads(output.read_text())
 
 
+def recompiler_project_root(project_root):
+    """Root a psxrecomp-game shard run resolves ``bios/<profile>.toml`` against.
+
+    The title's own directory when it carries the BIOS profile, otherwise the
+    framework (a title that vendors no BIOS profile). Returning the title
+    directory unconditionally made every shard die with "no BIOS profile found".
+    """
+    if project_root is not None and (Path(project_root) / 'bios' / 'SCPH1001.toml').is_file():
+        return Path(project_root)
+    return FRAMEWORK
+
+
 def build(inventory, game_toml, recompiler, work, gcc, workers, project_root=None, cps=False, flavor=0):
     """Independent recipe builds cannot nominate entries in sibling images."""
     cache = work / 'cache'
@@ -790,7 +802,7 @@ def build(inventory, game_toml, recompiler, work, gcc, workers, project_root=Non
         target.mkdir(parents=True)
         command = [sys.executable, str(FRAMEWORK / 'tools/compile_overlays.py'),
                    '--captures', job['input'], '--game-toml', str(game_toml),
-                   '--project-root', str(project_root or game_toml.parent), '--recompiler', str(recompiler),
+                   '--project-root', str(recompiler_project_root(project_root or game_toml.parent)), '--recompiler', str(recompiler),
                    '--runtime-include', str(FRAMEWORK / 'runtime/include'),
                    '--out-dir', str(target / 'cache'), '--compiler', 'gcc', '--gcc', gcc,
                    '--flavor', str(flavor), '--jobs', '1'] + (['--cps'] if cps else [])
@@ -844,7 +856,7 @@ def build_static(inventory, game_toml, recompiler, work, out_dir, gcc, workers, 
     build_dir = work / 'static'
     command = [sys.executable, str(FRAMEWORK / 'tools/compile_overlays.py'), '--static',
                '--captures', str(captures), '--game-toml', str(game_toml),
-               '--project-root', str(project_root or game_toml.parent), '--recompiler', str(recompiler),
+               '--project-root', str(recompiler_project_root(project_root or game_toml.parent)), '--recompiler', str(recompiler),
                '--runtime-include', str(FRAMEWORK / 'runtime/include'),
                '--out-dir', str(build_dir), '--gcc', gcc, '--jobs', str(workers)] +               (['--cps'] if cps else [])
     with (work / 'static-compile.log').open('w') as log:
