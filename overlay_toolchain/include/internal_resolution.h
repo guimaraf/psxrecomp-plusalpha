@@ -112,6 +112,54 @@ static inline int psx_resolve_internal_scale(int value, int ref_lines,
     return s < 1 ? 1 : s;
 }
 
+/* ---- Supersample ([video] supersample, PSX_SUPERSAMPLE) ----------------------
+ * A factor on the TARGET of a line-count preset or Match display, in
+ * thousandths (1000 = 1.0, the historical behaviour; range 1000..4000). The
+ * renderer already area-resolves an internal image taller than the output, so
+ * asking for 2x the display's lines is ordered-grid SSAA of the whole frame:
+ * Match display at 1080 px with 2.0 renders 2160 lines (S = 9) and resolves
+ * to 1080. Native and the legacy integer factor are left alone. Dynamic
+ * resolution takes the result as its ceiling and steps under it as usual. */
+#define PSX_SS_MILLI_MIN 1000
+#define PSX_SS_MILLI_MAX 4000
+
+static inline int psx_ss_milli_clamp(int m) {
+    return m < PSX_SS_MILLI_MIN ? PSX_SS_MILLI_MIN
+         : m > PSX_SS_MILLI_MAX ? PSX_SS_MILLI_MAX : m;
+}
+
+/* "1.5", "2", "2x" -> 1500, 2000, 2000. 0 for anything else. */
+static inline int psx_ss_parse_milli(const char *s) {
+    if (!s || !*s) return 0;
+    long whole = 0, frac = 0, div = 1;
+    const char *p = s;
+    while (*p >= '0' && *p <= '9') { whole = whole * 10 + (*p - '0'); p++; if (whole > 100) return 0; }
+    if (p == s) return 0;
+    if (*p == '.') { p++; while (*p >= '0' && *p <= '9') { if (div < 1000) { frac = frac * 10 + (*p - '0'); div *= 10; } p++; } }
+    if (*p == 'x' || *p == 'X') p++;
+    if (*p) return 0;
+    long m = whole * 1000 + frac * (1000 / div);
+    if (m < PSX_SS_MILLI_MIN || m > PSX_SS_MILLI_MAX) return 0;
+    return (int)m;
+}
+
+/* psx_resolve_internal_scale with the supersample factor on the target. */
+static inline int psx_resolve_internal_scale_ss(int value, int ref_lines,
+                                                int display_px_h, int s_max,
+                                                int ss_milli) {
+    ss_milli = psx_ss_milli_clamp(ss_milli);
+    if (ss_milli != PSX_SS_MILLI_MIN) {
+        if (value == PSX_IR_DISPLAY) {
+            if (display_px_h > 0)
+                display_px_h = (int)(((long long)display_px_h * ss_milli + 999) / 1000);
+        } else if (value >= PSX_IR_MIN_LINES) {
+            long long t = ((long long)value * ss_milli + 999) / 1000;
+            value = t > 4LL * PSX_IR_MAX_LINES ? 4 * PSX_IR_MAX_LINES : (int)t;
+        }
+    }
+    return psx_resolve_internal_scale(value, ref_lines, display_px_h, s_max);
+}
+
 /* A legacy [video] supersampling factor as a value the launcher can show:
  * the preset that resolves to the same scale (1 -> Native, 3 -> 720p,
  * 5 -> 1080p, 6 -> 1440p, 9 -> 4K, 12 -> 5K, 18 -> 8K at 240 lines),
@@ -192,4 +240,18 @@ static inline PsxIrAdopted psx_ir_adopt_launcher(int has_row, int preset,
         a.save_ir = a.preset;
     }
     return a;
+}
+
+/* ---- Dynamic resolution floor ([video] dynamic_resolution_min) -------------
+ * A preset or line count resolves as usual. "display" (PSX_IR_DISPLAY) is the
+ * output's own lines: the selected internal resolution WITHOUT the supersample
+ * factor (Match display = the monitor's pixel height). With supersample > 1
+ * the controller then trades only supersampling and never drops below the
+ * output. Clamped to [1, ceiling]. */
+static inline int psx_dynres_floor_scale(int min_value, int selected_ir, int ref_lines,
+                                         int display_px_h, int ceiling) {
+    const int v = (min_value == PSX_IR_DISPLAY && selected_ir != PSX_IR_UNSET)
+                  ? selected_ir : min_value;
+    int s = psx_resolve_internal_scale(v, ref_lines, display_px_h, ceiling);
+    return s > ceiling ? ceiling : s;
 }

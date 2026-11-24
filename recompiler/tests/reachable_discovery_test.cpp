@@ -348,6 +348,70 @@ int main() {
     CHECK(indirect_alias_hosted,
           "resolved indirect call target exports final alias provenance");
 
+    // An unresolved `jr` (here a computed jump no resolver proves) leaves the
+    // words after it unvisited, but the emitter still emits them inside the
+    // function range [start, max(visited)+4). A JAL in such a word must still
+    // make its target a root, even when that target is exactly the range end
+    // (a CPS tail-transfer to a missing entry otherwise).
+    auto dead_jal_image = make_exe_buffer(0x1000);
+    put32(dead_jal_image, text + 0x00, 0x10400005u);  // beq v0,zero,0x18
+    put32(dead_jal_image, text + 0x04, 0x00000000u);
+    put32(dead_jal_image, text + 0x08, 0x00400008u);  // jr v0 (unresolved)
+    put32(dead_jal_image, text + 0x0C, 0x00000000u);
+    put32(dead_jal_image, text + 0x10, jal(kLoad + 0x20)); // unvisited JAL
+    put32(dead_jal_image, text + 0x14, 0x00000000u);
+    put32(dead_jal_image, text + 0x18, 0x03E00008u);  // jr ra: range end 0x20
+    put32(dead_jal_image, text + 0x1C, 0x00000000u);
+    put32(dead_jal_image, text + 0x20, 0x27BDFFE0u);  // addiu sp,sp,-32
+    put32(dead_jal_image, text + 0x24, 0x03E00008u);
+    put32(dead_jal_image, text + 0x28, 0x27BD0020u);
+    auto dead_jal_exe = parse(dead_jal_image);
+    PSXRecomp::FunctionAnalyzer dead_jal_analyzer(dead_jal_exe);
+    const auto dead_jal_result =
+        dead_jal_analyzer.analyze_exact_entries({kLoad});
+    CHECK(starts(dead_jal_result).count(kLoad + 0x20) != 0,
+          "JAL in an emitted-but-unvisited word becomes a root");
+
+    // A JAL in the delay slot of a branch/jump is not a separate call site and
+    // data-shaped words outside the emitted range are never swept.
+    auto dead_slot_image = make_exe_buffer(0x1000);
+    put32(dead_slot_image, text + 0x00, 0x03E00008u);  // jr ra
+    put32(dead_slot_image, text + 0x04, 0x00000000u);
+    put32(dead_slot_image, text + 0x08, jal(kLoad + 0x20)); // past the range
+    put32(dead_slot_image, text + 0x20, 0x27BDFFE0u);
+    auto dead_slot_exe = parse(dead_slot_image);
+    PSXRecomp::FunctionAnalyzer dead_slot_analyzer(dead_slot_exe);
+    CHECK(!starts(dead_slot_analyzer.analyze_exact_entries({kLoad}))
+               .count(kLoad + 0x20),
+          "words past the emitted range are not swept for JALs");
+
+    // Fix B: root A falls through into B (an interior of A) and a third
+    // function C calls B. The call site proving B is reached sits in C, not in
+    // A's visited set; B must still be exported as an alias hosted by A.
+    auto fall_alias_image = make_exe_buffer(0x1000);
+    put32(fall_alias_image, text + 0x00, 0x24420001u);
+    put32(fall_alias_image, text + 0x04, 0x24420001u);
+    put32(fall_alias_image, text + 0x08, 0x24420001u);
+    put32(fall_alias_image, text + 0x0C, 0x24420001u);
+    put32(fall_alias_image, text + 0x10, 0x03E00008u);
+    put32(fall_alias_image, text + 0x14, 0x00000000u);
+    put32(fall_alias_image, text + 0x100, jal(kLoad + 0x10));
+    put32(fall_alias_image, text + 0x104, 0x00000000u);
+    put32(fall_alias_image, text + 0x108, 0x03E00008u);
+    put32(fall_alias_image, text + 0x10C, 0x00000000u);
+    auto fall_alias_exe = parse(fall_alias_image);
+    PSXRecomp::FunctionAnalyzer fall_alias_analyzer(fall_alias_exe);
+    const auto fall_alias_result =
+        fall_alias_analyzer.analyze_exact_entries({kLoad, kLoad + 0x100});
+    bool fall_alias_ok = starts(fall_alias_result).count(kLoad + 0x10) != 0;
+    for (const auto& absorbed : fall_alias_result.absorbed_entries) {
+        fall_alias_ok |= (absorbed.addr == kLoad + 0x10 &&
+                          absorbed.host_start == kLoad &&
+                          absorbed.source_addr == kLoad + 0x100);
+    }
+    CHECK(fall_alias_ok,
+          "call into a fall-through interior from a third function is an entry or alias");
+
     // The ordering can span rounds too: B is found first, then B discovers an
     // earlier A whose reachable body contains B. Once A exists, ownership must
     // be recomputed without retaining B as a stale hard cap.

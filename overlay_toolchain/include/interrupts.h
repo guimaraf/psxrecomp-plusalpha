@@ -14,6 +14,8 @@ struct CPUState;
 void psx_snapshot_host_call_begin(void);
 void psx_snapshot_host_call_end(void);
 void psx_snapshot_host_call_reset(void);
+unsigned psx_snapshot_host_call_depth(void);
+void psx_snapshot_host_call_restore(unsigned depth);
 
 /* IRQ bit positions in I_STAT/I_MASK */
 #define IRQ_VBLANK  0
@@ -107,6 +109,8 @@ uint32_t cycles_to_next_event(void);
 
 /* Query whether we are currently inside an exception handler dispatch. */
 int psx_get_in_exception(void);
+/* Host pacing only: no handler, deferred TCB switch, DMA or frozen pass. */
+int psx_offline_pacer_can_wait(void);
 
 /* Most recent block-leader IRQ-check guest PC / compiled resume latch.
  * Used by the post-savestate freeze probe (vblank-time "where was the game"). */

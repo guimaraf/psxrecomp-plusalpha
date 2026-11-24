@@ -41,9 +41,32 @@ RE_TAIL_CALL = re.compile(r'cpu->pc = 0x([0-9A-Fa-f]+)u?;\s*return;')
 # Game emit uses a switch/case dispatch table:
 #   case 0xADDRu: func_ADDR(cpu); return 1;
 # This is NOT the BIOS strict-translator's `{ 0xADDR, func_ADDR }` array.
+# Current emit: struct rows `{0xADDRu, 0xALIASu, chunk, n, func_X}` (5 fields;
+# older emits had fewer). Both spellings are recognised.
 RE_DISPATCH_TABLE_ENTRY = re.compile(
     r'case\s+0x([0-9A-Fa-f]+)u?\s*:\s*func_[0-9A-Fa-f]+\s*\(cpu\)'
+    r'|\{\s*0x([0-9A-Fa-f]+)u?\s*(?:,\s*[^,{}()]+?){1,4}\s*,\s*func_[0-9A-Fa-f]+\s*\}'
 )
+
+
+def dispatch_table_addrs(dispatch_c: str):
+    """Entry addresses of the dispatch table, for `case` and struct-row emits."""
+    return [a or b for a, b in RE_DISPATCH_TABLE_ENTRY.findall(dispatch_c)]
+
+
+def read_full_sources(full_c: Path):
+    """Concatenate the emitted function sources.
+
+    The emitter writes one `<stem>_full.c`, or shards `<stem>_full_NN.c`
+    (the count varies per run). Both layouts are read; shards in name order.
+    Returns (concatenated text, list of files).
+    """
+    parts = []
+    if full_c.exists():
+        parts.append(full_c)
+    stem = full_c.stem  # <stem>_full
+    parts += sorted(full_c.parent.glob(f"{stem}_[0-9]*{full_c.suffix}"))
+    return "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in parts), parts
 
 # ── Patterns specific to game full-function-emitter ────────────────────
 RE_DIRECT_CALL = re.compile(r'\bfunc_([0-9A-Fa-f]+)\(cpu\);')
@@ -67,14 +90,15 @@ def main():
     print(f"  dispatch_c = {cfg.dispatch_c}")
     print()
 
-    if not cfg.full_c.exists():
-        print(f"ERROR: full_c not found: {cfg.full_c}", file=sys.stderr)
+    full_c, parts = read_full_sources(cfg.full_c)
+    if not parts:
+        print(f"ERROR: full_c not found: {cfg.full_c} (nor shards _full_NN)", file=sys.stderr)
         return 2
+    print(f"  full sources = {len(parts)} file(s)")
     if not cfg.dispatch_c.exists():
         print(f"ERROR: dispatch_c not found: {cfg.dispatch_c}", file=sys.stderr)
         return 2
 
-    full_c = cfg.full_c.read_text(encoding="utf-8", errors="replace")
     dispatch_c = cfg.dispatch_c.read_text(encoding="utf-8", errors="replace")
 
     # ── 1. Direct-call resolution ──────────────────────────────────────
@@ -110,7 +134,7 @@ def main():
 
     cba_lits = RE_CALL_BY_ADDR_LIT.findall(full_c)
     cba_lit_set = set(cfg.normalize_addr(int(t, 16)) for t in cba_lits)
-    table_entries = RE_DISPATCH_TABLE_ENTRY.findall(dispatch_c)
+    table_entries = dispatch_table_addrs(dispatch_c)
     table_set = set(cfg.normalize_addr(int(e, 16)) for e in table_entries)
 
     cba_in_code = {t for t in cba_lit_set if is_in_code(t)}

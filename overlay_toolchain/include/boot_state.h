@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include "cpu_state.h"
 
+/* Title adapters can require support before selecting HLE execution boundaries.
+ * PSX_SAVESTATE_IMPL_TAG is a compile definition on boot_state.c, default zero. */
+#define PSX_BOOT_STATE_IMPL_TAG_VERSION 1
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -66,10 +70,10 @@ typedef struct {
     uint32_t entry_pc;       /* game PS-EXE entry PC                              */
     uint32_t codegen_hash;   /* PSX_OVERLAY_CODEGEN_HASH (auto-gen by cmake)      */
     int32_t  abi_tag;        /* PSX_OVERLAY_ABI_TAG (abi version | flavor<<16)    */
-    uint32_t codegen_ver;    /* PSX_OVERLAY_CODEGEN_VER                           */
+    uint32_t codegen_ver;    /* codegen version XOR build PSX_SAVESTATE_IMPL_TAG  */
     /* ---- layout ---- */
     uint32_t section_count;  /* number of sections that follow                    */
-    uint32_t reserved;       /* v8: enhancement-memory layout cookie; vanilla 0   */
+    uint32_t reserved;       /* enhancement-memory, RAM and execution cookie     */
 } BootStateHeader;
 
 #define BOOT_STATE_HEADER_WIRE_BYTES 36u
@@ -86,6 +90,7 @@ typedef struct {
  * never allowed) -> normal boot + recapture.
  */
 enum {
+    BS_SEC_NAMEPLATES = 0x16, /* optional title HUD state: version/scores/latch */
     BS_SEC_GAME_START = 0x12, /* u32 LE boolean: BIOS-to-game handoff completed */
     BS_SEC_MODMEM = 0x11,  /* allocated opt-in CPU/GPU enhancement arenas */
     BS_SEC_CPU    = 0x01,  /* CPUState: gpr/pc/hi/lo/cop0/gte_data/gte_ctrl       */
@@ -103,6 +108,12 @@ enum {
     BS_SEC_SIO    = 0x0D,  /* SIO regs + pad-config FSM + memcard FSM             */
     BS_SEC_DIRTY  = 0x0E,  /* dirty-RAM page bitmap (guest-written code pages)    */
     BS_SEC_MDEC   = 0x0F,  /* MDEC command/FIFOs/quant/scale (FMV decode resume)  */
+    BS_SEC_SPUCD  = 0x15,  /* SPU CD-input frames queued (u32 n + n*(l,r) s16) */
+    BS_SEC_CPUTIM = 0x14,  /* [timing] in-flight CPU stall state, relative to
+                              the clock: GTE / mul-div cycles left, the load-
+                              delay give-back (read_absorb[33], which, fudge,
+                              ld_which_t, ld_absorb). Absent => anchored at the
+                              restored clock (pre-0x14 behaviour). */
     BS_SEC_GCS    = 0x13,  /* [timing] guest_cycle_scale: carried fraction + gate
                               state (3 u32). Written only when the title's
                               scale is not 1, so faithful states are unchanged;

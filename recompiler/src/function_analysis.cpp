@@ -1612,6 +1612,42 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
                 break;
             }
         }
+        // Closure over the words the emitter will actually emit. A function's
+        // emitted range is [entry, max(visited)+4), but `visited` only holds
+        // what the walk could prove reachable: an unresolved `jr` (switch case
+        // bodies behind a table the resolvers reject) leaves the words after it
+        // unvisited although the emitter still emits them as blocks, each `jal`
+        // becoming a CPS tail-transfer to its target. Without a root for that
+        // target the emitted transfer dangles (codegen_audit_game tail-call
+        // miss). Take the direct-call targets of those emitted-but-unvisited
+        // words as call evidence too. Only a real JAL opcode outside a delay
+        // slot counts, and the target must pass the same callable filter as a
+        // walked JAL; nothing is decoded that the emitter does not already
+        // emit as code, and `visited` itself is untouched.
+        if (!wr.visited.empty()) {
+            uint32_t range_end = std::min(*wr.visited.rbegin() + 4u, hard_cap);
+            for (uint32_t pc = entry; pc < range_end; pc += 4u) {
+                if (wr.visited.count(pc) || !in_function(pc)) continue;
+                auto word_opt = exe_.read_word(pc);
+                if (!word_opt.has_value()) continue;
+                ExactCf cf = exact_classify_cf(pc, *word_opt);
+                if (cf.kind != ExactCfKind::Jal) continue;
+                if (pc >= entry + 4u) {
+                    auto prev = exe_.read_word(pc - 4u);
+                    if (prev.has_value() &&
+                        exact_classify_cf(pc - 4u, *prev).kind !=
+                            ExactCfKind::Normal) {
+                        continue;  // delay slot of the previous transfer
+                    }
+                }
+                if (in_exe(cf.target) &&
+                    callable_direct_jal_target(pc, cf.target)) {
+                    wr.direct_jal_targets.insert(cf.target);
+                    wr.transfer_sources[cf.target].insert(
+                        std::make_pair(pc, false));
+                }
+            }
+        }
         return wr;
     };
 
@@ -1774,9 +1810,24 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
             if (!wr.visited.count(target)) continue;
             auto evidence = derived_evidence.find(target);
             if (evidence == derived_evidence.end()) break;
+            // The call site that proves the target is reached need not sit in
+            // the host: a function entered by calls from elsewhere can also be
+            // a fall-through interior of another root (two roots whose ranges
+            // overlap). Prefer a source inside the host, otherwise accept one
+            // in any final function: every recorded source comes from a walk
+            // of the final partition, so the transfer is analyzer-proven.
+            auto in_final_function = [&](uint32_t pc) {
+                for (const auto& [h, hwr] : final_walks)
+                    if (pc >= h.start_addr && pc < h.end_addr) return true;
+                return false;
+            };
             auto source = std::find_if(
                 evidence->second.begin(), evidence->second.end(),
                 [&](const auto& item) { return wr.visited.count(item.first); });
+            if (source == evidence->second.end())
+                source = std::find_if(
+                    evidence->second.begin(), evidence->second.end(),
+                    [&](const auto& item) { return in_final_function(item.first); });
             if (source == evidence->second.end()) break;
             result.absorbed_entries.push_back(
                 {target, host.start_addr, host.end_addr,
