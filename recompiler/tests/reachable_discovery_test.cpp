@@ -187,10 +187,157 @@ void check_scheduled_switch() {
     }
 }
 
+// Delay-slot scale form (SF EX Plus Alpha):
+//   sltiu v0,v1,3; beq v0,zero,reject; sll v0,v1,2 (delay slot);
+//   lui at,hi; addiu at,at,lo; addu at,at,v0; lw v0,0(at); nop; jr v0
+ApeSwitchFixture make_delay_scale_switch() {
+    auto f = make_ape_switch();
+    const size_t text = 2048;
+    f.jr_pc = kLoad + 0x520u;
+    put32(f.image, text + 0x500, 0x2C620003u); // sltiu v0,v1,3
+    put32(f.image, text + 0x504, 0x1040001Eu); // beq v0,zero,+0x580
+    put32(f.image, text + 0x508, 0x00031080u); // sll v0,v1,2 (delay slot)
+    put32(f.image, text + 0x50C, 0x3C018001u); // lui at,0x8001
+    put32(f.image, text + 0x510, 0x24210A00u); // addiu at,at,0xa00
+    put32(f.image, text + 0x514, 0x00220821u); // addu at,at,v0
+    put32(f.image, text + 0x518, 0x8C220000u); // lw v0,0(at)
+    put32(f.image, text + 0x51C, 0x00000000u);
+    put32(f.image, text + 0x520, 0x00400008u); // jr v0
+    put32(f.image, text + 0x524, 0x00000000u);
+    put32(f.image, text + 0x528, 0x00000000u);
+    put32(f.image, text + 0x52C, 0x00000000u);
+    return f;
+}
+
+bool resolves_delay_scale(const ApeSwitchFixture& f,
+                          PSXRecomp::ExactJumpTable* out = nullptr,
+                          uint32_t producer_hi = kLoad + 0x1000u) {
+    auto exe = parse(f.image);
+    PSXRecomp::ExactJumpTable table;
+    bool ok = PSXRecomp::resolve_exact_bounded_jump_table(
+        exe, f.entry, kLoad + 0x600u, f.jr_pc, 2u, table,
+        nullptr, kLoad, producer_hi);
+    if (out) *out = table;
+    return ok;
+}
+
+void check_delay_scale_switch() {
+    const size_t text = 2048;
+    auto f = make_delay_scale_switch();
+    PSXRecomp::ExactJumpTable table;
+    CHECK(resolves_delay_scale(f, &table) && table.table_base == f.table &&
+              table.table_count == 3u,
+          "delay-slot scale switch resolves exactly");
+    std::set<uint32_t> targets;
+    for (auto target : table.targets) targets.insert(target.second);
+    CHECK(targets == std::set<uint32_t>(f.cases.begin(), f.cases.end()),
+          "delay-slot scale switch has exactly the expected case targets");
+    {
+        auto exe = parse(f.image);
+        PSXRecomp::FunctionAnalyzer analyzer(exe);
+        auto result = analyzer.analyze_exact_entries({f.entry});
+        for (auto target : f.cases)
+            CHECK(result.exact_reachable_pcs.count(target),
+                  "delay-slot scale switch cases are reached from the root");
+    }
+
+    // LUI only, the low half carried by the LW offset (0x80198074 shape).
+    auto lui_only = f;
+    lui_only.jr_pc = kLoad + 0x51Cu;
+    put32(lui_only.image, text + 0x510, 0x00220821u); // addu at,at,v0
+    put32(lui_only.image, text + 0x514, 0x8C220A00u); // lw v0,0xa00(at)
+    put32(lui_only.image, text + 0x518, 0x00000000u);
+    put32(lui_only.image, text + 0x51C, 0x00400008u); // jr v0
+    put32(lui_only.image, text + 0x520, 0x00000000u);
+    CHECK(resolves_delay_scale(lui_only, &table) &&
+              table.table_base == f.table && table.table_count == 3u,
+          "delay-slot scale switch with LUI plus LW offset resolves");
+
+    auto renamed = f;
+    put32(renamed.image, text + 0x50C, 0x3C0A8001u); // lui t2,0x8001
+    put32(renamed.image, text + 0x510, 0x25410A00u); // addiu at,t2,0xa00
+    CHECK(resolves_delay_scale(renamed),
+          "delay-slot scale switch can rename the constant register");
+
+    auto signed_low = f;
+    signed_low.image.resize(text + 0x9000u);
+    put32(signed_low.image, 0x1C, 0x9000u);
+    put32(signed_low.image, text + 0x50C, 0x3C018002u);
+    put32(signed_low.image, text + 0x510, 0x24218A00u);
+    for (size_t i = 0; i < f.cases.size(); ++i)
+        put32(signed_low.image, text + 0x8A00u + 4u * i, f.cases[i]);
+    CHECK(resolves_delay_scale(signed_low, nullptr, kLoad + 0x9000u),
+          "delay-slot scale switch sign-extends ADDIU low half");
+
+    CHECK(!resolves_delay_scale(f, nullptr, kLoad + 0x900u),
+          "delay-slot scale table must belong to the producer");
+
+    auto jump = [](uint32_t offset) {
+        return 0x08000000u | (((kLoad + offset) >> 2) & 0x03FFFFFFu);
+    };
+    struct Mutation { const char* name;
+                      std::vector<std::pair<size_t, uint32_t>> changes; };
+    const std::vector<Mutation> mutations = {
+        {"BEQ tests another register",
+         {{0x504, 0x1100001Eu}}},                  // beq t0,zero
+        {"SLTIU reads another index register",
+         {{0x500, 0x2C820003u}}},                  // sltiu v0,a0,3
+        {"SLTIU writes the index register",
+         {{0x500, 0x2C630003u}, {0x504, 0x1060001Eu}}},
+        {"SLL scales another register",
+         {{0x508, 0x00041080u}}},                  // sll v0,a0,2
+        {"SLL shifts by 3",
+         {{0x508, 0x000310C0u}}},
+        {"BEQ compares two registers",
+         {{0x504, 0x1042001Eu}}},                  // beq v0,v0... rt=v0 rs=v0
+        {"BNE instead of BEQ",
+         {{0x504, 0x1440001Eu}}},
+        {"BEQL instead of BEQ",
+         {{0x504, 0x5040001Eu}}},
+        {"reject lands on the SLL",
+         {{0x504, 0x10400000u}}},                  // target 0x508
+        {"reject lands inside the suffix",
+         {{0x504, 0x10400004u}}},                  // target 0x518
+        {"LUI writes the scaled register",
+         {{0x50C, 0x3C028001u}, {0x510, 0x24420A00u},
+          {0x514, 0x00221021u}, {0x518, 0x8C420000u}}},
+        {"LUI writes the checked index",
+         {{0x50C, 0x3C038001u}, {0x510, 0x24630A00u},
+          {0x514, 0x00621821u}, {0x518, 0x8C620000u}}},
+        {"ADDIU low half from another register",
+         {{0x510, 0x25220A00u}}},                  // addiu at,t1,...
+        {"extra instruction between SLL and LUI",
+         {{0x50C, 0x00000000u}}},
+        {"non-LUI base definition",
+         {{0x50C, 0x24010001u}}},
+        {"later edge skips the bound",
+         {{0x590, jump(0x50C)}, {0x594, 0}}},
+        {"case skips the bound",
+         {{0x540, jump(0x50C)}, {0x544, 0}}},
+        {"case target inside the suffix",
+         {{0xA00, kLoad + 0x50Cu}}},
+        {"case target outside the host",
+         {{0xA04, kLoad + 0x2000u}}},
+        {"JR reads the old load value (no NOP)",
+         {{0x51C, 0x00400008u}}},                  // jr in the load delay slot
+    };
+    for (const auto& mutation : mutations) {
+        auto broken = f;
+        if (std::string(mutation.name) == "JR reads the old load value (no NOP)")
+            broken.jr_pc = kLoad + 0x51Cu;
+        for (auto change : mutation.changes)
+            put32(broken.image, text + change.first, change.second);
+        std::string message = std::string("unsafe delay-slot scale mutation ") +
+                              "fails closed: " + mutation.name;
+        CHECK(!resolves_delay_scale(broken), message.c_str());
+    }
+}
+
 } // namespace
 
 int main() {
     check_scheduled_switch();
+    check_delay_scale_switch();
     auto image = make_exe_buffer(0x2000);
     const size_t text = 2048;
 

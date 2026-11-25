@@ -310,6 +310,98 @@ def check_scheduled_jump_table_discovery():
         assert resolve(broken) == set(), name
 
 
+def check_delay_scale_jump_table_discovery():
+    # Independent synthetic function in the delay-slot scale form: the SLL is
+    # the bounds BEQ's delay slot and the table base is built after it.
+    data = bytearray(0x1000)
+    for offset, word in (
+        (0x500, 0x2C620003),  # sltiu v0,v1,3
+        (0x504, 0x1040001E),  # beq v0,zero,+0x580
+        (0x508, 0x00031080),  # sll v0,v1,2 (guard delay slot)
+        (0x50C, 0x3C018001),  # lui at,0x8001
+        (0x510, 0x24210A00),  # addiu at,at,0xa00
+        (0x514, 0x00220821),  # addu at,at,v0
+        (0x518, 0x8C220000),  # lw v0,0(at)
+        (0x520, 0x00400008),  # jr v0
+        (0x580, 0x03E00008),
+    ):
+        put(data, offset, word)
+    cases = {LOAD + off for off in (0x540, 0x550, 0x560)}
+    for i, target in enumerate(sorted(cases)):
+        put(data, 0xA00 + i * 4, target)
+        put(data, target - LOAD, 0x24020001 + i)
+        put(data, target - LOAD + 4, 0x03E00008)
+
+    def resolve(image, producer=None, jr_pc=LOAD + 0x520):
+        return MOD._find_jump_table_targets(
+            bytes(image), LOAD, len(image), LOAD + 0x500, LOAD + 0x600,
+            jr_pc, 2, producer)
+
+    assert resolve(data) == cases
+    walk = MOD._walk_overlay_function(
+        bytes(data), LOAD, len(data), LOAD + 0x500, LOAD + 0x600)
+    assert walk['jump_table_targets'] == cases
+    assert cases <= walk['visited']
+
+    # LUI only, the low half carried by the LW offset.
+    lui_only = bytearray(data)
+    put(lui_only, 0x510, 0x00220821)  # addu at,at,v0
+    put(lui_only, 0x514, 0x8C220A00)  # lw v0,0xa00(at)
+    put(lui_only, 0x518, 0x00000000)
+    put(lui_only, 0x51C, 0x00400008)  # jr v0
+    put(lui_only, 0x520, 0x00000000)
+    assert resolve(lui_only, jr_pc=LOAD + 0x51C) == cases
+
+    renamed = bytearray(data)
+    put(renamed, 0x50C, 0x3C0A8001)  # lui t2,0x8001
+    put(renamed, 0x510, 0x25410A00)  # addiu at,t2,0xa00
+    assert resolve(renamed) == cases
+    signed_low = bytearray(0x9000)
+    signed_low[:len(data)] = data
+    signed_low[0x8A00:0x8A0C] = data[0xA00:0xA0C]
+    put(signed_low, 0x50C, 0x3C018002)
+    put(signed_low, 0x510, 0x24218A00)
+    assert resolve(signed_low) == cases
+    assert resolve(data, (LOAD, LOAD + 0x900)) == set()
+
+    def jump(offset):
+        return 0x08000000 | (((LOAD + offset) >> 2) & 0x03FFFFFF)
+
+    for name, mutations in (
+        ('beq tests another register', ((0x504, 0x1100001E),)),
+        ('sltiu reads another register', ((0x500, 0x2C820003),)),
+        ('bound overwrites index',
+         ((0x500, 0x2C630003), (0x504, 0x1060001E))),
+        ('sll scales another register', ((0x508, 0x00041080),)),
+        ('sll shifts by 3', ((0x508, 0x000310C0),)),
+        ('bne instead of beq', ((0x504, 0x1440001E),)),
+        ('branch likely', ((0x504, 0x5040001E),)),
+        ('reject into sll', ((0x504, 0x10400000),)),
+        ('reject into suffix', ((0x504, 0x10400004),)),
+        ('LUI overwrites scaled register',
+         ((0x50C, 0x3C028001), (0x510, 0x24420A00),
+          (0x514, 0x00221021), (0x518, 0x8C420000))),
+        ('LUI overwrites index',
+         ((0x50C, 0x3C038001), (0x510, 0x24630A00),
+          (0x514, 0x00621821), (0x518, 0x8C620000))),
+        ('wrong constant source', ((0x510, 0x25220A00),)),
+        ('non-LUI base', ((0x50C, 0x24010001),)),
+        ('gap between sll and lui', ((0x50C, 0x00000000),)),
+        ('skip bound from after', ((0x590, jump(0x50C)),)),
+        ('case skips bound', ((0x540, jump(0x50C)), (0x544, 0))),
+        ('table case skips bound', ((0xA00, LOAD + 0x50C),)),
+        ('out of host target', ((0xA04, LOAD + 0x700),)),
+    ):
+        broken = bytearray(data)
+        for offset, word in mutations:
+            put(broken, offset, word)
+        assert resolve(broken) == set(), name
+    # JR directly after the LW would read the old register (load delay).
+    no_load_delay = bytearray(data)
+    put(no_load_delay, 0x51C, 0x00400008)
+    assert resolve(no_load_delay, jr_pc=LOAD + 0x51C) == set()
+
+
 def check_composite_call_boundaries():
     data = bytearray(0x100)
     cross_target = LOAD + 0x50
@@ -3932,6 +4024,7 @@ def main():
     check_composite_call_boundaries()
     check_bounded_jump_table_discovery()
     check_scheduled_jump_table_discovery()
+    check_delay_scale_jump_table_discovery()
     check_static_discovery_provenance()
     check_static_dispatch_provenance()
     check_owned_direct_call_is_interior()

@@ -1165,6 +1165,11 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     That exact pair may not overwrite the checked index, and direct edges
     may not bypass the bound (including edges from switch cases).
 
+    Also accept the delay-slot scale form ``sltiu; beq; sll; lui [; addiu];
+    addu; lw; nop; jr``: the SLL executes in the guard's delay slot and the
+    table base is built after it. The LUI/ADDIU may not overwrite the checked
+    index or the scaled register, and edges may not bypass the bound.
+
     ``table_base`` must be a nearest-definition LUI, optionally followed by a
     nearest-definition ADDIU.  The lower instruction may rename the
     register (``lui v0; addiu s0,v0,lo``), as used by Ape Escape.  Any other
@@ -1207,7 +1212,22 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     addu_inputs = ((addu_word >> 21) & 0x1F,
                    (addu_word >> 16) & 0x1F)
 
+    def _is_scale_sll(word):
+        return (word is not None and (word >> 26) == 0 and
+                (word & 0x3F) == 0 and ((word >> 21) & 0x1F) == 0 and
+                ((word >> 6) & 0x1F) == 2 and ((word >> 16) & 0x1F) != 0 and
+                ((word >> 11) & 0x1F) != 0)
+
     sll_pc = addu_pc - 4
+    delay_scale = False
+    if not _is_scale_sll(_word_at(data, load_addr, sll_pc)):
+        for words in (2, 3):
+            if addu_pc < entry + (words + 2) * 4:
+                break
+            if _is_scale_sll(_word_at(data, load_addr, addu_pc - words * 4)):
+                sll_pc = addu_pc - words * 4
+                delay_scale = True
+                break
     sll_word = _word_at(data, load_addr, sll_pc)
     if sll_word is None or ((sll_word >> 26) & 0x3F) != 0 \
             or (sll_word & 0x3F) != 0 \
@@ -1225,7 +1245,21 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     # The bound must guard this exact index on the sole fallthrough into SLL.
     sltiu_pc = sll_pc - 12
     branch_pc = sll_pc - 8
-    scheduled_base = _word_at(data, load_addr, sll_pc - 4) != 0
+    scheduled_base = (not delay_scale and
+                      _word_at(data, load_addr, sll_pc - 4) != 0)
+    if delay_scale:
+        # R3000 load delay: JR must not consume the immediately preceding LW.
+        if lw_pc != jr_pc - 8:
+            return set()
+        sltiu_pc = sll_pc - 8
+        branch_pc = sll_pc - 4
+        upper = _word_at(data, load_addr, sll_pc + 4)
+        if (upper is None or (upper >> 26) != 0x0F or
+                ((upper >> 21) & 31) != 0 or ((upper >> 16) & 31) == 0 or
+                index_reg in (table_reg, (upper >> 16) & 31) or
+                scaled_reg == (upper >> 16) & 31):
+            return set()
+    guarded_base = scheduled_base or delay_scale
     if scheduled_base:
         # R3000 load delay: JR must not consume the immediately preceding LW.
         if lw_pc != jr_pc - 8:
@@ -1262,7 +1296,7 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     reject_target = _branch_target(branch_pc, branch_word)
     if (not (entry <= reject_target < hard_cap) or
             sll_pc <= reject_target < jr_pc + 8 or
-            (scheduled_base and sltiu_pc < reject_target < jr_pc + 8)):
+            (guarded_base and sltiu_pc < reject_target < jr_pc + 8)):
         return set()
 
     def nearest_writer(reg: int, before: int):
@@ -1304,10 +1338,26 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     if scheduled_base and (constant_pc != branch_pc + 4 or
                            table_def_pc != sll_pc - 4):
         return set()
+    if delay_scale:
+        # Exactly LUI right after the SLL, optionally completed by an ADDIU
+        # that immediately precedes the ADDU.
+        if constant_pc != sll_pc + 4:
+            return set()
+        if table_def_pc != constant_pc and (table_def_pc != sll_pc + 8 or
+                                            addu_pc != sll_pc + 12):
+            return set()
+        if table_def_pc == constant_pc and addu_pc != sll_pc + 8:
+            return set()
+        for pc in range(sll_pc + 4, addu_pc, 4):
+            if _instruction_writes_gpr(_word_at(data, load_addr, pc),
+                                       scaled_reg):
+                return set()
 
     # Calls could clobber the proven constant.  Other branches could enter the
     # suffix through an unproved path.  The one exact bounds branch is allowed.
-    for pc in range(constant_pc + 4, sll_pc, 4):
+    control_lo = branch_pc + 4 if delay_scale else constant_pc + 4
+    control_hi = addu_pc if delay_scale else sll_pc
+    for pc in range(control_lo, control_hi, 4):
         word = _word_at(data, load_addr, pc)
         if word is None:
             return set()
@@ -1328,7 +1378,7 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
         target = _word_at(data, load_addr, table_base + index * 4)
         if (target is None or (target & 3) or
                 not (entry <= target < hard_cap) or
-                (scheduled_base and sltiu_pc < target < jr_pc + 8) or
+                (guarded_base and sltiu_pc < target < jr_pc + 8) or
                 not (range_lo <= target < range_hi) or
                 not _is_valid_mips_word(_word_at(data, load_addr, target))):
             return set()
@@ -1370,7 +1420,7 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
         elif kind in ('jr', 'jr_ra'):
             case_reachable.add(delay)
 
-    protected_pc = sltiu_pc if scheduled_base else constant_pc
+    protected_pc = sltiu_pc if guarded_base else constant_pc
     for source in range(entry, hard_cap, 4):
         source_word = _word_at(data, load_addr, source)
         if source_word is None:
@@ -1379,7 +1429,7 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
         if (kind in ('branch', 'j', 'jal') and
                 protected_pc < target <= jr_pc and
                 not (protected_pc <= source <= jr_pc) and
-                (scheduled_base or source not in case_reachable)):
+                (guarded_base or source not in case_reachable)):
             return set()
     if proof_out is not None:
         proof_out.append({
