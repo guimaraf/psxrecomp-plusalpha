@@ -44,7 +44,7 @@ assert "psx_lobby_set_last_error(g_netplay_exit_reason_text);" in MAIN, "the sof
 runs = [m.start() for m in re.finditer(r"(?m)^\s*psx_scheduler_run\(&cpu\);", MAIN)]
 assert len(runs) == 1, "expected one scheduler entry"
 assert re.search(
-    r"if \(psx_return_to_lobby_requested\(\) && g_netplay_from_lobby\)\s*goto soft_return_lobby;\s*$",
+    r"if \(psx_return_to_lobby_requested\(\) && g_netplay_from_lobby\)\s*goto soft_return_lobby;\s*(?:freeze_heartbeat_set_paused\(0\);\s*)?$",
     MAIN[runs[0] - 260 : runs[0]],
 ), "a failed launcher start would boot the game offline: no return to the lobby before the scheduler"
 
