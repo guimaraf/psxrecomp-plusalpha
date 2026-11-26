@@ -333,11 +333,153 @@ void check_delay_scale_switch() {
     }
 }
 
+// Free-delay-slot variant: an unrelated word D sits in the bounds BEQ delay
+// slot and the scale follows it:
+//   sltiu v0,v1,3; beq v0,zero,reject; D; sll v0,v1,2;
+//   lui at,hi; addiu at,at,lo; addu at,at,v0; lw v0,0(at); nop; jr v0
+ApeSwitchFixture make_delay_scale_free_d_switch() {
+    auto f = make_ape_switch();
+    const size_t text = 2048;
+    f.jr_pc = kLoad + 0x524u;
+    put32(f.image, text + 0x500, 0x2C620003u); // sltiu v0,v1,3
+    put32(f.image, text + 0x504, 0x1040001Eu); // beq v0,zero,+0x580
+    put32(f.image, text + 0x508, 0x26300704u); // D: addiu s0,s1,0x704
+    put32(f.image, text + 0x50C, 0x00031080u); // sll v0,v1,2
+    put32(f.image, text + 0x510, 0x3C018001u); // lui at,0x8001
+    put32(f.image, text + 0x514, 0x24210A00u); // addiu at,at,0xa00
+    put32(f.image, text + 0x518, 0x00220821u); // addu at,at,v0
+    put32(f.image, text + 0x51C, 0x8C220000u); // lw v0,0(at)
+    put32(f.image, text + 0x520, 0x00000000u);
+    put32(f.image, text + 0x524, 0x00400008u); // jr v0
+    put32(f.image, text + 0x528, 0x00000000u);
+    put32(f.image, text + 0x52C, 0x00000000u);
+    return f;
+}
+
+void check_delay_scale_free_d_switch() {
+    const size_t text = 2048;
+    auto f = make_delay_scale_free_d_switch();
+    PSXRecomp::ExactJumpTable table;
+    CHECK(resolves_delay_scale(f, &table) && table.table_base == f.table &&
+              table.table_count == 3u,
+          "free-D delay-slot scale switch resolves exactly");
+    std::set<uint32_t> targets;
+    for (auto target : table.targets) targets.insert(target.second);
+    CHECK(targets == std::set<uint32_t>(f.cases.begin(), f.cases.end()),
+          "free-D switch has exactly the expected case targets");
+    {
+        auto exe = parse(f.image);
+        PSXRecomp::FunctionAnalyzer analyzer(exe);
+        auto result = analyzer.analyze_exact_entries({f.entry});
+        for (auto target : f.cases)
+            CHECK(result.exact_reachable_pcs.count(target),
+                  "free-D switch cases are reached from the root");
+    }
+    for (uint32_t d : {0x26300704u, 0x00000000u, 0x36106800u, 0x3C111F80u,
+                       0xAFBF0010u}) {
+        auto variant = f;
+        put32(variant.image, text + 0x508, d);
+        CHECK(resolves_delay_scale(variant, &table) &&
+                  table.table_base == f.table && table.table_count == 3u,
+              "free-D switch accepts allowlisted delay-slot words");
+    }
+
+    auto jump = [](uint32_t offset) {
+        return 0x08000000u | (((kLoad + offset) >> 2) & 0x03FFFFFFu);
+    };
+    struct Mutation { const char* name;
+                      std::vector<std::pair<size_t, uint32_t>> changes; };
+    const std::vector<Mutation> mutations = {
+        {"D writes the index", {{0x508, 0x24630001u}}},
+        {"D writes the table register", {{0x508, 0x24010001u}}},
+        {"D writes the scaled/bound register", {{0x508, 0x34020001u}}},
+        {"D is a branch", {{0x508, 0x10000001u}}},
+        // Non-BEQ control words: the free-D flag is true for these, so they
+        // are refused by the new D checks rather than the legacy BEQ path.
+        {"D is a bne (free-D path)", {{0x508, 0x14400001u}}},
+        {"D is a bgez (REGIMM, free-D path)", {{0x508, 0x04610001u}}},
+        {"case target is D", {{0xA00, kLoad + 0x508u}}},
+        {"case target is the SLL", {{0xA00, kLoad + 0x50Cu}}},
+        {"case target is the base ADDIU", {{0xA04, kLoad + 0x514u}}},
+        {"D is a j", {{0x508, jump(0x580)}}},
+        {"D is a jal", {{0x508, jump(0x580) | 0x04000000u}}},
+        {"D is a load", {{0x508, 0x8FA80000u}}},
+        {"D is a non-sp store", {{0x508, 0xAD280000u}}},
+        {"D is mfc2", {{0x508, 0x48080000u}}},
+        {"D is lwc2", {{0x508, 0xCBA00000u}}},
+        {"D is addi (trap)", {{0x508, 0x21080001u}}},
+        {"D is mult", {{0x508, 0x00430018u}}},
+        {"reject lands on D", {{0x504, 0x10400000u}}},
+        {"reject lands inside the suffix", {{0x504, 0x10400004u}}},
+        {"external edge into D", {{0x590, jump(0x508)}, {0x594, 0}}},
+        {"external edge into the SLL", {{0x590, jump(0x50C)}, {0x594, 0}}},
+        {"table inside the region", {{0x514, 0x24210500u}}},
+        {"LUI writes the scaled register",
+         {{0x510, 0x3C028001u}, {0x514, 0x24420A00u},
+          {0x518, 0x00221021u}, {0x51C, 0x8C420000u}}},
+    };
+    for (const auto& mutation : mutations) {
+        auto broken = f;
+        for (auto change : mutation.changes)
+            put32(broken.image, text + change.first, change.second);
+        std::string message = std::string("unsafe free-D mutation ") +
+                              "fails closed: " + mutation.name;
+        CHECK(!resolves_delay_scale(broken), message.c_str());
+    }
+    // LUI rt distinct from the base register: lui t0,hi; addiu at,t0,lo.
+    // Harmless D is accepted (the form itself resolves); D writing t0 (the
+    // LUI rt) is refused only by the upper_rt check.
+    {
+        auto split = f;
+        put32(split.image, text + 0x510, 0x3C088001u); // lui t0,0x8001
+        put32(split.image, text + 0x514, 0x25010A00u); // addiu at,t0,0xa00
+        CHECK(resolves_delay_scale(split, &table) &&
+                  table.table_base == f.table && table.table_count == 3u,
+              "free-D switch with distinct LUI rt resolves with harmless D");
+        auto bad = split;
+        put32(bad.image, text + 0x508, 0x26280001u); // D: addiu t0,s1,1
+        CHECK(!resolves_delay_scale(bad),
+              "free-D switch fails closed when D writes the LUI rt");
+        auto ori = split;
+        put32(ori.image, text + 0x508, 0x36280001u); // D: ori t0,s1,1
+        CHECK(!resolves_delay_scale(ori),
+              "free-D switch fails closed when D (ori) writes the LUI rt");
+    }
+    // Guard register distinct from the scaled register:
+    //   sltiu t1,v1,3; beq t1,zero,reject; D; sll v0,v1,2; ...
+    {
+        auto guard = f;
+        put32(guard.image, text + 0x500, 0x2C690003u); // sltiu t1,v1,3
+        put32(guard.image, text + 0x504, 0x1120001Eu); // beq t1,zero,+0x580
+        CHECK(resolves_delay_scale(guard, &table) &&
+                  table.table_base == f.table && table.table_count == 3u,
+              "free-D switch with distinct guard register resolves");
+        auto bad = guard;
+        put32(bad.image, text + 0x508, 0x26290001u); // D: addiu t1,s1,1
+        CHECK(!resolves_delay_scale(bad),
+              "free-D switch fails closed when D writes the guard register");
+    }
+    {
+        auto no_nop = f;
+        no_nop.jr_pc = kLoad + 0x520u;
+        put32(no_nop.image, text + 0x520, 0x00400008u);
+        CHECK(!resolves_delay_scale(no_nop),
+              "free-D switch without NOP before JR fails closed");
+    }
+    {
+        auto no_room = f;
+        no_room.entry = kLoad + 0x504u;
+        CHECK(!resolves_delay_scale(no_room),
+              "free-D switch without room before the SLL fails closed");
+    }
+}
+
 } // namespace
 
 int main() {
     check_scheduled_switch();
     check_delay_scale_switch();
+    check_delay_scale_free_d_switch();
     auto image = make_exe_buffer(0x2000);
     const size_t text = 2048;
 

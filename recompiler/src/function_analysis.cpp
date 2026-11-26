@@ -564,6 +564,38 @@ static bool exact_instruction_writes_gpr(uint32_t instr, uint32_t reg) {
     return false;
 }
 
+// Allowlist for the unrelated delay-slot word of a bounds BEQ in the
+// free-delay-slot jump-table form. Only side-effect-free ALU words (no traps,
+// no HI/LO, no COP, no loads, no control flow) and stack stores are accepted.
+static bool exact_is_safe_guard_delay_word(uint32_t instr) {
+    if (instr == 0u) return true;
+    uint32_t opcode = (instr >> 26) & 0x3Fu;
+    uint32_t rs = (instr >> 21) & 0x1Fu;
+    uint32_t funct = instr & 0x3Fu;
+    if (opcode == 0x00u) {
+        switch (funct) {
+        case 0x00u: case 0x02u: case 0x03u:  // sll srl sra
+        case 0x04u: case 0x06u: case 0x07u:  // sllv srlv srav
+        case 0x21u: case 0x23u:              // addu subu
+        case 0x24u: case 0x25u: case 0x26u: case 0x27u: // and or xor nor
+        case 0x2Au: case 0x2Bu:              // slt sltu
+            return true;
+        default:
+            return false;
+        }
+    }
+    switch (opcode) {
+    case 0x09u: case 0x0Au: case 0x0Bu:     // addiu slti sltiu
+    case 0x0Cu: case 0x0Du: case 0x0Eu:     // andi ori xori
+    case 0x0Fu:                             // lui
+        return true;
+    case 0x28u: case 0x29u: case 0x2Bu:     // sb sh sw, $sp-based only
+        return rs == 29u;
+    default:
+        return false;
+    }
+}
+
 // Resolve the common absolute indirect-transfer idiom within one basic block:
 //
 //   lui    rN, hi(target)
@@ -878,7 +910,9 @@ bool resolve_exact_bounded_jump_table(
     };
     // Delay-slot form: sltiu; beq; sll; lui [; addiu]; addu; lw; nop; jr.
     // The SLL lives in the bounds BEQ's delay slot and the table base is built
-    // after it. Only taken when the word before the ADDU is not itself the
+    // after it. A variant (delay_scale_free_d) places the SLL after the BEQ
+    // delay slot: sltiu; beq; D; sll; lui [; addiu]; addu; lw; nop; jr, with D
+    // an unrelated allowlisted word. Only taken when the word before the ADDU is not itself the
     // scale, so the canonical forms are decided exactly as before.
     bool delay_scale = false;
     if (auto adjacent = read(sll_pc);
@@ -892,6 +926,12 @@ bool resolve_exact_bounded_jump_table(
                 delay_scale = true;
             }
         }
+    }
+    bool delay_scale_free_d = false;
+    if (delay_scale && sll_pc >= entry + 4u) {
+        auto before_sll = read(sll_pc - 4u);
+        delay_scale_free_d = before_sll.has_value() &&
+                             ((*before_sll >> 26) & 0x3Fu) != 0x04u;
     }
     auto addu_word = read(addu_pc);
     auto sll_word = read(sll_pc);
@@ -924,9 +964,11 @@ bool resolve_exact_bounded_jump_table(
     // Exact guards: sltiu; beq; nop; sll, sltiu; beq; lui; addiu; sll, or the
     // delay-slot form sltiu; beq; sll; lui [; addiu]; addu.
     // The second schedules the table's LUI in the bounds branch's delay slot;
-    // the third schedules the index scale there.
+    // the third schedules the index scale there; the free-D variant keeps an
+    // unrelated word (D) in that delay slot and scales after it.
     // Keep all forms in parity with the Python capture verifier.
-    if (sll_pc < entry + (delay_scale ? 8u : 12u)) return false;
+    if (sll_pc < entry + ((delay_scale && !delay_scale_free_d) ? 8u : 12u))
+        return false;
     uint32_t guard_pc = sll_pc - 8u;
     uint32_t bound_pc = sll_pc - 12u;
     auto before_scale = read(sll_pc - 4u);
@@ -935,8 +977,10 @@ bool resolve_exact_bounded_jump_table(
     if (delay_scale) {
         // R3000 JR would see the old target register without this load delay.
         if (lw_pc != jr_pc - 8u) return false;
-        guard_pc = sll_pc - 4u;
-        bound_pc = sll_pc - 8u;
+        if (!delay_scale_free_d) {
+            guard_pc = sll_pc - 4u;
+            bound_pc = sll_pc - 8u;
+        }
         // The constant may not clobber the scaled index or the checked index.
         auto upper_word = read(sll_pc + 4u);
         if (!upper_word.has_value()) return false;
@@ -980,6 +1024,27 @@ bool resolve_exact_bounded_jump_table(
     if (guard_op != 0x04u || bound_reg == 0u ||
         (guard_rs != 0u && guard_rt != 0u)) {
         return false;
+    }
+    if (delay_scale_free_d) {
+        // D = sll_pc - 4 is the bounds BEQ delay slot. It must be a plain,
+        // side-effect-free word that touches none of the proven registers.
+        uint32_t d_pc = sll_pc - 4u;
+        auto d_word = read(d_pc);
+        if (!d_word.has_value() || is_control(d_pc, *d_word) ||
+            !exact_is_safe_guard_delay_word(*d_word)) {
+            return false;
+        }
+        auto upper_word = read(sll_pc + 4u);
+        if (!upper_word.has_value()) return false;
+        uint32_t upper_rt = (*upper_word >> 16) & 0x1Fu;
+        uint32_t free_bound_reg = guard_rs == 0u ? guard_rt : guard_rs;
+        if (exact_instruction_writes_gpr(*d_word, index_reg) ||
+            exact_instruction_writes_gpr(*d_word, scaled_reg) ||
+            exact_instruction_writes_gpr(*d_word, base_reg) ||
+            exact_instruction_writes_gpr(*d_word, free_bound_reg) ||
+            exact_instruction_writes_gpr(*d_word, upper_rt)) {
+            return false;
+        }
     }
     uint32_t bound_op = (*bound_word >> 26) & 0x3Fu;
     uint32_t bound_rs = (*bound_word >> 21) & 0x1Fu;

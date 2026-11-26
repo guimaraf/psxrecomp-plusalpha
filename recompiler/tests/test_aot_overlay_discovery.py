@@ -402,6 +402,102 @@ def check_delay_scale_jump_table_discovery():
     assert resolve(no_load_delay, jr_pc=LOAD + 0x51C) == set()
 
 
+def check_delay_scale_free_d_jump_table_discovery():
+    # Free-delay-slot variant: an unrelated word D sits in the bounds BEQ delay
+    # slot and the scale follows it.
+    data = bytearray(0x1000)
+    for offset, word in (
+        (0x500, 0x2C620003),  # sltiu v0,v1,3
+        (0x504, 0x1040001E),  # beq v0,zero,+0x580
+        (0x508, 0x26300704),  # D: addiu s0,s1,0x704
+        (0x50C, 0x00031080),  # sll v0,v1,2
+        (0x510, 0x3C018001),  # lui at,0x8001
+        (0x514, 0x24210A00),  # addiu at,at,0xa00
+        (0x518, 0x00220821),  # addu at,at,v0
+        (0x51C, 0x8C220000),  # lw v0,0(at)
+        (0x524, 0x00400008),  # jr v0
+        (0x580, 0x03E00008),
+    ):
+        put(data, offset, word)
+    cases = {LOAD + off for off in (0x540, 0x550, 0x560)}
+    for i, target in enumerate(sorted(cases)):
+        put(data, 0xA00 + i * 4, target)
+        put(data, target - LOAD, 0x24020001 + i)
+        put(data, target - LOAD + 4, 0x03E00008)
+
+    def resolve(image, producer=None, jr_pc=LOAD + 0x524, entry=LOAD + 0x500):
+        return MOD._find_jump_table_targets(
+            bytes(image), LOAD, len(image), entry, LOAD + 0x600,
+            jr_pc, 2, producer)
+
+    assert resolve(data) == cases
+    walk = MOD._walk_overlay_function(
+        bytes(data), LOAD, len(data), LOAD + 0x500, LOAD + 0x600)
+    assert walk['jump_table_targets'] == cases
+    assert cases <= walk['visited']
+    for d in (0x26300704, 0x00000000, 0x36106800, 0x3C111F80, 0xAFBF0010):
+        variant = bytearray(data)
+        put(variant, 0x508, d)
+        assert resolve(variant) == cases, hex(d)
+    assert resolve(data, (LOAD, LOAD + 0x900)) == set()
+
+    def jump(offset):
+        return 0x08000000 | (((LOAD + offset) >> 2) & 0x03FFFFFF)
+
+    for name, mutations in (
+        ('D writes index', ((0x508, 0x24630001),)),
+        ('D writes table register', ((0x508, 0x24010001),)),
+        ('D writes scaled/bound register', ((0x508, 0x34020001),)),
+        ('D branch', ((0x508, 0x10000001),)),
+        # Non-BEQ control words are refused by the free-D checks.
+        ('D bne', ((0x508, 0x14400001),)),
+        ('D bgez regimm', ((0x508, 0x04610001),)),
+        ('case target is D', ((0xA00, LOAD + 0x508),)),
+        ('case target is sll', ((0xA00, LOAD + 0x50C),)),
+        ('case target is base addiu', ((0xA04, LOAD + 0x514),)),
+        ('D j', ((0x508, jump(0x580)),)),
+        ('D jal', ((0x508, jump(0x580) | 0x04000000),)),
+        ('D load', ((0x508, 0x8FA80000),)),
+        ('D non-sp store', ((0x508, 0xAD280000),)),
+        ('D mfc2', ((0x508, 0x48080000),)),
+        ('D lwc2', ((0x508, 0xCBA00000),)),
+        ('D addi trap', ((0x508, 0x21080001),)),
+        ('D mult', ((0x508, 0x00430018),)),
+        ('reject into D', ((0x504, 0x10400000),)),
+        ('reject into suffix', ((0x504, 0x10400004),)),
+        ('edge into D', ((0x590, jump(0x508)), (0x594, 0))),
+        ('edge into sll', ((0x590, jump(0x50C)), (0x594, 0))),
+        ('table inside region', ((0x514, 0x24210500),)),
+        ('LUI overwrites scaled register',
+         ((0x510, 0x3C028001), (0x514, 0x24420A00),
+          (0x518, 0x00221021), (0x51C, 0x8C420000))),
+    ):
+        broken = bytearray(data)
+        for offset, word in mutations:
+            put(broken, offset, word)
+        assert resolve(broken) == set(), name
+    # LUI rt distinct from the base register: lui t0; addiu at,t0,lo.
+    split = bytearray(data)
+    put(split, 0x510, 0x3C088001)  # lui t0,0x8001
+    put(split, 0x514, 0x25010A00)  # addiu at,t0,0xa00
+    assert resolve(split) == cases  # form accepted with a harmless D
+    for d in (0x26280001, 0x36280001):  # D writes t0 (the LUI rt)
+        bad = bytearray(split)
+        put(bad, 0x508, d)
+        assert resolve(bad) == set(), hex(d)
+    # Guard register distinct from the scaled register.
+    guard = bytearray(data)
+    put(guard, 0x500, 0x2C690003)  # sltiu t1,v1,3
+    put(guard, 0x504, 0x1120001E)  # beq t1,zero,+0x580
+    assert resolve(guard) == cases
+    put(guard, 0x508, 0x26290001)  # D: addiu t1,s1,1
+    assert resolve(guard) == set()
+    no_nop = bytearray(data)
+    put(no_nop, 0x520, 0x00400008)
+    assert resolve(no_nop, jr_pc=LOAD + 0x520) == set()
+    assert resolve(data, entry=LOAD + 0x504) == set()
+
+
 def check_composite_call_boundaries():
     data = bytearray(0x100)
     cross_target = LOAD + 0x50
@@ -4025,6 +4121,7 @@ def main():
     check_bounded_jump_table_discovery()
     check_scheduled_jump_table_discovery()
     check_delay_scale_jump_table_discovery()
+    check_delay_scale_free_d_jump_table_discovery()
     check_static_discovery_provenance()
     check_static_dispatch_provenance()
     check_owned_direct_call_is_interior()

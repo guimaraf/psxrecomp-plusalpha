@@ -1064,6 +1064,29 @@ def _is_control_flow(word) -> bool:
             (op in (0x11, 0x12) and ((word >> 21) & 0x1F) == 0x08))
 
 
+def _is_safe_guard_delay_word(word) -> bool:
+    """Allowlist for the unrelated BEQ delay-slot word of a jump table.
+
+    Only side-effect-free ALU words (no traps, HI/LO, COP, loads or control
+    flow) and ``$sp``-based stores are accepted.
+    """
+    if word is None:
+        return False
+    if word == 0:
+        return True
+    op = (word >> 26) & 0x3F
+    fn = word & 0x3F
+    rs = (word >> 21) & 0x1F
+    if op == 0:
+        return fn in (0x00, 0x02, 0x03, 0x04, 0x06, 0x07, 0x21, 0x23,
+                      0x24, 0x25, 0x26, 0x27, 0x2A, 0x2B)
+    if op in (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F):
+        return True
+    if op in (0x28, 0x29, 0x2B):
+        return rs == 29
+    return False
+
+
 def _is_valid_mips_word(word) -> bool:
     if word is None or word in (0xFFFFFFFF, 0xFFFFFFFD):
         return False
@@ -1167,7 +1190,9 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
 
     Also accept the delay-slot scale form ``sltiu; beq; sll; lui [; addiu];
     addu; lw; nop; jr``: the SLL executes in the guard's delay slot and the
-    table base is built after it. The LUI/ADDIU may not overwrite the checked
+    table base is built after it. A variant keeps an unrelated allowlisted word
+    D in the BEQ delay slot and scales after it (``sltiu; beq; D; sll; lui
+    [; addiu]; addu; lw; nop; jr``). The LUI/ADDIU may not overwrite the checked
     index or the scaled register, and edges may not bypass the bound.
 
     ``table_base`` must be a nearest-definition LUI, optionally followed by a
@@ -1228,6 +1253,11 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
                 sll_pc = addu_pc - words * 4
                 delay_scale = True
                 break
+    delay_scale_free_d = False
+    if delay_scale and sll_pc >= entry + 4:
+        before_sll = _word_at(data, load_addr, sll_pc - 4)
+        delay_scale_free_d = (before_sll is not None and
+                              ((before_sll >> 26) & 0x3F) != 0x04)
     sll_word = _word_at(data, load_addr, sll_pc)
     if sll_word is None or ((sll_word >> 26) & 0x3F) != 0 \
             or (sll_word & 0x3F) != 0 \
@@ -1251,8 +1281,9 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
         # R3000 load delay: JR must not consume the immediately preceding LW.
         if lw_pc != jr_pc - 8:
             return set()
-        sltiu_pc = sll_pc - 8
-        branch_pc = sll_pc - 4
+        if not delay_scale_free_d:
+            sltiu_pc = sll_pc - 8
+            branch_pc = sll_pc - 4
         upper = _word_at(data, load_addr, sll_pc + 4)
         if (upper is None or (upper >> 26) != 0x0F or
                 ((upper >> 21) & 31) != 0 or ((upper >> 16) & 31) == 0 or
@@ -1293,6 +1324,16 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     branch_rt = (branch_word >> 16) & 0x1F
     if {branch_rs, branch_rt} != {0, guard_reg}:
         return set()
+    if delay_scale_free_d:
+        # D (BEQ delay slot) must be plain and touch none of the proven regs.
+        d_word = _word_at(data, load_addr, sll_pc - 4)
+        upper_rt = ((_word_at(data, load_addr, sll_pc + 4) or 0) >> 16) & 31
+        if (d_word is None or _is_control_flow(d_word) or
+                not _is_safe_guard_delay_word(d_word) or
+                any(_instruction_writes_gpr(d_word, reg)
+                    for reg in (index_reg, scaled_reg, table_reg,
+                                guard_reg, upper_rt))):
+            return set()
     reject_target = _branch_target(branch_pc, branch_word)
     if (not (entry <= reject_target < hard_cap) or
             sll_pc <= reject_target < jr_pc + 8 or
