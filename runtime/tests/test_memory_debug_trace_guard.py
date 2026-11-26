@@ -14,7 +14,25 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MEMORY_C = ROOT / "runtime" / "src" / "memory.c"
 TRACE_CALL = "debug_server_trace_write_check"
-DEFAULT_GCC = pathlib.Path(r"C:\msys64\mingw64\bin\gcc.exe")
+def _resolve_default_gcc() -> pathlib.Path:
+    # PSX_MINGW_BIN (convencao de compile_overlays.py) -> caminho fixo antigo.
+    import os
+    mingw = os.environ.get("PSX_MINGW_BIN")
+    if mingw and (pathlib.Path(mingw) / "gcc.exe").exists():
+        return pathlib.Path(mingw) / "gcc.exe"
+    return pathlib.Path(r"C:\msys64\mingw64\bin\gcc.exe")
+
+
+def _gcc_dir_on_path(gcc: str) -> str:
+    # O gcc do MSYS2 so roda (cc1 precisa das DLLs) com o seu bin no PATH.
+    import os
+    gcc_dir = os.path.dirname(gcc)
+    if gcc_dir and gcc_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = gcc_dir + os.pathsep + os.environ.get("PATH", "")
+    return gcc
+
+
+DEFAULT_GCC = _resolve_default_gcc()
 
 HARNESS_COMMON_H = r"""
 #ifndef PSX_MEMORY_TRACE_HARNESS_COMMON_H
@@ -335,11 +353,11 @@ def fail(message: str) -> None:
 
 def default_cc() -> str:
     if DEFAULT_GCC.exists():
-        return str(DEFAULT_GCC).replace("\\", "/")
+        return _gcc_dir_on_path(str(DEFAULT_GCC)).replace("\\", "/")
     for name in ("cc", "gcc", "clang"):
         path = shutil.which(name)
         if path:
-            return path
+            return _gcc_dir_on_path(path)
     return str(DEFAULT_GCC)
 
 

@@ -14,14 +14,20 @@ INCLUDE = ROOT / "runtime" / "include"
 
 
 def find_gcc() -> str:
+    mingw_bin = os.environ.get("PSX_MINGW_BIN")
     candidates = [
         os.environ.get("CC"),
+        str(pathlib.Path(mingw_bin) / "gcc.exe") if mingw_bin else None,
         shutil.which("gcc"),
         shutil.which("cc"),
         r"C:\msys64\mingw64\bin\gcc.exe" if os.name == "nt" else None,
     ]
     for candidate in candidates:
         if candidate and pathlib.Path(candidate).is_file():
+            # gcc do MSYS2 so roda com o seu bin no PATH (cc1 precisa das DLLs).
+            gcc_dir = os.path.dirname(candidate)
+            if gcc_dir and gcc_dir not in os.environ.get("PATH", "").split(os.pathsep):
+                os.environ["PATH"] = gcc_dir + os.pathsep + os.environ.get("PATH", "")
             return candidate
     raise SystemExit("gcc/cc is required for the overlay shim compile test")
 
