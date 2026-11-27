@@ -370,6 +370,12 @@ def positioned_sources(disc, specifications, views=None, ram_bytes=RETAIL_RAM_BY
 def spec_sources(disc, spec):
     sources = []
     method = spec['method']
+    if 'interior_entries_by_file' in spec:
+        require(method == 'fixed_address_files',
+                'interior_entries_by_file is only valid for fixed_address_files')
+        files = {name.upper() for name in spec['files']}
+        for key in spec['interior_entries_by_file']:
+            require(key.upper() in files, f'interior_entries_by_file key has no file in spec: {key}')
     if method == 'counted_relocated_members':
         return counted_relocated_sources(disc, spec)
     if method == 'fixed_address_extents':
@@ -556,6 +562,21 @@ def declared_entries(source, disc):
     return entries
 
 
+def interior_entries(source):
+    """Per-file dispatch-only entries (e.g. shared epilogues a sibling function
+    reaches with `j`). They name interior addresses of one file's image: they are
+    never walk roots, so they cannot truncate their host function."""
+    table = source['spec'].get('interior_entries_by_file')
+    if not table:
+        return set()
+    body, base = source['body'], source['base']
+    found = {number(x) for key, items in table.items() if key.upper() == source['name']
+             for x in items}
+    require(all(base <= entry < base + len(body) and entry % 4 == 0 for entry in found),
+            f"Interior entry outside image or unaligned: {source['name']}")
+    return found
+
+
 def make_fixed_record(source, disc):
     body, base, spec = source['body'], source['base'], source['spec']
     require(spec.get('allow_missing'), f"Generic extractor missed required image: {source['name']}")
@@ -568,7 +589,7 @@ def make_fixed_record(source, disc):
     seeds |= entries
     require(seeds, f"No static entries: {source['name']}")
     page, data = extractor.page_aligned_region(base, body)
-    return extractor.rec(page, data, sorted(seeds), dispatch_extra=sorted(entries),
+    return extractor.rec(page, data, sorted(seeds), dispatch_extra=sorted(entries | interior_entries(source)),
                          producer_ranges=[(base, base + len(body))], static_discovery=direct | entries)
 
 
@@ -656,6 +677,14 @@ def prepare(profile, disc, records, output, views=None):
                 record[key] = [hex(pc) for pc in sorted(entries | {number(pc) for pc in record[key]})]
             record['static_discovery_entry_pcs'] = [hex(pc) for pc in sorted(entries |
                 {number(pc) for pc in record.get('static_discovery_entry_pcs', [])})]
+    # Interior entries feed dispatch only: no seeds, discovery or required entries.
+    for source in sources:
+        interior = interior_entries(source)
+        if interior:
+            require(source['name'] in singles, 'Interior entries need a complete source recipe')
+            record = singles[source['name']]
+            for key in ('dispatch_entry_pcs', 'static_dispatch_entry_pcs'):
+                record[key] = [hex(pc) for pc in sorted(interior | {number(pc) for pc in record[key]})]
     by_name = {source['name']: source for source in sources}
     keys = {(number(r['load_addr']), r['bytes_b64']) for r in records}
     for composition in profile.get('compositions', []):

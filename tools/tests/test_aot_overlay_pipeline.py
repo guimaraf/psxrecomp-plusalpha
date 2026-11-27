@@ -519,6 +519,68 @@ class AotMethodsTest(unittest.TestCase):
             pipeline.eligible_ranges({**source, 'spec': dict(excluded_ranges=[item, item])},
                                      0x1000, 0x1020)
 
+    def test_interior_entries_by_file_feed_dispatch_only_for_their_file(self):
+        base = 0x80100000
+        # A: addiu sp / sw ra ... ; shared epilogue at +0x10 (interior); B: leaf
+        words = [0x27bdffe8, 0xafbf0014, 0, 0, 0x8fbf0014, 0x27bd0018, 0x03e00008, 0,
+                 0x03e00008, 0]
+        body = struct.pack(f'<{len(words)}I', *words)
+        disc = FakeDisc({'OVL/A.OVL': body, 'OVL/B.OVL': body})
+        interior = hex(base + 0x10)
+
+        def spec(**extra):
+            return dict(method='fixed_address_files', files=['OVL/A.OVL', 'OVL/B.OVL'],
+                        load_addr=hex(base), allow_missing=True, **extra)
+
+        def sources(**extra):
+            return pipeline.positioned_sources(disc, [spec(**extra)])
+
+        plain = {s['name']: pipeline.make_fixed_record(s, disc) for s in sources()}
+        extra = {s['name']: pipeline.make_fixed_record(s, disc)
+                 for s in sources(interior_entries_by_file={'ovl/a.ovl': [interior]})}
+        # Fields absent: nothing changes. Present: only the named file, dispatch only.
+        self.assertEqual(plain['OVL/B.OVL'], extra['OVL/B.OVL'])
+        record = extra['OVL/A.OVL']
+        self.assertIn(interior, record['dispatch_entry_pcs'])
+        self.assertIn(interior, record['static_dispatch_entry_pcs'])
+        self.assertNotIn(interior, record['seeds'])
+        self.assertNotIn(interior, record['function_entry_pcs'])
+        self.assertNotIn(interior, record.get('static_discovery_entry_pcs', []))
+        self.assertNotIn(interior, plain['OVL/A.OVL']['dispatch_entry_pcs'])
+        for key in ('seeds', 'function_entry_pcs'):
+            self.assertEqual(record[key], plain['OVL/A.OVL'][key])
+        for bad, error in [({'OVL/C.OVL': [interior]}, 'no file in spec'),
+                           ({'OVL/A.OVL': [hex(base + 0x1000)]}, 'outside image'),
+                           ({'OVL/A.OVL': [hex(base + 0x11)]}, 'unaligned')]:
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, error):
+                for source in sources(interior_entries_by_file=bad):
+                    pipeline.make_fixed_record(source, disc)
+        extents = dict(method='fixed_address_extents', interior_entries_by_file={}, extents=[])
+        with self.assertRaisesRegex(ValueError, 'only valid for fixed_address_files'):
+            pipeline.spec_sources(disc, extents)
+
+    def test_prepare_adds_interior_entries_to_generic_recipe_dispatch(self):
+        base = 0x80100000
+        body = struct.pack('<8I', 0x27bdffe8, 0xafbf0014, 0, 0x8fbf0014, 0x27bd0018,
+                           0x03e00008, 0, 0)
+        interior = base + 0x10
+        spec = dict(method='fixed_address_files', files=['CODE'], load_addr=hex(base),
+                    entries=[hex(base)], interior_entries_by_file={'CODE': [hex(interior)]})
+        record = pipeline.extractor.rec(base, body, [base])
+        disc = FakeDisc({'CODE': body})
+        disc.binary = b''
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(pipeline, 'digest', return_value='0' * 64):
+            pipeline.prepare(dict(game_id='SYNTHETIC', images=[spec], expected_records=1),
+                             disc, [dict(record)], Path(directory))
+            inventory = json.loads((Path(directory) / 'runtime-input-inventory.json').read_text())
+            job = inventory['jobs'][0]
+            written = json.loads(Path(job['input']).read_text())[0]
+        self.assertIn(hex(interior), written['dispatch_entry_pcs'])
+        self.assertIn(hex(interior), written['static_dispatch_entry_pcs'])
+        self.assertNotIn(hex(interior), written['seeds'])
+        self.assertNotIn(hex(interior), job['required_entries'])
+
     def test_fallback_cannot_hide_required_loader_entry(self):
         base, body = 0x80100000, struct.pack('<4I', 0x03e00008, 0, 0x03e00008, 0)
         spec = dict(method='fixed_address_files', files=['CODE'], load_addr=hex(base),
